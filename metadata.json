@@ -1,0 +1,8 @@
+{
+  "name": "Dragon Download Manager",
+  "description": "Universal DDM & Media Downloader with 16x Multi-Thread Acceleration, Batch Downloader, Built-in Browser & Media Grabber, Cloudflare WARP DNS, and Live Download Notification Panel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
