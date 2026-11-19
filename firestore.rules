@@ -1,0 +1,127 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Entity Validation Blueprint: SyncedBookmark
+    function isValidSyncedBookmark(data) {
+      return data.userId is string &&
+             data.userId.size() >= 1 &&
+             data.userId.size() <= 128 &&
+             data.userId == request.auth.uid &&
+             data.title is string &&
+             data.title.size() >= 1 &&
+             data.title.size() <= 500 &&
+             data.url is string &&
+             data.url.size() >= 1 &&
+             data.url.size() <= 2048 &&
+             data.createdAtMs is int &&
+             data.createdAtMs >= 0 &&
+             data.createdAt is timestamp &&
+             data.createdAt <= request.time &&
+             data.updatedAt is timestamp &&
+             data.updatedAt <= request.time;
+    }
+
+    // Entity Validation Blueprint: SyncedPassword
+    function isValidSyncedPassword(data) {
+      return data.userId is string &&
+             data.userId.size() >= 1 &&
+             data.userId.size() <= 128 &&
+             data.userId == request.auth.uid &&
+             data.url is string &&
+             data.url.size() <= 2048 &&
+             data.domain is string &&
+             data.domain.size() <= 255 &&
+             data.username is string &&
+             data.username.size() <= 320 &&
+             data.password is string &&
+             data.password.size() <= 1024 &&
+             (data.username.size() >= 1 || data.password.size() >= 1) &&
+             data.title is string &&
+             data.title.size() >= 1 &&
+             data.title.size() <= 500 &&
+             data.importedFrom is string &&
+             data.importedFrom.size() >= 1 &&
+             data.importedFrom.size() <= 100 &&
+             data.createdAtMs is int &&
+             data.createdAtMs >= 0 &&
+             data.createdAt is timestamp &&
+             data.createdAt <= request.time &&
+             data.updatedAt is timestamp &&
+             data.updatedAt <= request.time;
+    }
+
+    // User-Scoped Synced Bookmarks
+    match /users/{userId}/bookmarks/{bookmarkId} {
+      allow get: if isOwner(userId) && isValidId(userId) && isValidId(bookmarkId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(userId) &&
+                       isValidId(bookmarkId) &&
+                       incoming().keys().hasAll(['userId', 'title', 'url', 'createdAtMs', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'title', 'url', 'createdAtMs', 'createdAt', 'updatedAt']) &&
+                       isValidSyncedBookmark(incoming());
+
+      allow update: if isOwner(userId) &&
+                       isValidId(userId) &&
+                       isValidId(bookmarkId) &&
+                       isValidSyncedBookmark(incoming()) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['title', 'url', 'createdAtMs', 'updatedAt']);
+
+      allow delete: if isOwner(userId) && isValidId(userId) && isValidId(bookmarkId);
+    }
+
+    // User-Scoped Synced Passwords
+    match /users/{userId}/passwords/{passwordId} {
+      allow get: if isOwner(userId) && isValidId(userId) && isValidId(passwordId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(userId) &&
+                       isValidId(passwordId) &&
+                       incoming().keys().hasAll(['userId', 'url', 'domain', 'username', 'password', 'title', 'importedFrom', 'createdAtMs', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'url', 'domain', 'username', 'password', 'title', 'importedFrom', 'createdAtMs', 'createdAt', 'updatedAt']) &&
+                       isValidSyncedPassword(incoming());
+
+      allow update: if isOwner(userId) &&
+                       isValidId(userId) &&
+                       isValidId(passwordId) &&
+                       isValidSyncedPassword(incoming()) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['url', 'domain', 'username', 'password', 'title', 'importedFrom', 'createdAtMs', 'updatedAt']);
+
+      allow delete: if isOwner(userId) && isValidId(userId) && isValidId(passwordId);
+    }
+  }
+}

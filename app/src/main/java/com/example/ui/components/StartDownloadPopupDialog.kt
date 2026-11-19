@@ -131,16 +131,29 @@ fun StartDownloadPopupDialog(
     val context = LocalContext.current
     val haptics = LocalDragonHaptics.current
     val warpDnsEnabled by downloadManager.warpDnsEnabledFlow.collectAsState()
+    val dnsMode by downloadManager.dnsModeFlow.collectAsState()
+    val activeCustomDns by downloadManager.activeCustomDnsFlow.collectAsState()
     val requiredPerms = remember { requiredStoragePermissionsForDownload() }
     var hasPermission by remember { mutableStateOf(hasStoragePermissionsForDownload(context)) }
     var didAskOnce by remember { mutableStateOf(false) }
     var pendingStartAfterPermission by remember { mutableStateOf(false) }
 
-    val defaultExt = remember(formatOption) {
-        formatOption.container.lowercase(Locale.US).ifBlank {
+    var probedSizeBytes by remember(formatOption.streamUrl, formatOption.contentLengthBytes) {
+        mutableStateOf(formatOption.contentLengthBytes)
+    }
+    val effectiveFormatOption = remember(formatOption, probedSizeBytes) {
+        if (probedSizeBytes > 0L && formatOption.contentLengthBytes <= 0L) {
+            formatOption.copy(contentLengthBytes = probedSizeBytes, isEstimatedSize = false)
+        } else {
+            formatOption
+        }
+    }
+
+    val defaultExt = remember(effectiveFormatOption) {
+        effectiveFormatOption.container.lowercase(Locale.US).ifBlank {
             when {
-                formatOption.isAudioOnly -> "m4a"
-                formatOption.isGenericFile -> "bin"
+                effectiveFormatOption.isAudioOnly -> "m4a"
+                effectiveFormatOption.isGenericFile -> "bin"
                 else -> "mp4"
             }
         }
@@ -149,24 +162,59 @@ fun StartDownloadPopupDialog(
         mutableStateOf(
             downloadManager.buildSuggestedFilename(
                 title = mediaInfo.title,
-                qualityLabel = formatOption.qualityLabel,
+                qualityLabel = effectiveFormatOption.qualityLabel,
                 ext = defaultExt,
-                isAudioOnly = formatOption.isAudioOnly,
-                isGenericFile = formatOption.isGenericFile
+                isAudioOnly = effectiveFormatOption.isAudioOnly,
+                isGenericFile = effectiveFormatOption.isGenericFile
             )
         )
     }
 
-    val targetDisplayPath = remember(formatOption) {
+    val targetDisplayPath = remember(effectiveFormatOption) {
         DragonDownloadManager.displayFolderForType(
-            isAudioOnly = formatOption.isAudioOnly,
-            isGenericFile = formatOption.isGenericFile
+            extension = defaultExt,
+            mimeType = effectiveFormatOption.mimeType,
+            isAudioOnly = effectiveFormatOption.isAudioOnly,
+            isGenericFile = effectiveFormatOption.isGenericFile,
+            url = effectiveFormatOption.streamUrl,
+            platform = mediaInfo.platform
         )
     }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(formatOption.streamUrl, formatOption.contentLengthBytes) {
         downloadManager.ensureDragonToolDirectories()
         hasPermission = hasStoragePermissionsForDownload(context)
+        if (formatOption.contentLengthBytes <= 0L &&
+            (formatOption.streamUrl.startsWith("http://", true) || formatOption.streamUrl.startsWith("https://", true))
+        ) {
+            val resolvedLen = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                try {
+                    val reqBuilder = okhttp3.Request.Builder()
+                        .url(formatOption.streamUrl)
+                        .get()
+                        .header("Accept-Encoding", "identity")
+                        .header("Range", "bytes=0-0")
+                    downloadManager.webViewExtractor.getCookiesForUrl(formatOption.streamUrl)?.let {
+                        reqBuilder.header("Cookie", it)
+                    }
+                    formatOption.requestHeaders.forEach { (k, v) -> reqBuilder.header(k, v) }
+                    downloadManager.httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                        val cr = resp.header("Content-Range")
+                        val crTotal = cr?.substringAfterLast("/")?.trim()?.toLongOrNull() ?: -1L
+                        if (crTotal > 0L) {
+                            crTotal
+                        } else {
+                            resp.header("Content-Length")?.toLongOrNull()?.takeIf { it > 1L } ?: -1L
+                        }
+                    }
+                } catch (_: Exception) {
+                    -1L
+                }
+            }
+            if (resolvedLen > 0L) {
+                probedSizeBytes = resolvedLen
+            }
+        }
     }
 
     val startAction = {
@@ -174,7 +222,7 @@ fun StartDownloadPopupDialog(
         val chosenName = filenameInput.trim().ifBlank { null }
         val taskId = downloadManager.startDownload(
             mediaInfo = mediaInfo,
-            format = formatOption,
+            format = effectiveFormatOption,
             customFilename = chosenName
         )
         onDownloadStarted(taskId, chosenName ?: mediaInfo.title)
@@ -225,7 +273,7 @@ fun StartDownloadPopupDialog(
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = "${mediaInfo.platform.displayName} • ${formatOption.qualityLabel}",
+                        text = "${mediaInfo.platform.displayName} • ${effectiveFormatOption.qualityLabel}",
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -277,7 +325,7 @@ fun StartDownloadPopupDialog(
                                 color = MaterialTheme.colorScheme.primary
                             )
                             Text(
-                                text = formatOption.formattedSize(mediaInfo.durationSeconds),
+                                text = effectiveFormatOption.formattedSize(mediaInfo.durationSeconds),
                                 fontSize = 11.sp,
                                 fontFamily = FontFamily.Monospace,
                                 fontWeight = FontWeight.ExtraBold,
@@ -285,7 +333,7 @@ fun StartDownloadPopupDialog(
                             )
                         }
                         Text(
-                            text = formatOption.technicalSummary(),
+                            text = effectiveFormatOption.technicalSummary(),
                             fontSize = 11.sp,
                             color = MaterialTheme.colorScheme.onSurface
                         )
@@ -462,14 +510,29 @@ fun StartDownloadPopupDialog(
                         }
                     }
 
-                    // Cloudflare WARP DNS (1.1.1.1) Toggle in Popup
+                    // DNS Resolver Status & Cloudflare WARP DNS (1.1.1.1) Toggle in Popup
+                    val otherDnsActiveInPopup = !warpDnsEnabled && dnsMode != com.example.data.downloader.DnsProviderMode.SYSTEM_DEFAULT
+                    val popupDnsLabel = when (dnsMode) {
+                        com.example.data.downloader.DnsProviderMode.CLOUDFLARE_WARP -> "Cloudflare WARP DNS (1.1.1.1) • ON"
+                        com.example.data.downloader.DnsProviderMode.ADBLOCKER_DNS -> "AdBlocker DNS Active • WARP OFF"
+                        com.example.data.downloader.DnsProviderMode.UNFILTERED_ADBLOCKER_DNS -> "Unfiltered DNS Active • WARP OFF"
+                        com.example.data.downloader.DnsProviderMode.CUSTOM_DNS -> "Custom DNS (${activeCustomDns?.name ?: "Custom"}) • WARP OFF"
+                        com.example.data.downloader.DnsProviderMode.SYSTEM_DEFAULT -> "Cloudflare WARP DNS (1.1.1.1) • OFF"
+                    }
+                    val popupDnsAccent = when (dnsMode) {
+                        com.example.data.downloader.DnsProviderMode.CLOUDFLARE_WARP -> WarningOrange
+                        com.example.data.downloader.DnsProviderMode.ADBLOCKER_DNS -> SuccessGreen
+                        com.example.data.downloader.DnsProviderMode.UNFILTERED_ADBLOCKER_DNS,
+                        com.example.data.downloader.DnsProviderMode.CUSTOM_DNS -> NeonCyan
+                        com.example.data.downloader.DnsProviderMode.SYSTEM_DEFAULT -> MaterialTheme.colorScheme.onSurfaceVariant
+                    }
                     Surface(
                         shape = RoundedCornerShape(10.dp),
-                        color = if (warpDnsEnabled) WarningOrange.copy(alpha = 0.12f)
+                        color = if (warpDnsEnabled || otherDnsActiveInPopup) popupDnsAccent.copy(alpha = 0.12f)
                         else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.40f),
                         border = BorderStroke(
                             1.dp,
-                            if (warpDnsEnabled) WarningOrange.copy(alpha = 0.50f)
+                            if (warpDnsEnabled || otherDnsActiveInPopup) popupDnsAccent.copy(alpha = 0.50f)
                             else MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
                         ),
                         modifier = Modifier
@@ -493,15 +556,15 @@ fun StartDownloadPopupDialog(
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.Bolt,
-                                    contentDescription = "Cloudflare WARP DNS",
-                                    tint = if (warpDnsEnabled) WarningOrange else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    contentDescription = "DNS Status",
+                                    tint = if (warpDnsEnabled || otherDnsActiveInPopup) popupDnsAccent else MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.size(15.dp)
                                 )
                                 Text(
-                                    text = if (warpDnsEnabled) "Cloudflare WARP DNS (1.1.1.1) • ON" else "Cloudflare WARP DNS (1.1.1.1) • OFF",
+                                    text = popupDnsLabel,
                                     fontSize = 10.5.sp,
                                     fontWeight = FontWeight.Bold,
-                                    color = if (warpDnsEnabled) WarningOrange else MaterialTheme.colorScheme.onSurface,
+                                    color = if (warpDnsEnabled || otherDnsActiveInPopup) popupDnsAccent else MaterialTheme.colorScheme.onSurface,
                                     modifier = Modifier.weight(1f),
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis

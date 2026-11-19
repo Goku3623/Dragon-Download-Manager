@@ -1612,11 +1612,29 @@ object MediaProcessingEngine {
 
         val ext = expectedExtension.lowercase(Locale.US).removePrefix(".")
         val expectsMarkupOrText = ext in setOf("html", "htm", "xhtml", "xml", "svg", "txt", "csv", "json", "rtf")
-        if (!expectsMarkupOrText) {
-            try {
-                val headBytes = ByteArray(128)
-                val readCount = file.inputStream().use { it.read(headBytes) }
-                if (readCount > 0) {
+        try {
+            val headBytes = ByteArray(128)
+            val readCount = file.inputStream().use { it.read(headBytes) }
+            if (readCount > 0) {
+                val disguisedError = com.example.data.security.MalwareProtectionEngine.detectDisguisedBinaryError(
+                    filename = file.name,
+                    headerBytes = headBytes.copyOf(readCount)
+                )
+                if (disguisedError != null) {
+                    return MediaValidationResult(
+                        isValid = false,
+                        fileSizeBytes = length,
+                        durationMs = 0L,
+                        hasVideo = false,
+                        hasAudio = false,
+                        width = 0,
+                        height = 0,
+                        videoMime = null,
+                        audioMime = null,
+                        errorReason = disguisedError
+                    )
+                }
+                if (!expectsMarkupOrText) {
                     val headAscii = String(headBytes, 0, readCount, Charsets.ISO_8859_1).trimStart()
                     if (headAscii.startsWith("<!DOCTYPE html", ignoreCase = true) ||
                         headAscii.startsWith("<html", ignoreCase = true) ||
@@ -1636,8 +1654,8 @@ object MediaProcessingEngine {
                         )
                     }
                 }
-            } catch (_: Exception) {
             }
+        } catch (_: Exception) {
         }
 
         val label = ext.ifBlank { "FILE" }.uppercase(Locale.US)

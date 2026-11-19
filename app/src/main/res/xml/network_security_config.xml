@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Block rogue user-installed CA certificates from MiTM-intercepting HTTPS sessions -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Enforce strict HTTPS-only transport on critical identity, payment, and cloud domains -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">google.com</domain>
+        <domain includeSubdomains="true">googleapis.com</domain>
+        <domain includeSubdomains="true">gstatic.com</domain>
+        <domain includeSubdomains="true">firebaseio.com</domain>
+        <domain includeSubdomains="true">firebaseapp.com</domain>
+        <domain includeSubdomains="true">github.com</domain>
+        <domain includeSubdomains="true">paypal.com</domain>
+        <domain includeSubdomains="true">apple.com</domain>
+        <domain includeSubdomains="true">microsoft.com</domain>
+        <domain includeSubdomains="true">live.com</domain>
+    </domain-config>
+</network-security-config>

@@ -41,14 +41,21 @@ class DownloadNotificationController(
     private val notificationManager =
         context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
+    private val notifPrefs = context.getSharedPreferences("dragon_download_notif_prefs", Context.MODE_PRIVATE)
+
     private val lastNotifyMs = AtomicLong(0L)
     private val lastPrimaryTaskId = java.util.concurrent.atomic.AtomicReference<String?>(null)
     private val lastPrimaryStage = java.util.concurrent.atomic.AtomicReference<DownloadStateStage?>(null)
     private val lastPrimarySmartRetrying = AtomicBoolean(false)
     private val lastPrimaryRetryCount = java.util.concurrent.atomic.AtomicInteger(-1)
-    private val isPanelDismissedByUser = AtomicBoolean(false)
+    private val isPanelDismissedByUser = AtomicBoolean(
+        notifPrefs.getBoolean(KEY_PANEL_DISMISSED, false)
+    )
+    private val suppressedCompletedIds: MutableSet<String> = java.util.Collections.synchronizedSet(
+        notifPrefs.getStringSet(KEY_SUPPRESSED_COMPLETED_IDS, emptySet())?.toMutableSet() ?: mutableSetOf()
+    )
 
-    private val _isPanelVisibleFlow = kotlinx.coroutines.flow.MutableStateFlow(true)
+    private val _isPanelVisibleFlow = kotlinx.coroutines.flow.MutableStateFlow(!isPanelDismissedByUser.get())
     val isPanelVisibleFlow: kotlinx.coroutines.flow.StateFlow<Boolean> = _isPanelVisibleFlow
 
     companion object {
@@ -56,6 +63,8 @@ class DownloadNotificationController(
         const val GROUP_DOWNLOAD_CONTROL_HUD = "com.example.dragon.GROUP_DOWNLOAD_CONTROL_HUD"
         const val STANDBY_TASK_ID = "ddm_standby_ready_panel"
         internal const val PROGRESS_THROTTLE_MS = 800L
+        private const val KEY_PANEL_DISMISSED = "panel_dismissed_by_user_v1"
+        private const val KEY_SUPPRESSED_COMPLETED_IDS = "suppressed_completed_notif_ids_v1"
 
         fun buildStandbyTask(): DownloaderTask {
             val fmt = com.example.data.model.MediaFormatOption(
@@ -90,26 +99,94 @@ class DownloadNotificationController(
         }
     }
 
-    fun onNewDownloadStarted() {
-        isPanelDismissedByUser.set(false)
+    private fun persistPanelDismissed(dismissed: Boolean) {
+        isPanelDismissedByUser.set(dismissed)
+        runCatching {
+            notifPrefs.edit().putBoolean(KEY_PANEL_DISMISSED, dismissed).commit()
+        }
+    }
+
+    private fun markCompletedIdsSuppressed(ids: Collection<String>) {
+        if (ids.isEmpty()) return
+        synchronized(suppressedCompletedIds) {
+            ids.filter { it.isNotBlank() && it != STANDBY_TASK_ID }.forEach { suppressedCompletedIds.add(it) }
+            if (suppressedCompletedIds.size > 250) {
+                val trimmed = suppressedCompletedIds.toList().takeLast(200)
+                suppressedCompletedIds.clear()
+                suppressedCompletedIds.addAll(trimmed)
+            }
+            runCatching {
+                notifPrefs.edit()
+                    .putStringSet(KEY_SUPPRESSED_COMPLETED_IDS, suppressedCompletedIds.toSet())
+                    .commit()
+            }
+        }
+    }
+
+    private fun unmarkCompletedIdSuppressed(taskId: String?) {
+        if (taskId.isNullOrBlank()) return
+        val removed = synchronized(suppressedCompletedIds) {
+            val didRemove = suppressedCompletedIds.remove(taskId)
+            if (didRemove) {
+                runCatching {
+                    notifPrefs.edit()
+                        .putStringSet(KEY_SUPPRESSED_COMPLETED_IDS, suppressedCompletedIds.toSet())
+                        .commit()
+                }
+            }
+            didRemove
+        }
+        if (removed) {
+            lastPrimaryTaskId.compareAndSet(taskId, null)
+        }
+    }
+
+    fun onNewDownloadStarted(taskId: String? = null) {
+        unmarkCompletedIdSuppressed(taskId)
+        persistPanelDismissed(false)
         _isPanelVisibleFlow.value = true
     }
 
     fun showPanelNow(tasks: List<DownloaderTask>) {
-        isPanelDismissedByUser.set(false)
+        persistPanelDismissed(false)
         _isPanelVisibleFlow.value = true
-        syncTasks(tasks, force = true)
+        syncTasks(tasks, force = true, allowStandby = true)
     }
 
-    fun dismissPanel() {
-        isPanelDismissedByUser.set(true)
+    fun dismissPanel(currentTasks: List<DownloaderTask> = emptyList(), dismissedTaskId: String? = null) {
+        val idsToSuppress = buildList {
+            if (!dismissedTaskId.isNullOrBlank()) add(dismissedTaskId)
+            lastPrimaryTaskId.get()?.let { add(it) }
+            currentTasks.filter { it.stage == DownloadStateStage.COMPLETED }.forEach { add(it.id) }
+        }
+        markCompletedIdsSuppressed(idsToSuppress)
+        persistPanelDismissed(true)
+        lastPrimaryTaskId.set(null)
+        lastPrimaryStage.set(null)
         _isPanelVisibleFlow.value = false
         try {
             notificationManager.cancel(NOTIFICATION_ID_DOWNLOAD_PANEL)
         } catch (_: Exception) {}
     }
 
-    fun syncTasks(tasks: List<DownloaderTask>, force: Boolean = false) {
+    /**
+     * Called when a task is deleted or removed from the Downloaded/Completed section (or missing on disk).
+     * Permanently suppresses that task's completion notification and cancels the shade notification
+     * whenever no active/paused/failed downloads remain.
+     */
+    fun onTaskRemovedOrDeleted(taskId: String, remainingTasks: List<DownloaderTask>) {
+        markCompletedIdsSuppressed(listOf(taskId))
+        val hasPendingWork = remainingTasks.any {
+            it.stage.isActive || it.isSmartRetrying || it.stage == DownloadStateStage.PAUSED || it.stage == DownloadStateStage.FAILED
+        }
+        if (hasPendingWork) {
+            syncTasks(remainingTasks, force = true, allowStandby = false)
+        } else {
+            dismissPanel(currentTasks = remainingTasks, dismissedTaskId = taskId)
+        }
+    }
+
+    fun syncTasks(tasks: List<DownloaderTask>, force: Boolean = false, allowStandby: Boolean = false) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(
                     context,
@@ -123,13 +200,36 @@ class DownloadNotificationController(
         val activeTasks = tasks.filter { it.stage.isActive || it.isSmartRetrying }
         val pausedTasks = tasks.filter { it.stage == DownloadStateStage.PAUSED }
         val failedTasks = tasks.filter { it.stage == DownloadStateStage.FAILED }
-        val completedTasks = tasks.filter { it.stage == DownloadStateStage.COMPLETED }
+        val allCompletedTasks = tasks.filter { it.stage == DownloadStateStage.COMPLETED }
+        val suppressedSnapshot = synchronized(suppressedCompletedIds) { suppressedCompletedIds.toSet() }
+        val unacknowledgedCompletedTasks = allCompletedTasks.filter { it.id !in suppressedSnapshot }
 
         if (activeTasks.isNotEmpty()) {
-            isPanelDismissedByUser.set(false)
+            if (isPanelDismissedByUser.get()) {
+                persistPanelDismissed(false)
+            }
             _isPanelVisibleFlow.value = true
         } else if (isPanelDismissedByUser.get()) {
             _isPanelVisibleFlow.value = false
+            try {
+                notificationManager.cancel(NOTIFICATION_ID_DOWNLOAD_PANEL)
+            } catch (_: Exception) {}
+            return
+        }
+
+        // Never auto-resurrect a notification for already-dismissed/deleted completed files or empty standby
+        if (!allowStandby &&
+            activeTasks.isEmpty() &&
+            pausedTasks.isEmpty() &&
+            failedTasks.isEmpty() &&
+            unacknowledgedCompletedTasks.isEmpty()
+        ) {
+            lastPrimaryTaskId.set(null)
+            lastPrimaryStage.set(null)
+            _isPanelVisibleFlow.value = false
+            try {
+                notificationManager.cancel(NOTIFICATION_ID_DOWNLOAD_PANEL)
+            } catch (_: Exception) {}
             return
         }
 
@@ -137,7 +237,10 @@ class DownloadNotificationController(
             activeTasks.isNotEmpty() -> activeTasks.first()
             pausedTasks.isNotEmpty() -> pausedTasks.first()
             failedTasks.isNotEmpty() -> failedTasks.first()
-            completedTasks.isNotEmpty() -> completedTasks.maxByOrNull { it.createdAtMs } ?: completedTasks.first()
+            unacknowledgedCompletedTasks.isNotEmpty() ->
+                unacknowledgedCompletedTasks.maxByOrNull { it.createdAtMs } ?: unacknowledgedCompletedTasks.first()
+            allowStandby && allCompletedTasks.isNotEmpty() ->
+                allCompletedTasks.maxByOrNull { it.createdAtMs } ?: allCompletedTasks.first()
             else -> buildStandbyTask()
         }
 
@@ -440,6 +543,15 @@ class DownloadNotificationController(
             if (secondaryBtnTextExpanded != null && secondaryBtnIntent != null) {
                 builder.addAction(0, secondaryBtnTextExpanded, secondaryBtnIntent)
             }
+            if (!isPersistent) {
+                builder.setDeleteIntent(
+                    buildReceiverPendingIntent(
+                        action = DownloadNotificationReceiver.ACTION_DISMISS_PANEL,
+                        taskId = primaryTask.id,
+                        requestCode = 404
+                    )
+                )
+            }
             builder.addAction(0, cancelBtnTextExpanded, cancelBtnIntent)
             return builder.build()
         }
@@ -541,7 +653,7 @@ class DownloadNotificationController(
         expandedView.setTextColor(R.id.btn_dl_expanded_cancel, headerColor)
         expandedView.setOnClickPendingIntent(R.id.btn_dl_expanded_cancel, cancelBtnIntent)
 
-        return NotificationCompat.Builder(context, DragonKernelApp.CHANNEL_DOWNLOADER)
+        val customBuilder = NotificationCompat.Builder(context, DragonKernelApp.CHANNEL_DOWNLOADER)
             .setSmallIcon(R.drawable.ic_notif_download)
             .setColor(notifTint)
             .setColorized(false)
@@ -562,7 +674,16 @@ class DownloadNotificationController(
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .build()
+        if (!isPersistent) {
+            customBuilder.setDeleteIntent(
+                buildReceiverPendingIntent(
+                    action = DownloadNotificationReceiver.ACTION_DISMISS_PANEL,
+                    taskId = primaryTask.id,
+                    requestCode = 404
+                )
+            )
+        }
+        return customBuilder.build()
     }
 
     private fun buildReceiverPendingIntent(

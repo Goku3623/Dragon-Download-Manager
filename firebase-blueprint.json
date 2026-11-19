@@ -1,0 +1,120 @@
+{
+  "entities": {
+    "SyncedBookmark": {
+      "title": "SyncedBookmark",
+      "description": "A browser bookmark synchronized with the signed-in Google account.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The UID of the authenticated Google user who owns this bookmark."
+        },
+        "title": {
+          "type": "string",
+          "description": "Display title of the bookmarked web page (1 to 500 characters)."
+        },
+        "url": {
+          "type": "string",
+          "description": "Full URL of the bookmarked web page (1 to 2048 characters)."
+        },
+        "createdAtMs": {
+          "type": "integer",
+          "description": "Client creation epoch timestamp in milliseconds."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the bookmark was first synced. Clients must submit FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the bookmark was last updated. Clients must submit FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "userId",
+        "title",
+        "url",
+        "createdAtMs",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SyncedPassword": {
+      "title": "SyncedPassword",
+      "description": "A saved browser login credential synchronized with the signed-in Google account.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The UID of the authenticated Google user who owns this saved password."
+        },
+        "url": {
+          "type": "string",
+          "description": "Origin or login page URL associated with the credential (0 to 2048 characters)."
+        },
+        "domain": {
+          "type": "string",
+          "description": "Normalized hostname/domain for autofill matching (0 to 255 characters)."
+        },
+        "username": {
+          "type": "string",
+          "description": "Login username or email address (0 to 320 characters)."
+        },
+        "password": {
+          "type": "string",
+          "description": "Saved login password (0 to 1024 characters)."
+        },
+        "title": {
+          "type": "string",
+          "description": "Friendly display title for the credential (1 to 500 characters)."
+        },
+        "importedFrom": {
+          "type": "string",
+          "description": "Source label for the credential, e.g. Browser, Google Sync, Chrome, CSV, JSON (1 to 100 characters)."
+        },
+        "createdAtMs": {
+          "type": "integer",
+          "description": "Client creation or update epoch timestamp in milliseconds."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the password entry was first synced. Clients must submit FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the password entry was last updated. Clients must submit FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "userId",
+        "url",
+        "domain",
+        "username",
+        "password",
+        "title",
+        "importedFrom",
+        "createdAtMs",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/bookmarks/{bookmarkId}": {
+      "schema": {
+        "$ref": "#/entities/SyncedBookmark"
+      },
+      "description": "User-scoped collection of browser bookmarks synced with the user's Google account."
+    },
+    "/users/{userId}/passwords/{passwordId}": {
+      "schema": {
+        "$ref": "#/entities/SyncedPassword"
+      },
+      "description": "User-scoped collection of saved browser passwords synced with the user's Google account."
+    }
+  }
+}

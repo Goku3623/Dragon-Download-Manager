@@ -61,7 +61,7 @@ class DownloadNotificationReceiver : BroadcastReceiver() {
                 }
             }
             ACTION_DISMISS_PANEL -> {
-                downloadManager.dismissNotificationPanel()
+                downloadManager.dismissNotificationPanel(dismissedTaskId = taskId.takeIf { it.isNotBlank() })
             }
         }
     }

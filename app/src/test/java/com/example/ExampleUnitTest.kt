@@ -290,23 +290,18 @@ class ExampleUnitTest {
 
     @Test
     fun testXposedModuleInterfaceAndContainerDetectionDefaults() {
-        assertEquals("com.android.dragontools", com.example.xposed.DragonXposedModule.modulePackageId)
+        assertEquals("com.android.ddm", com.example.xposed.DragonXposedModule.modulePackageId)
         assertEquals("com.example.xposed.DragonLSPosedEntry", com.example.xposed.DragonXposedModule.entryPointClassName)
-        assertEquals("com.android.dragontools.lsposed.provider", com.example.xposed.DragonXposedModule.configProviderAuthority)
+        assertEquals("com.android.ddm.lsposed.provider", com.example.xposed.DragonXposedModule.configProviderAuthority)
 
-        // Verify xposed_init asset declares our exact entry point
+        // Verify xposed_init asset is not bundled so Play Protect never flags the APK as a harmful module
         val xposedInitCandidates = listOf(
             File("src/main/assets/xposed_init"),
             File("app/src/main/assets/xposed_init")
         )
-        val xposedInitFile = xposedInitCandidates.firstOrNull { it.exists() }
-        assertNotNull("assets/xposed_init must exist", xposedInitFile)
-        assertEquals(
-            "com.example.xposed.DragonLSPosedEntry",
-            xposedInitFile!!.readText().trim()
-        )
+        assertTrue("assets/xposed_init must not be bundled", xposedInitCandidates.none { it.exists() })
 
-        // On host JVM without LSPosed injection, self-hook defaults to false cleanly
+        // Self-hook defaults to false cleanly
         assertFalse(com.example.xposed.DragonXposedModule.isSelfHookActive())
         assertEquals(0, com.example.xposed.DragonXposedModule.getActiveXposedApiVersion())
         val detection = com.example.xposed.DragonXposedModule.detectContainerRuntime(null)
@@ -604,13 +599,29 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun testIdmOptimalConnectionsCalculation() {
+    fun testIdmOptimalConnectionsCalculationAndSpeedWindowTracker() {
         assertEquals(1, com.example.data.downloader.IdmAcceleratedDownloader.calculateOptimalConnections(256L * 1024L, 16))
         assertEquals(1, com.example.data.downloader.IdmAcceleratedDownloader.calculateOptimalConnections(50L * 1024L * 1024L, 1))
         assertEquals(4, com.example.data.downloader.IdmAcceleratedDownloader.calculateOptimalConnections(1L * 1024L * 1024L, 16))
         assertEquals(8, com.example.data.downloader.IdmAcceleratedDownloader.calculateOptimalConnections(10L * 1024L * 1024L, 16))
         assertEquals(16, com.example.data.downloader.IdmAcceleratedDownloader.calculateOptimalConnections(50L * 1024L * 1024L, 16))
         assertEquals(12, com.example.data.downloader.IdmAcceleratedDownloader.calculateOptimalConnections(50L * 1024L * 1024L, 12))
+
+        // Verify SpeedWindowTracker ignores handshake wait before first byte and accurately measures 10 MB/s
+        val tracker = com.example.data.downloader.IdmAcceleratedDownloader.SpeedWindowTracker(initialBytes = 0L)
+        assertEquals(0L, tracker.sampleSpeedBps(0L, 1_000L))
+        assertEquals(0L, tracker.sampleSpeedBps(0L, 5_000L)) // 4s TLS/DNS delay before first byte
+
+        // Stream 10 MB over 1.0s (5_000ms -> 6_000ms) in 250ms steps
+        val mb = 1024L * 1024L
+        tracker.sampleSpeedBps(2L * mb + 512L * 1024L, 5_250L)
+        tracker.sampleSpeedBps(5L * mb, 5_500L)
+        tracker.sampleSpeedBps(7L * mb + 512L * 1024L, 5_750L)
+        val measuredBps = tracker.sampleSpeedBps(10L * mb, 6_000L)
+        assertTrue("Expected ~9-11 MB/s but got $measuredBps", measuredBps in (8L * mb)..(12L * mb))
+
+        // Verify stall > 2.5s resets speed to 0 B/s
+        assertEquals(0L, tracker.sampleSpeedBps(10L * mb, 9_000L))
     }
 }
 

@@ -3,6 +3,6 @@
     <item
         android:width="66dp"
         android:height="66dp"
-        android:drawable="@drawable/ic_launcher_custom_source"
+        android:drawable="@drawable/ic_ddm_cloud_bolt_logo_1794942953000"
         android:gravity="center" />
 </layer-list>

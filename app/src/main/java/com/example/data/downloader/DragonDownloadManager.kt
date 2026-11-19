@@ -35,6 +35,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.io.IOException
 import java.util.Locale
@@ -50,12 +51,39 @@ class DragonDownloadManager(
 ) {
     private val prefs = context.getSharedPreferences("dragon_universal_downloader", Context.MODE_PRIVATE)
 
+    private val _customDnsListFlow = MutableStateFlow(loadPersistedCustomDnsServers())
+    val customDnsListFlow: StateFlow<List<CustomDnsServerEntry>> = _customDnsListFlow.asStateFlow()
+
+    private val initialDnsMode: DnsProviderMode = run {
+        val savedModeStr = prefs.getString("dns_provider_mode_v3", null)
+        if (savedModeStr != null) {
+            DnsProviderMode.fromId(savedModeStr)
+        } else if (prefs.getBoolean("cloudflare_warp_dns_enabled_v2", false)) {
+            DnsProviderMode.CLOUDFLARE_WARP
+        } else {
+            DnsProviderMode.SYSTEM_DEFAULT
+        }
+    }
+
+    private val initialCustomDnsEntry: CustomDnsServerEntry? = run {
+        val activeId = prefs.getString("active_custom_dns_id_v3", null)
+        _customDnsListFlow.value.firstOrNull { it.id == activeId } ?: _customDnsListFlow.value.firstOrNull()
+    }
+
     val warpDns = CloudflareWarpDns(
-        initialEnabled = prefs.getBoolean("cloudflare_warp_dns_enabled_v2", false)
+        initialEnabled = initialDnsMode == DnsProviderMode.CLOUDFLARE_WARP,
+        initialMode = initialDnsMode,
+        initialCustomDns = initialCustomDnsEntry
     )
 
     private val _warpDnsEnabledFlow = MutableStateFlow(warpDns.isEnabled)
     val warpDnsEnabledFlow: StateFlow<Boolean> = _warpDnsEnabledFlow.asStateFlow()
+
+    private val _dnsModeFlow = MutableStateFlow(warpDns.dnsMode)
+    val dnsModeFlow: StateFlow<DnsProviderMode> = _dnsModeFlow.asStateFlow()
+
+    private val _activeCustomDnsFlow = MutableStateFlow(warpDns.activeCustomDns)
+    val activeCustomDnsFlow: StateFlow<CustomDnsServerEntry?> = _activeCustomDnsFlow.asStateFlow()
 
     val warpDnsTelemetryFlow: StateFlow<WarpDnsTelemetry> = warpDns.telemetryFlow
 
@@ -86,10 +114,15 @@ class DragonDownloadManager(
 
     private val tasksLoaded = java.util.concurrent.atomic.AtomicBoolean(false)
     private val tasksLoadLock = Any()
+    private val deletedTaskIds: MutableSet<String> = java.util.Collections.synchronizedSet(
+        prefs.getStringSet(KEY_DELETED_TASK_IDS, emptySet())?.toMutableSet() ?: mutableSetOf()
+    )
 
     init {
         scope.launch(Dispatchers.IO) {
             ensurePersistedTasksLoaded()
+            pruneDeletedCompletedTasks()
+            cleanTemporaryAndRedundantStorage()
             notificationController.syncTasks(_tasksFlow.value, force = false)
             if (warpDns.isAnyCustomDnsActive) {
                 warpDns.prewarmCommonHosts(scope)
@@ -104,6 +137,129 @@ class DragonDownloadManager(
             loadPersistedTasks()
             tasksLoaded.set(true)
         }
+    }
+
+    /**
+     * Automatically cleans orphaned temporary download segments, staging files, and redundant
+     * private User Data copies that have already been exported to the public Downloads folder.
+     */
+    fun cleanTemporaryAndRedundantStorage(): Long {
+        var bytesFreed = 0L
+        try {
+            val activeOrPausedIds = _tasksFlow.value
+                .filter { it.stage.isActive || it.stage == DownloadStateStage.PAUSED || it.isSmartRetrying }
+                .map { it.id }
+                .toSet()
+
+            // 1. Clean orphaned downloader_work task folders in cacheDir
+            val workRoot = File(context.cacheDir, "downloader_work")
+            if (workRoot.exists()) {
+                workRoot.listFiles()?.forEach { dir ->
+                    if (dir.name !in activeOrPausedIds) {
+                        val size = computeFileOrDirBytes(dir)
+                        if (runCatching { dir.deleteRecursively() }.getOrDefault(false)) {
+                            bytesFreed += size
+                        }
+                    }
+                }
+            }
+
+            // 2. Clean temporary extension archive staging folder
+            val extStaging = File(context.cacheDir, "ext_temp_staging")
+            if (extStaging.exists()) {
+                val now = System.currentTimeMillis()
+                extStaging.listFiles()?.forEach { f ->
+                    if (now - f.lastModified() > 60_000L) {
+                        val size = computeFileOrDirBytes(f)
+                        if (runCatching { f.deleteRecursively() }.getOrDefault(false)) {
+                            bytesFreed += size
+                        }
+                    }
+                }
+            }
+
+            // 3. Remove legacy unpacked extensions stored inside permanent filesDir (migrated to cacheDir)
+            val legacyFilesExt = File(context.filesDir, "browser_extensions")
+            if (legacyFilesExt.exists()) {
+                val size = computeFileOrDirBytes(legacyFilesExt)
+                if (runCatching { legacyFilesExt.deleteRecursively() }.getOrDefault(false)) {
+                    bytesFreed += size
+                }
+            }
+
+            // 4. Remove duplicate downloaded files in private getExternalFilesDir / filesDir
+            // that are already exported to public MediaStore Downloads or no longer referenced.
+            val referencedLocalPaths = _tasksFlow.value
+                .mapNotNull { task ->
+                    // If the task already has a valid public MediaStore URI, we do NOT need a duplicate multi-GB file in private User Data!
+                    if (!task.publicUriString.isNullOrBlank() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val dupPath = task.filePath
+                        if (!dupPath.isNullOrBlank()) {
+                            val dupFile = File(dupPath)
+                            val extBase = context.getExternalFilesDir(null)?.absolutePath
+                            val filesBase = context.filesDir.absolutePath
+                            if (dupFile.exists() && (
+                                    (extBase != null && dupFile.absolutePath.startsWith(extBase)) ||
+                                        dupFile.absolutePath.startsWith(filesBase)
+                                )
+                            ) {
+                                val len = dupFile.length()
+                                if (runCatching { dupFile.delete() }.getOrDefault(false)) {
+                                    bytesFreed += len
+                                }
+                            }
+                        }
+                        null
+                    } else {
+                        task.filePath
+                    }
+                }
+                .toSet()
+
+            val privateDownloadDirs = listOfNotNull(
+                context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS),
+                File(context.filesDir, "DDM")
+            )
+            privateDownloadDirs.forEach { rootDir ->
+                if (rootDir.exists()) {
+                    sweepUnreferencedFiles(rootDir, referencedLocalPaths) { freed ->
+                        bytesFreed += freed
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return bytesFreed
+    }
+
+    private fun sweepUnreferencedFiles(
+        dir: File,
+        referencedPaths: Set<String>,
+        onFreed: (Long) -> Unit
+    ) {
+        val children = dir.listFiles() ?: return
+        for (child in children) {
+            if (child.isDirectory) {
+                sweepUnreferencedFiles(child, referencedPaths, onFreed)
+                if (child.listFiles().isNullOrEmpty()) {
+                    runCatching { child.delete() }
+                }
+            } else if (child.absolutePath !in referencedPaths) {
+                val len = child.length()
+                if (runCatching { child.delete() }.getOrDefault(false)) {
+                    onFreed(len)
+                }
+            }
+        }
+    }
+
+    private fun computeFileOrDirBytes(file: File): Long {
+        if (!file.exists()) return 0L
+        if (file.isFile) return file.length()
+        var total = 0L
+        file.listFiles()?.forEach { child ->
+            total += computeFileOrDirBytes(child)
+        }
+        return total
     }
 
     fun hasActiveDownloads(): Boolean =
@@ -122,25 +278,142 @@ class DragonDownloadManager(
         }
     }
 
-    fun setWarpDnsEnabled(enabled: Boolean) {
-        prefs.edit()
-            .putBoolean("cloudflare_warp_dns_enabled_v2", enabled)
-            .putBoolean("cloudflare_warp_dns_enabled", enabled)
-            .remove("adguard_default_dns_enabled_v1")
-            .remove("unfiltered_adguard_dns_enabled_v1")
-            .apply()
-        warpDns.setEnabled(enabled)
-        _warpDnsEnabledFlow.value = warpDns.isEnabled
-        if (enabled) {
-            warpDns.prewarmCommonHosts(scope)
-            onFeedback("Cloudflare WARP DNS (1.1.1.1) ON • Accelerated DoH + 0ms multi-thread DNS cache active")
-        } else {
-            onFeedback("Cloudflare WARP DNS OFF • Using standard system DNS")
+    private fun loadPersistedCustomDnsServers(): List<CustomDnsServerEntry> {
+        val raw = prefs.getString("custom_dns_servers_v3", null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(raw)
+            val list = mutableListOf<CustomDnsServerEntry>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val id = obj.optString("id", "").ifBlank { UUID.randomUUID().toString() }
+                val name = obj.optString("name", "").trim()
+                val primary = obj.optString("primaryServer", "").trim()
+                val secondary = obj.optString("secondaryServer", "").trim()
+                if (name.isNotBlank() && primary.isNotBlank()) {
+                    list.add(
+                        CustomDnsServerEntry(
+                            id = id,
+                            name = name,
+                            primaryServer = primary,
+                            secondaryServer = secondary
+                        )
+                    )
+                }
+            }
+            list
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 
+    private fun persistCustomDnsServers(list: List<CustomDnsServerEntry>) {
+        try {
+            val arr = JSONArray()
+            list.forEach { entry ->
+                arr.put(
+                    JSONObject().apply {
+                        put("id", entry.id)
+                        put("name", entry.name)
+                        put("primaryServer", entry.primaryServer)
+                        put("secondaryServer", entry.secondaryServer)
+                    }
+                )
+            }
+            prefs.edit().putString("custom_dns_servers_v3", arr.toString()).apply()
+        } catch (_: Exception) {}
+    }
+
+    fun setDnsMode(mode: DnsProviderMode, customEntry: CustomDnsServerEntry? = _activeCustomDnsFlow.value) {
+        val resolvedCustom = if (mode == DnsProviderMode.CUSTOM_DNS) {
+            customEntry ?: _customDnsListFlow.value.firstOrNull()
+        } else {
+            customEntry
+        }
+        val finalMode = if (mode == DnsProviderMode.CUSTOM_DNS && resolvedCustom == null) {
+            DnsProviderMode.SYSTEM_DEFAULT
+        } else {
+            mode
+        }
+        warpDns.setDnsMode(finalMode, resolvedCustom)
+        _dnsModeFlow.value = warpDns.dnsMode
+        _warpDnsEnabledFlow.value = warpDns.isEnabled
+        _activeCustomDnsFlow.value = warpDns.activeCustomDns
+
+        prefs.edit()
+            .putString("dns_provider_mode_v3", finalMode.id)
+            .putBoolean("cloudflare_warp_dns_enabled_v2", finalMode == DnsProviderMode.CLOUDFLARE_WARP)
+            .putBoolean("cloudflare_warp_dns_enabled", finalMode == DnsProviderMode.CLOUDFLARE_WARP)
+            .putString("active_custom_dns_id_v3", resolvedCustom?.id ?: "")
+            .apply()
+
+        if (warpDns.isAnyCustomDnsActive) {
+            warpDns.prewarmCommonHosts(scope)
+        }
+
+        val feedbackMsg = when (finalMode) {
+            DnsProviderMode.SYSTEM_DEFAULT -> "DNS set to System Default (Off)"
+            DnsProviderMode.CLOUDFLARE_WARP -> "Cloudflare WARP DNS (1.1.1.1) ON • Accelerated DoH + 0ms DNS cache active"
+            DnsProviderMode.ADBLOCKER_DNS -> "AdBlocker DNS (AdGuard 94.140.14.14) ON • Blocking ads, popups & trackers"
+            DnsProviderMode.UNFILTERED_ADBLOCKER_DNS -> "Unfiltered AdGuard DNS (94.140.14.140) ON • Fast non-filtering DoH resolver"
+            DnsProviderMode.CUSTOM_DNS -> "Custom DNS (${resolvedCustom?.name ?: "Custom"}) ON • ${resolvedCustom?.primaryServer ?: ""}"
+        }
+        onFeedback(feedbackMsg)
+    }
+
+    fun addCustomDnsServer(
+        name: String,
+        primaryServer: String,
+        secondaryServer: String = "",
+        activateImmediately: Boolean = true
+    ): CustomDnsServerEntry? {
+        val cleanName = name.trim().ifBlank { "Custom DNS" }
+        val cleanPrimary = primaryServer.trim()
+        val cleanSecondary = secondaryServer.trim()
+        if (cleanPrimary.isBlank()) {
+            onFeedback("Please enter a valid DNS IPv4 address or https:// DoH URL")
+            return null
+        }
+        val newEntry = CustomDnsServerEntry(
+            id = "custom_" + UUID.randomUUID().toString().take(8),
+            name = cleanName,
+            primaryServer = cleanPrimary,
+            secondaryServer = cleanSecondary
+        )
+        val updated = _customDnsListFlow.value + newEntry
+        _customDnsListFlow.value = updated
+        persistCustomDnsServers(updated)
+        if (activateImmediately) {
+            setDnsMode(DnsProviderMode.CUSTOM_DNS, newEntry)
+        } else {
+            onFeedback("Saved Custom DNS: $cleanName")
+        }
+        return newEntry
+    }
+
+    fun removeCustomDnsServer(id: String) {
+        val updated = _customDnsListFlow.value.filterNot { it.id == id }
+        _customDnsListFlow.value = updated
+        persistCustomDnsServers(updated)
+        if (_activeCustomDnsFlow.value?.id == id) {
+            val nextCustom = updated.firstOrNull()
+            if (_dnsModeFlow.value == DnsProviderMode.CUSTOM_DNS) {
+                if (nextCustom != null) {
+                    setDnsMode(DnsProviderMode.CUSTOM_DNS, nextCustom)
+                } else {
+                    setDnsMode(DnsProviderMode.SYSTEM_DEFAULT, null)
+                }
+            } else {
+                _activeCustomDnsFlow.value = nextCustom
+            }
+        }
+    }
+
+    fun setWarpDnsEnabled(enabled: Boolean) {
+        setDnsMode(if (enabled) DnsProviderMode.CLOUDFLARE_WARP else DnsProviderMode.SYSTEM_DEFAULT)
+    }
+
     fun toggleWarpDns(): Boolean {
-        val next = !_warpDnsEnabledFlow.value
+        val next = _dnsModeFlow.value != DnsProviderMode.CLOUDFLARE_WARP
         setWarpDnsEnabled(next)
         return next
     }
@@ -197,6 +470,7 @@ class DragonDownloadManager(
     companion object {
         const val DRAGON_TOOL_ROOT_FOLDER = "DDM"
         const val DRAGON_TOOL_DISPLAY_PATH = "Download/DDM"
+        private const val KEY_DELETED_TASK_IDS = "deleted_task_ids_v1"
 
         val ALL_SUBFOLDERS: List<String> = DownloadFolderCategory.ALL_SUBFOLDERS
 
@@ -383,7 +657,8 @@ class DragonDownloadManager(
             activeConnections = _maxConnectionsFlow.value
         )
 
-        notificationController.onNewDownloadStarted()
+        removeDeletedTaskIds(listOf(taskId))
+        notificationController.onNewDownloadStarted(taskId)
         _tasksFlow.value = listOf(newTask) + _tasksFlow.value
         notificationController.syncTasks(_tasksFlow.value, force = true)
         persistTasks()
@@ -405,9 +680,14 @@ class DragonDownloadManager(
             val maxSmartRetries = task.maxRetries.coerceAtLeast(4)
 
             try {
-                // Check available storage space
+                // Check available storage space (generic files assemble & move in-place without 2x duplication)
                 val requiredBytes = task.totalBytes.coerceAtLeast(10L * 1024L * 1024L)
-                if (!hasEnoughStorage(requiredBytes * 2L)) {
+                val minStorageNeeded = if (task.isGenericFile) {
+                    requiredBytes + (32L * 1024L * 1024L)
+                } else {
+                    requiredBytes * 2L
+                }
+                if (!hasEnoughStorage(minStorageNeeded)) {
                     throw ExtractorException(
                         DownloaderErrorType.INSUFFICIENT_STORAGE,
                         "Insufficient device storage space to download and process this media file."
@@ -517,6 +797,7 @@ class DragonDownloadManager(
                         it.copy(
                             stage = DownloadStateStage.CONVERTING_MEDIA,
                             progress = 0.74f,
+                            speedBytesPerSec = 0L,
                             speedFormatted = "Formatting ${task.container.uppercase(Locale.US)} (${fmt.bitrateKbps.coerceAtLeast(128)} kbps)..."
                         )
                     }
@@ -594,13 +875,12 @@ class DragonDownloadManager(
                     val aBytesTrack = AtomicLong(0L)
                     val vTotalTrack = AtomicLong(fmt.contentLengthBytes.coerceAtLeast(0L))
                     val aTotalTrack = AtomicLong(fmt.secondaryAudioContentLength.coerceAtLeast(0L))
-                    val vSpeedTrack = AtomicLong(0L)
-                    val aSpeedTrack = AtomicLong(0L)
+                    val dashSpeedTracker = IdmAcceleratedDownloader.SpeedWindowTracker(0L)
 
                     fun emitCombinedDashProgress(activeConns: Int, segs: List<Float>, resumable: Boolean) {
                         val dlSum = vBytesTrack.get() + aBytesTrack.get()
                         val totSum = vTotalTrack.get() + aTotalTrack.get()
-                        val speedSum = vSpeedTrack.get() + aSpeedTrack.get()
+                        val speedSum = dashSpeedTracker.sampleSpeedBps(dlSum)
                         val frac = if (totSum > 0L) (dlSum.toFloat() / totSum.toFloat()).coerceIn(0f, 1f) else 0.5f
                         val overall = (0.02f + frac * 0.83f).coerceIn(0.02f, 0.85f)
                         val rem = if (totSum > dlSum) totSum - dlSum else -1L
@@ -637,7 +917,6 @@ class DragonDownloadManager(
                                 customProgressHandler = { upd ->
                                     vBytesTrack.set(upd.downloadedBytes)
                                     if (upd.totalBytes > 0L) vTotalTrack.set(upd.totalBytes)
-                                    vSpeedTrack.set(upd.speedBytesPerSec)
                                     emitCombinedDashProgress(upd.activeConnections, upd.segmentProgress, upd.supportsResume)
                                 }
                             )
@@ -656,7 +935,6 @@ class DragonDownloadManager(
                                 customProgressHandler = { upd ->
                                     aBytesTrack.set(upd.downloadedBytes)
                                     if (upd.totalBytes > 0L) aTotalTrack.set(upd.totalBytes)
-                                    aSpeedTrack.set(upd.speedBytesPerSec)
                                     emitCombinedDashProgress(upd.activeConnections, upd.segmentProgress, upd.supportsResume)
                                 }
                             )
@@ -670,6 +948,7 @@ class DragonDownloadManager(
                     updateTask(taskId) {
                         it.copy(
                             stage = DownloadStateStage.MERGING_STREAMS,
+                            speedBytesPerSec = 0L,
                             speedFormatted = "Muxing ${task.container.uppercase(Locale.US)}...",
                             downloadedBytes = (vBytes + aBytes).coerceAtLeast(it.downloadedBytes),
                             totalBytes = if (vBytes + aBytes > 0L) vBytes + aBytes else it.totalBytes,
@@ -793,6 +1072,7 @@ class DragonDownloadManager(
                             it.copy(
                                 stage = DownloadStateStage.CONVERTING_MEDIA,
                                 progress = 0.72f,
+                                speedBytesPerSec = 0L,
                                 speedFormatted = "Encoding ${fmt.resolutionHeight.coerceAtLeast(360)}p ${task.container.uppercase(Locale.US)}..."
                             )
                         }
@@ -816,6 +1096,7 @@ class DragonDownloadManager(
                     it.copy(
                         stage = DownloadStateStage.VALIDATING_OUTPUT,
                         progress = 0.98f,
+                        speedBytesPerSec = 0L,
                         speedFormatted = if (task.isGenericFile) "Verifying file integrity..." else "Verifying container..."
                     )
                 }
@@ -879,6 +1160,7 @@ class DragonDownloadManager(
                 }
 
                 // 5. Save verified file to DragonTool categorized subfolder and MediaStore
+                val verifiedFileSize = tempProcessedFile.length().coerceAtLeast(1L)
                 val savedResult = saveToDragonToolDownloads(
                     sourceFile = tempProcessedFile,
                     filename = task.filename,
@@ -890,10 +1172,10 @@ class DragonDownloadManager(
                     platform = task.platform
                 )
 
-                // Clean up temporary work directory
+                // Clean up temporary work directory immediately so User Data / Cache never bloats
                 try { workDir.deleteRecursively() } catch (_: Exception) {}
 
-                        val finalBytes = savedResult.first.length()
+                        val finalBytes = savedResult.first.length().takeIf { it > 0L } ?: verifiedFileSize
                         updateTask(taskId) {
                             it.copy(
                                 stage = DownloadStateStage.COMPLETED,
@@ -919,6 +1201,7 @@ class DragonDownloadManager(
                         }
                         notificationController.syncTasks(_tasksFlow.value, force = true)
                         persistTasks()
+                        cleanTemporaryAndRedundantStorage()
                         val folderLabel = displayFolderForTask(task)
                         onFeedback("Saved to $folderLabel: ${task.filename} (${formatBytes(finalBytes)})")
                         break
@@ -1227,14 +1510,35 @@ class DragonDownloadManager(
         out["Accept"] = "*/*"
 
         if (!isForeignCdn) {
-            val streamCookies = webViewExtractor.getCookiesForUrl(targetUrl)
-            if (!streamCookies.isNullOrBlank()) {
-                out["Cookie"] = streamCookies
+            val cookieMap = LinkedHashMap<String, String>()
+            fun absorbCookies(raw: String?) {
+                if (raw.isNullOrBlank()) return
+                raw.split(";").forEach { part ->
+                    val trimmed = part.trim()
+                    val eq = trimmed.indexOf('=')
+                    if (eq > 0) {
+                        val k = trimmed.substring(0, eq).trim()
+                        val v = trimmed.substring(eq + 1).trim()
+                        if (k.isNotEmpty() && v.isNotEmpty()) {
+                            cookieMap[k] = v
+                        }
+                    }
+                }
+            }
+            val refererUrl = baseHeaders.entries.firstOrNull { it.key.equals("Referer", ignoreCase = true) }?.value
+            if (!refererUrl.isNullOrBlank()) {
+                absorbCookies(webViewExtractor.getCookiesForUrl(refererUrl))
+            }
+            absorbCookies(webViewExtractor.getCookiesForUrl(targetUrl))
+            val explicitCookies = baseHeaders.entries.firstOrNull { it.key.equals("Cookie", ignoreCase = true) }?.value
+            absorbCookies(explicitCookies)
+            if (cookieMap.isNotEmpty()) {
+                out["Cookie"] = cookieMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
             }
         }
         baseHeaders.forEach { (k, v) ->
-            if (!isForeignCdn || (!k.equals("Cookie", ignoreCase = true) &&
-                (!isGoogleVideoCdn || (!k.equals("Origin", ignoreCase = true) && !k.equals("Referer", ignoreCase = true))))
+            if (!k.equals("Cookie", ignoreCase = true) &&
+                (!isForeignCdn || (!isGoogleVideoCdn || (!k.equals("Origin", ignoreCase = true) && !k.equals("Referer", ignoreCase = true))))
             ) {
                 out[k] = v
             }
@@ -1344,10 +1648,23 @@ class DragonDownloadManager(
                         maxRetries = maxOf(it.maxRetries, maxAttempts),
                         isSmartRetrying = true,
                         retryStatusText = "Smart Retry $attempt/$maxAttempts: $reason",
+                        speedBytesPerSec = 0L,
                         speedFormatted = "Smart Retry $attempt/$maxAttempts..."
                     )
                 }
                 notificationController.syncTasks(_tasksFlow.value, force = true)
+            },
+            onAssembling = {
+                if (customProgressHandler == null) {
+                    updateTask(taskId) {
+                        it.copy(
+                            speedBytesPerSec = 0L,
+                            speedFormatted = "Assembling chunks...",
+                            etaSeconds = 0L,
+                            etaFormatted = "Finishing..."
+                        )
+                    }
+                }
             },
             onProgress = progressHandler
         )
@@ -1787,6 +2104,7 @@ class DragonDownloadManager(
         }
 
         var lastTorrentUiReportMs = 0L
+        val torrentSpeedTracker = IdmAcceleratedDownloader.SpeedWindowTracker(0L)
         val output = TorrentEngine.downloadTorrentContent(
             sourceUrlOrMagnet = task.formatOption.streamUrl,
             httpClient = httpClient,
@@ -1795,12 +2113,11 @@ class DragonDownloadManager(
         ) { p ->
             val nowMs = SystemClock.elapsedRealtime()
             val isTerminal = p.totalBytes > 0L && p.downloadedBytes >= p.totalBytes
-            if (!isTerminal && (nowMs - lastTorrentUiReportMs) < 450L) {
+            if (!isTerminal && (nowMs - lastTorrentUiReportMs) < 350L) {
                 return@downloadTorrentContent
             }
             lastTorrentUiReportMs = nowMs
-            val elapsedSec = ((nowMs - startedMs) / 1000.0).coerceAtLeast(0.4)
-            val speed = (p.downloadedBytes / elapsedSec).toLong().coerceAtLeast(0L)
+            val speed = if (isTerminal) 0L else torrentSpeedTracker.sampleSpeedBps(p.downloadedBytes, nowMs)
             val frac = if (p.totalBytes > 0L) (p.downloadedBytes.toFloat() / p.totalBytes.toFloat()).coerceIn(0f, 0.99f) else -1f
             updateTask(taskId) {
                 it.copy(
@@ -1813,33 +2130,30 @@ class DragonDownloadManager(
             }
         }
 
-        val appTorrentDir = File(
-            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir,
-            torrentSubFolder
-        ).apply { mkdirs() }
-
+        val cacheTorrentDir = File(context.cacheDir, "ddm_exports/$torrentSubFolder").apply { mkdirs() }
         val savedLocalFiles = mutableListOf<File>()
         var firstPublicUri: Uri? = null
+        var totalExportedBytes = 0L
 
         output.allSavedFiles.forEach { src ->
             val rel = src.relativeTo(stagingOutput).path
-            val destLocal = File(appTorrentDir, rel).apply { parentFile?.mkdirs() }
-            src.copyTo(destLocal, overwrite = true)
-            savedLocalFiles.add(destLocal)
+            val fileLen = src.length()
+            totalExportedBytes += fileLen
+            val relParent = File(rel).parent?.replace('\\', '/')?.trim('/') ?: ""
+            val subRelativeDir = if (relParent.isNotBlank()) "$torrentSubFolder/$relParent" else torrentSubFolder
 
-            val parentPath = destLocal.parentFile?.absolutePath ?: ""
-            val baseDownloadsPath = (context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir).absolutePath
-            val subRelativeDir = if (parentPath.startsWith(baseDownloadsPath)) {
-                parentPath.removePrefix(baseDownloadsPath).removePrefix("/").ifBlank { torrentSubFolder }
-            } else {
-                torrentSubFolder
-            }
+            var exportedToPublic = false
+            @Suppress("DEPRECATION")
+            val publicTargetFile = File(
+                File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), subRelativeDir),
+                src.name
+            )
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 try {
                     val resolver = context.contentResolver
                     val values = ContentValues().apply {
-                        put(MediaStore.Downloads.DISPLAY_NAME, destLocal.name)
+                        put(MediaStore.Downloads.DISPLAY_NAME, src.name)
                         put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
                         put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/$subRelativeDir")
                         put(MediaStore.Downloads.IS_PENDING, 1)
@@ -1847,28 +2161,43 @@ class DragonDownloadManager(
                     val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                     if (uri != null) {
                         resolver.openOutputStream(uri)?.use { out ->
-                            FileInputStream(destLocal).use { input -> input.copyTo(out, bufferSize = 32 * 1024) }
+                            FileInputStream(src).use { input -> input.copyTo(out, bufferSize = 64 * 1024) }
                         }
                         values.clear()
                         values.put(MediaStore.Downloads.IS_PENDING, 0)
                         resolver.update(uri, values, null, null)
                         if (firstPublicUri == null) firstPublicUri = uri
+                        exportedToPublic = true
                     }
                 } catch (_: Exception) {}
             } else {
                 try {
-                    @Suppress("DEPRECATION")
-                    val pubRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                    val pubFile = File(File(pubRoot, subRelativeDir).apply { mkdirs() }, destLocal.name)
-                    destLocal.copyTo(pubFile, overwrite = true)
-                    MediaScannerConnection.scanFile(context, arrayOf(pubFile.absolutePath), null, null)
+                    publicTargetFile.parentFile?.mkdirs()
+                    src.copyTo(publicTargetFile, overwrite = true)
+                    MediaScannerConnection.scanFile(context, arrayOf(publicTargetFile.absolutePath), null, null)
+                    exportedToPublic = true
                 } catch (_: Exception) {}
+            }
+
+            if (exportedToPublic) {
+                // Delete temporary staging file so private App User Data does not grow
+                runCatching { src.delete() }
+                savedLocalFiles.add(publicTargetFile)
+            } else {
+                // Fallback (e.g. unit test environment where MediaStore is null): keep in cacheDir
+                val destCache = File(cacheTorrentDir, rel).apply { parentFile?.mkdirs() }
+                if (!src.renameTo(destCache)) {
+                    src.copyTo(destCache, overwrite = true)
+                    runCatching { src.delete() }
+                }
+                savedLocalFiles.add(destCache)
             }
         }
 
         val primarySaved = savedLocalFiles.firstOrNull() ?: output.primaryFile
-        val totalLen = savedLocalFiles.sumOf { it.length() }.coerceAtLeast(output.totalBytes)
+        val totalLen = totalExportedBytes.coerceAtLeast(output.totalBytes)
         val displayTitle = primarySaved.name
+        try { workDir.deleteRecursively() } catch (_: Exception) {}
         updateTask(taskId) {
             it.copy(
                 filename = displayTitle,
@@ -1892,6 +2221,7 @@ class DragonDownloadManager(
             )
         }
         persistTasks()
+        cleanTemporaryAndRedundantStorage()
         onFeedback("Saved to ${DownloadFolderCategory.TORRENT.displayPath}: $displayTitle (${formatBytes(totalLen)})")
     }
 
@@ -1914,13 +2244,12 @@ class DragonDownloadManager(
             url = url,
             platform = platform
         )
-        val appExternalDir = File(
-            context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir,
-            subFolder
-        ).apply { mkdirs() }
 
-        val targetLocalFile = File(appExternalDir, filename)
-        sourceFile.copyTo(targetLocalFile, overwrite = true)
+        @Suppress("DEPRECATION")
+        val publicFileRef = File(
+            File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), subFolder),
+            filename
+        )
 
         var publicUri: Uri? = null
 
@@ -1936,8 +2265,8 @@ class DragonDownloadManager(
                 val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                 if (uri != null) {
                     resolver.openOutputStream(uri)?.use { out ->
-                        FileInputStream(targetLocalFile).use { input ->
-                            input.copyTo(out, bufferSize = 32 * 1024)
+                        FileInputStream(sourceFile).use { input ->
+                            input.copyTo(out, bufferSize = 64 * 1024)
                         }
                     }
                     values.clear()
@@ -1946,21 +2275,38 @@ class DragonDownloadManager(
                     publicUri = uri
                 }
             } catch (_: Exception) {}
+
+            if (publicUri != null) {
+                // Exported to public Download/DDM folder via MediaStore!
+                // Immediately delete the temporary sourceFile so private App User Data size stays 0B!
+                runCatching { sourceFile.delete() }
+                return publicFileRef to publicUri
+            }
         } else {
             try {
-                @Suppress("DEPRECATION")
-                val publicDir = File(
-                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                    subFolder
-                ).apply { mkdirs() }
-                val pubFile = File(publicDir, filename)
-                targetLocalFile.copyTo(pubFile, overwrite = true)
-                MediaScannerConnection.scanFile(context, arrayOf(pubFile.absolutePath), arrayOf(mimeType), null)
-                return pubFile to null
+                publicFileRef.parentFile?.mkdirs()
+                if (!sourceFile.renameTo(publicFileRef)) {
+                    sourceFile.copyTo(publicFileRef, overwrite = true)
+                    runCatching { sourceFile.delete() }
+                }
+                MediaScannerConnection.scanFile(context, arrayOf(publicFileRef.absolutePath), arrayOf(mimeType), null)
+                return publicFileRef to null
             } catch (_: Exception) {}
         }
 
-        return targetLocalFile to publicUri
+        // Fallback when MediaStore is unavailable (e.g. local JVM unit tests):
+        // Store in cacheDir/ddm_exports instead of filesDir/getExternalFilesDir so it is counted as cache, not permanent User Data.
+        val cacheExportDir = File(context.cacheDir, "ddm_exports/$subFolder").apply { mkdirs() }
+        val targetCacheFile = File(cacheExportDir, filename)
+        if (targetCacheFile.exists()) {
+            runCatching { targetCacheFile.delete() }
+        }
+        if (!sourceFile.renameTo(targetCacheFile)) {
+            sourceFile.copyTo(targetCacheFile, overwrite = true)
+            runCatching { sourceFile.delete() }
+        }
+
+        return targetCacheFile to null
     }
 
     fun pauseDownload(taskId: String) {
@@ -1985,7 +2331,8 @@ class DragonDownloadManager(
         val task = _tasksFlow.value.find { it.id == taskId } ?: return
         if (task.stage != DownloadStateStage.PAUSED && task.stage != DownloadStateStage.FAILED) return
 
-        notificationController.onNewDownloadStarted()
+        removeDeletedTaskIds(listOf(taskId))
+        notificationController.onNewDownloadStarted(taskId)
         val resumedStage = when {
             task.isGenericFile -> DownloadStateStage.DOWNLOADING_FILE
             task.isAudioOnly -> DownloadStateStage.DOWNLOADING_AUDIO
@@ -2007,7 +2354,8 @@ class DragonDownloadManager(
     fun retryDownload(taskId: String) {
         val task = _tasksFlow.value.find { it.id == taskId } ?: return
         activeJobs.remove(taskId)?.cancel()
-        notificationController.onNewDownloadStarted()
+        removeDeletedTaskIds(listOf(taskId))
+        notificationController.onNewDownloadStarted(taskId)
 
         // Smart Retry preserves valid partial chunk progress unless explicitly corrupted,
         // and automatically refreshes expired links inside launchDownloadWorker.
@@ -2090,14 +2438,39 @@ class DragonDownloadManager(
         onFeedback("Download Notification Panel active in system notification shade")
     }
 
-    fun dismissNotificationPanel() {
-        notificationController.dismissPanel()
+    fun dismissNotificationPanel(dismissedTaskId: String? = null) {
+        notificationController.dismissPanel(_tasksFlow.value, dismissedTaskId)
         onFeedback("Download Notification Panel hidden")
+    }
+
+    fun pruneDeletedCompletedTasks() {
+        ensurePersistedTasksLoaded()
+        val removedIds = mutableListOf<String>()
+        val remainingTasks: List<DownloaderTask>
+        synchronized(tasksLoadLock) {
+            val current = _tasksFlow.value
+            val missing = current.filter { task ->
+                task.stage == DownloadStateStage.COMPLETED &&
+                    !doesCompletedTaskFileExist(task.publicUriString, task.filePath)
+            }
+            if (missing.isEmpty()) return
+            missing.forEach { removedIds.add(it.id) }
+            recordDeletedTaskIds(removedIds)
+            val missingIdSet = removedIds.toSet()
+            remainingTasks = current.filterNot { it.id in missingIdSet }
+            _tasksFlow.value = remainingTasks
+            persistTasks(commit = true)
+        }
+        removedIds.forEach { removedId ->
+            notificationController.onTaskRemovedOrDeleted(removedId, remainingTasks)
+        }
+        cleanTemporaryAndRedundantStorage()
     }
 
     fun cancelDownload(taskId: String) {
         val task = _tasksFlow.value.find { it.id == taskId }
         activeJobs.remove(taskId)?.cancel()
+        recordDeletedTaskIds(listOf(taskId))
 
         val customBackendUrl = _backendUrlFlow.value.takeIf { it.isNotBlank() }
         if (customBackendUrl != null && task != null && task.jobId != task.id) {
@@ -2109,13 +2482,32 @@ class DragonDownloadManager(
         val workDir = File(context.cacheDir, "downloader_work/$taskId")
         try { workDir.deleteRecursively() } catch (_: Exception) {}
 
-        _tasksFlow.value = _tasksFlow.value.filter { it.id != taskId }
-        notificationController.syncTasks(_tasksFlow.value, force = true)
-        persistTasks()
+        // Also delete any private cache/app-local copy if the task was cancelled
+        task?.filePath?.takeIf { it.isNotBlank() }?.let { path ->
+            val f = File(path)
+            if (f.exists() && (f.absolutePath.startsWith(context.cacheDir.absolutePath) ||
+                    f.absolutePath.startsWith(context.filesDir.absolutePath) ||
+                    context.getExternalFilesDir(null)?.let { f.absolutePath.startsWith(it.absolutePath) } == true)
+            ) {
+                runCatching { f.delete() }
+            }
+        }
+
+        val updatedTasks = _tasksFlow.value.filter { it.id != taskId }
+        _tasksFlow.value = updatedTasks
+        persistTasks(commit = true)
+        notificationController.onTaskRemovedOrDeleted(taskId, updatedTasks)
+        cleanTemporaryAndRedundantStorage()
         syncBackgroundDownloadService()
     }
 
     private fun resolveTaskContentUri(context: Context, task: DownloaderTask): Uri? {
+        val pubUri = task.publicUriString?.takeIf { it.isNotBlank() }?.let {
+            try { Uri.parse(it) } catch (_: Exception) { null }
+        }
+        if (pubUri != null) {
+            return pubUri
+        }
         val path = task.filePath
         if (!path.isNullOrBlank()) {
             val file = File(path)
@@ -2129,9 +2521,7 @@ class DragonDownloadManager(
                 } catch (_: Exception) {}
             }
         }
-        return task.publicUriString?.takeIf { it.isNotBlank() }?.let {
-            try { Uri.parse(it) } catch (_: Exception) { null }
-        }
+        return null
     }
 
     fun openDownloadedFile(context: Context, task: DownloaderTask) {
@@ -2311,40 +2701,133 @@ class DragonDownloadManager(
         notificationController.syncTasks(_tasksFlow.value, force = false)
     }
 
-    private fun persistTasks() {
-        try {
-            val arr = JSONArray()
-            _tasksFlow.value.take(50).forEach { t ->
-                val obj = JSONObject().apply {
-                    put("id", t.id)
-                    put("url", t.url)
-                    put("title", t.title)
-                    put("creator", t.creator)
-                    put("filename", t.filename)
-                    put("thumbnailUrl", t.thumbnailUrl)
-                    put("platform", t.platform.name)
-                    put("qualityLabel", t.qualityLabel)
-                    put("container", t.container)
-                    put("mimeType", t.mimeType)
-                    put("isAudioOnly", t.isAudioOnly)
-                    put("isGenericFile", t.isGenericFile)
-                    put("stage", if (t.stage.isActive) DownloadStateStage.PAUSED.name else t.stage.name)
-                    put("progress", t.progress.toDouble())
-                    put("downloadedBytes", t.downloadedBytes)
-                    put("totalBytes", t.totalBytes)
-                    put("filePath", t.filePath ?: "")
-                    put("publicUriString", t.publicUriString ?: "")
-                    put("verifiedResolution", t.verifiedResolution ?: "")
-                    put("verifiedDuration", t.verifiedDuration ?: "")
-                    put("verifiedCodec", t.verifiedCodec ?: "")
-                    put("streamUrl", t.formatOption.streamUrl)
-                    put("errorMessage", t.errorMessage ?: "")
-                    put("createdAtMs", t.createdAtMs)
-                    put("batchSessionId", t.batchSessionId ?: "")
-                }
-                arr.put(obj)
+    private fun recordDeletedTaskIds(ids: Collection<String>) {
+        if (ids.isEmpty()) return
+        synchronized(deletedTaskIds) {
+            ids.filter { it.isNotBlank() }.forEach { deletedTaskIds.add(it) }
+            if (deletedTaskIds.size > 300) {
+                val trimmed = deletedTaskIds.toList().takeLast(250)
+                deletedTaskIds.clear()
+                deletedTaskIds.addAll(trimmed)
             }
-            prefs.edit().putString("saved_tasks_v2", arr.toString()).apply()
+            runCatching {
+                prefs.edit().putStringSet(KEY_DELETED_TASK_IDS, deletedTaskIds.toSet()).commit()
+            }
+        }
+    }
+
+    private fun removeDeletedTaskIds(ids: Collection<String>) {
+        if (ids.isEmpty()) return
+        synchronized(deletedTaskIds) {
+            var changed = false
+            ids.forEach { id ->
+                if (deletedTaskIds.remove(id)) changed = true
+            }
+            if (changed) {
+                runCatching {
+                    prefs.edit().putStringSet(KEY_DELETED_TASK_IDS, deletedTaskIds.toSet()).commit()
+                }
+            }
+        }
+    }
+
+    private fun doesCompletedTaskFileExist(
+        publicUriString: String?,
+        filePath: String?
+    ): Boolean {
+        if (!publicUriString.isNullOrBlank()) {
+            val uri = runCatching { Uri.parse(publicUriString) }.getOrNull() ?: return false
+            try {
+                val projection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.IS_TRASHED)
+                } else {
+                    arrayOf(MediaStore.MediaColumns._ID)
+                }
+                val cursor = context.contentResolver.query(uri, projection, null, null, null)
+                if (cursor != null) {
+                    cursor.use { c ->
+                        if (!c.moveToFirst()) return false
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            val trashedIdx = c.getColumnIndex(MediaStore.MediaColumns.IS_TRASHED)
+                            if (trashedIdx >= 0 && c.getInt(trashedIdx) == 1) {
+                                return false
+                            }
+                        }
+                    }
+                    return try {
+                        context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { true } ?: false
+                    } catch (_: FileNotFoundException) {
+                        false
+                    } catch (_: SecurityException) {
+                        true
+                    } catch (_: Exception) {
+                        true
+                    }
+                }
+                // Cursor may be null in local JVM/Robolectric tests without MediaStore provider;
+                // fall through to local filePath verification below.
+                if (filePath.isNullOrBlank()) return false
+            } catch (_: FileNotFoundException) {
+                return false
+            } catch (_: SecurityException) {
+                if (!filePath.isNullOrBlank()) {
+                    val localFile = File(filePath)
+                    if (localFile.parentFile?.canRead() == true && !localFile.exists()) return false
+                }
+                return true
+            } catch (_: Exception) {
+                if (filePath.isNullOrBlank()) return false
+            }
+        }
+        if (filePath.isNullOrBlank()) return false
+        val localFile = File(filePath)
+        return localFile.exists() && localFile.length() > 0L
+    }
+
+    private fun persistTasks(commit: Boolean = false) {
+        try {
+            val deletedSnapshot = synchronized(deletedTaskIds) { deletedTaskIds.toSet() }
+            val arr = JSONArray()
+            _tasksFlow.value
+                .asSequence()
+                .filter { it.id !in deletedSnapshot }
+                .take(50)
+                .forEach { t ->
+                    val obj = JSONObject().apply {
+                        put("id", t.id)
+                        put("url", t.url)
+                        put("title", t.title)
+                        put("creator", t.creator)
+                        put("filename", t.filename)
+                        put("thumbnailUrl", t.thumbnailUrl)
+                        put("platform", t.platform.name)
+                        put("qualityLabel", t.qualityLabel)
+                        put("container", t.container)
+                        put("mimeType", t.mimeType)
+                        put("isAudioOnly", t.isAudioOnly)
+                        put("isGenericFile", t.isGenericFile)
+                        put("stage", if (t.stage.isActive) DownloadStateStage.PAUSED.name else t.stage.name)
+                        put("progress", t.progress.toDouble())
+                        put("downloadedBytes", t.downloadedBytes)
+                        put("totalBytes", t.totalBytes)
+                        put("filePath", t.filePath ?: "")
+                        put("publicUriString", t.publicUriString ?: "")
+                        put("verifiedResolution", t.verifiedResolution ?: "")
+                        put("verifiedDuration", t.verifiedDuration ?: "")
+                        put("verifiedCodec", t.verifiedCodec ?: "")
+                        put("streamUrl", t.formatOption.streamUrl)
+                        put("errorMessage", t.errorMessage ?: "")
+                        put("createdAtMs", t.createdAtMs)
+                        put("batchSessionId", t.batchSessionId ?: "")
+                    }
+                    arr.put(obj)
+                }
+            val editor = prefs.edit().putString("saved_tasks_v2", arr.toString())
+            if (commit) {
+                editor.commit()
+            } else {
+                editor.apply()
+            }
         } catch (_: Exception) {}
     }
 
@@ -2353,12 +2836,25 @@ class DragonDownloadManager(
             val raw = prefs.getString("saved_tasks_v2", null) ?: return
             val arr = JSONArray(raw)
             val loaded = mutableListOf<DownloaderTask>()
+            val deletedSnapshot = synchronized(deletedTaskIds) { deletedTaskIds.toSet() }
+            val prunedIds = mutableListOf<String>()
+            var didPrune = false
+
             for (i in 0 until arr.length()) {
                 val obj = arr.optJSONObject(i) ?: continue
+                val id = obj.optString("id", "").ifBlank { UUID.randomUUID().toString() }
+                if (id in deletedSnapshot) {
+                    prunedIds.add(id)
+                    didPrune = true
+                    continue
+                }
                 val filePath = obj.optString("filePath", "").ifBlank { null }
+                val publicUriString = obj.optString("publicUriString", "").ifBlank { null }
                 val stageStr = obj.optString("stage", DownloadStateStage.COMPLETED.name)
                 val stage = DownloadStateStage.values().firstOrNull { it.name == stageStr } ?: DownloadStateStage.COMPLETED
-                if (stage == DownloadStateStage.COMPLETED && (filePath == null || !File(filePath).exists())) {
+                if (stage == DownloadStateStage.COMPLETED && !doesCompletedTaskFileExist(publicUriString, filePath)) {
+                    prunedIds.add(id)
+                    didPrune = true
                     continue
                 }
                 val platformStr = obj.optString("platform", MediaPlatform.DIRECT.name)
@@ -2383,7 +2879,7 @@ class DragonDownloadManager(
                 )
                 loaded.add(
                     DownloaderTask(
-                        id = obj.optString("id", UUID.randomUUID().toString()),
+                        id = id,
                         url = obj.optString("url", ""),
                         title = obj.optString("title", "Downloaded Media"),
                         creator = obj.optString("creator", ""),
@@ -2401,7 +2897,7 @@ class DragonDownloadManager(
                         downloadedBytes = obj.optLong("downloadedBytes", totalB),
                         totalBytes = totalB,
                         filePath = filePath,
-                        publicUriString = obj.optString("publicUriString", "").ifBlank { null },
+                        publicUriString = publicUriString,
                         verifiedResolution = obj.optString("verifiedResolution", "").ifBlank { null },
                         verifiedDuration = obj.optString("verifiedDuration", "").ifBlank { null },
                         verifiedCodec = obj.optString("verifiedCodec", "").ifBlank { null },
@@ -2413,6 +2909,13 @@ class DragonDownloadManager(
                 )
             }
             _tasksFlow.value = loaded
+            if (didPrune) {
+                recordDeletedTaskIds(prunedIds)
+                persistTasks(commit = true)
+                prunedIds.forEach { removedId ->
+                    notificationController.onTaskRemovedOrDeleted(removedId, loaded)
+                }
+            }
         } catch (_: Exception) {}
     }
 

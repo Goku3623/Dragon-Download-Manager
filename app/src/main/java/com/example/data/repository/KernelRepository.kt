@@ -7325,39 +7325,14 @@ class KernelRepository private constructor(@Volatile private var context: Contex
 
     fun grantAccessibilityViaRoot() {
         scope.launch {
-            val pkg = context.packageName
-            val serviceComponent = "$pkg/com.example.service.DragonAccessibilityMonitorService"
             val hasRoot = RootHelper.refreshRootStatus()
             _isRootGrantedFlow.value = hasRoot
             if (hasRoot) {
-                val cmd = """
-                    pm grant $pkg android.permission.PACKAGE_USAGE_STATS 2>/dev/null || true
-                    pm grant $pkg android.permission.WRITE_SECURE_SETTINGS 2>/dev/null || true
-                    pm grant $pkg android.permission.WRITE_SETTINGS 2>/dev/null || true
-                    appops set $pkg GET_USAGE_STATS allow 2>/dev/null || true
-                    appops set $pkg BIND_ACCESSIBILITY_SERVICE allow 2>/dev/null || true
-                    appops set $pkg ACCESS_ACCESSIBILITY allow 2>/dev/null || true
-                    cur_acc=${'$'}(settings get secure enabled_accessibility_services 2>/dev/null)
-                    if [ -z "${'$'}cur_acc" ] || [ "${'$'}cur_acc" = "null" ]; then
-                        settings put secure enabled_accessibility_services "$serviceComponent" 2>/dev/null || true
-                    elif ! echo "${'$'}cur_acc" | grep -q "$serviceComponent"; then
-                        settings put secure enabled_accessibility_services "${'$'}cur_acc:$serviceComponent" 2>/dev/null || true
-                    fi
-                    settings put secure accessibility_enabled 1 2>/dev/null || true
-                """.trimIndent()
-                RootHelper.executeCommand(cmd)
                 _isAccessibilityEnabledFlow.value = true
                 enforceActivePerformanceRulesAsync(forceImmediate = true)
-                _lastActionFeedbackFlow.value = "Accessibility & App Monitor active"
+                _lastActionFeedbackFlow.value = "App Monitor active"
             } else {
-                try {
-                    val intent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                    }
-                    context.startActivity(intent)
-                } catch (_: Exception) {
-                }
-                _lastActionFeedbackFlow.value = "Enable Dragon Kernel Accessibility Service in Settings"
+                _lastActionFeedbackFlow.value = "App Monitor running in standard mode"
             }
         }
     }
@@ -7680,12 +7655,6 @@ class KernelRepository private constructor(@Volatile private var context: Contex
         _frameGenConfigFlow.value = updated
         saveFrameGenPrefs(updated)
 
-        scope.launch(Dispatchers.IO) {
-            if (RootHelper.isRootAvailable) {
-                RootHelper.executeCommand("appops set ${context.packageName} SYSTEM_ALERT_WINDOW allow 2>/dev/null || true")
-            }
-        }
-
         val caps = _frameGenCapabilitiesFlow.value
         rebuildAddedGamesListSync(caps, updatedPkgs)
         _detectedGamesCompatibilityFlow.value = _detectedGamesCompatibilityFlow.value.map { item ->
@@ -7963,12 +7932,6 @@ class KernelRepository private constructor(@Volatile private var context: Contex
         saveFrameGenPrefs(updated)
         if (!enabled) {
             FrameGenMiniOverlayManager.hide(context)
-        } else {
-            scope.launch(Dispatchers.IO) {
-                if (RootHelper.isRootAvailable) {
-                    RootHelper.executeCommand("appops set ${context.packageName} SYSTEM_ALERT_WINDOW allow 2>/dev/null || true")
-                }
-            }
         }
         updateFrameGenTelemetrySync()
         _lastActionFeedbackFlow.value = if (enabled) {
@@ -7997,13 +7960,6 @@ class KernelRepository private constructor(@Volatile private var context: Contex
     }
 
     fun setFrameGenFloatingPreviewActive(active: Boolean) {
-        if (active && !android.provider.Settings.canDrawOverlays(context)) {
-            scope.launch(Dispatchers.IO) {
-                if (RootHelper.isRootAvailable) {
-                    RootHelper.executeCommand("appops set ${context.packageName} SYSTEM_ALERT_WINDOW allow 2>/dev/null || true")
-                }
-            }
-        }
         val cur = _frameGenConfigFlow.value
         val updated = cur.copy(floatingWindowPreviewActive = active)
         _frameGenConfigFlow.value = updated

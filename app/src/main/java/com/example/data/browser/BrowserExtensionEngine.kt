@@ -2,6 +2,7 @@ package com.example.data.browser
 
 import android.content.Context
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.webkit.WebResourceResponse
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -14,11 +15,14 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import android.util.JsonReader
+import android.util.JsonToken
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
+import java.io.InputStreamReader
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -75,14 +79,20 @@ data class BrowserExtension(
     val hostPermissions: List<String> = listOf("<all_urls>"),
     val contentScripts: List<ExtensionContentScriptRule> = emptyList(),
     val netRules: List<ExtensionNetRule> = emptyList(),
-    val installedAtMs: Long = System.currentTimeMillis()
+    val installedAtMs: Long = System.currentTimeMillis(),
+    val optionsPath: String? = null,
+    val optionsOpenInTab: Boolean = false,
+    val author: String = "",
+    val homepageUrl: String = ""
 )
 
 /**
  * Full-featured Browser Extension Runtime Engine for Dragon Browser.
  *
  * Supports installing extensions directly from the Chrome Web Store (`chromewebstore.google.com`),
- * store URLs / 32-character Extension IDs, direct `.crx` download links, or local storage (`OpenDocument`):
+ * store URLs / 32-character Extension IDs, direct `.crx` download links, local files (`OpenDocument`),
+ * or unpacked extension folders (`OpenDocumentTree` / directory path):
+ * - Unpacked extension folders containing `manifest.json` (MV2 / MV3, `_locales`, popup, DNR, JS/CSS) or scripts
  * - `.zip`, `.crx` (Chrome Extension CRX2/CRX3 header auto-unwrapped), `.xpi` (Firefox WebExtension)
  * - `.user.js` / `.js` (Tampermonkey / Violentmonkey / Greasemonkey Userscripts)
  * - `.css` / `.user.css` (Stylus UserStyles)
@@ -101,7 +111,11 @@ class BrowserExtensionEngine(private val context: Context) {
 
     private val prefs = context.getSharedPreferences("dragon_browser_extensions_v1", Context.MODE_PRIVATE)
     private val kvStoragePrefs = context.getSharedPreferences("dragon_browser_ext_storage_kv", Context.MODE_PRIVATE)
-    private val extensionsRootDir: File = File(context.filesDir, "browser_extensions").apply { mkdirs() }
+
+    // Store unpacked extension packages inside cacheDir rather than filesDir so Android OS
+    // does not bloat permanent App User Data size, while keeping temporary archive staging isolated.
+    private val extensionsRootDir: File = File(context.cacheDir, "browser_extensions_store").apply { mkdirs() }
+    private val tempStagingDir: File = File(context.cacheDir, "ext_temp_staging").apply { mkdirs() }
 
     @Volatile
     private var crossOriginHttpClient: OkHttpClient = buildHttpClient(Dns.SYSTEM)
@@ -109,6 +123,8 @@ class BrowserExtensionEngine(private val context: Context) {
     private fun buildHttpClient(dns: Dns): OkHttpClient {
         return OkHttpClient.Builder()
             .dns(dns)
+            .proxySelector(BrowserProxyManager.okHttpProxySelector)
+            .proxyAuthenticator(BrowserProxyManager.okHttpProxyAuthenticator)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(25, TimeUnit.SECONDS)
             .followRedirects(true)
@@ -124,7 +140,86 @@ class BrowserExtensionEngine(private val context: Context) {
     val extensionsFlow: StateFlow<List<BrowserExtension>> = _extensionsFlow.asStateFlow()
 
     init {
+        migrateLegacyFilesDirExtensionsAndCleanTemp()
         loadExtensions()
+        pruneOrphanedExtensionDirectories()
+    }
+
+    /**
+     * Migrates any legacy extensions unpacked in `context.filesDir/browser_extensions` into
+     * `context.cacheDir/browser_extensions_store` and deletes the old `filesDir` directory
+     * so App User Data size immediately shrinks.
+     */
+    private fun migrateLegacyFilesDirExtensionsAndCleanTemp() {
+        try {
+            val legacyRoot = File(context.filesDir, "browser_extensions")
+            if (legacyRoot.exists() && legacyRoot.isDirectory) {
+                legacyRoot.listFiles()?.forEach { child ->
+                    if (child.isDirectory) {
+                        val dest = File(extensionsRootDir, child.name)
+                        if (!dest.exists()) {
+                            runCatching { child.copyRecursively(dest, overwrite = true) }
+                        }
+                    }
+                }
+                runCatching { legacyRoot.deleteRecursively() }
+            }
+            // Clear any leftover temporary archive staging files
+            if (tempStagingDir.exists()) {
+                tempStagingDir.listFiles()?.forEach { f ->
+                    runCatching { f.deleteRecursively() }
+                }
+            }
+            // Also clean any stray temp_ext_*.tmp files in extensionsRootDir
+            extensionsRootDir.listFiles()?.forEach { f ->
+                if (f.isFile && f.name.startsWith("temp_ext_")) {
+                    runCatching { f.delete() }
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Removes any unpacked extension folders in `extensionsRootDir` that are not referenced by
+     * an installed extension, freeing temporary storage allocation automatically.
+     */
+    fun pruneOrphanedExtensionDirectories(): Long {
+        var bytesFreed = 0L
+        try {
+            val activeIds = _extensionsFlow.value.map { it.id }.toSet()
+            val activePaths = _extensionsFlow.value.mapNotNull {
+                it.installDirPath.takeIf { p -> p.isNotBlank() }?.let { p -> File(p).absolutePath }
+            }.toSet()
+
+            if (tempStagingDir.exists()) {
+                tempStagingDir.listFiles()?.forEach { f ->
+                    val sz = computeDirBytes(f)
+                    if (runCatching { f.deleteRecursively() }.getOrDefault(false)) {
+                        bytesFreed += sz
+                    }
+                }
+            }
+
+            extensionsRootDir.listFiles()?.forEach { dir ->
+                val isReferenced = dir.name in activeIds ||
+                    activePaths.any { p -> p == dir.absolutePath || p.startsWith(dir.absolutePath + File.separator) }
+                if (!isReferenced) {
+                    val sz = computeDirBytes(dir)
+                    if (runCatching { dir.deleteRecursively() }.getOrDefault(false)) {
+                        bytesFreed += sz
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return bytesFreed
+    }
+
+    private fun computeDirBytes(file: File): Long {
+        if (!file.exists()) return 0L
+        if (file.isFile) return file.length()
+        var sum = 0L
+        file.listFiles()?.forEach { sum += computeDirBytes(it) }
+        return sum
     }
 
     fun isInstalledFromStoreId(storeId: String?): Boolean {
@@ -146,13 +241,97 @@ class BrowserExtensionEngine(private val context: Context) {
     fun removeExtension(extensionId: String): Boolean {
         val target = _extensionsFlow.value.find { it.id == extensionId } ?: return false
         if (target.installDirPath.isNotBlank()) {
-            runCatching { File(target.installDirPath).deleteRecursively() }
+            val installDir = File(target.installDirPath)
+            runCatching { installDir.deleteRecursively() }
+            // Also delete parent container inside extensionsRootDir if manifest was in a subfolder
+            val rootContainer = File(extensionsRootDir, target.id)
+            if (rootContainer.exists()) {
+                runCatching { rootContainer.deleteRecursively() }
+            }
         }
         kvStoragePrefs.edit().remove("kv_${target.id}").apply()
         val updated = _extensionsFlow.value.filterNot { it.id == extensionId }
         _extensionsFlow.value = updated
         persistExtensions(updated)
+        pruneOrphanedExtensionDirectories()
         return true
+    }
+
+    /**
+     * Live Modification Panel API: Allows modifying an installed extension's display name,
+     * URL match patterns, injection timing (`document_start`, `document_end`, `document_idle`),
+     * and custom injected JS/CSS rules directly from the Extension Modification Panel.
+     */
+    fun updateExtensionConfiguration(
+        extensionId: String,
+        newName: String? = null,
+        matchPatternsRaw: String? = null,
+        runAt: String? = null,
+        customJs: String? = null,
+        customCss: String? = null
+    ): BrowserExtension? {
+        val current = _extensionsFlow.value.find { it.id == extensionId } ?: return null
+        val cleanName = newName?.trim()?.takeIf { it.isNotBlank() } ?: current.name
+        val parsedMatches = matchPatternsRaw
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?.ifEmpty { null }
+            ?: current.hostPermissions.ifEmpty { listOf("<all_urls>") }
+        val resolvedRunAt = runAt?.trim()?.takeIf {
+            it in setOf("document_start", "document_end", "document_idle")
+        } ?: current.contentScripts.firstOrNull()?.runAt ?: "document_end"
+
+        val baseRules = if (current.contentScripts.isNotEmpty()) {
+            current.contentScripts.mapIndexed { idx, rule ->
+                if (idx == 0) {
+                    rule.copy(
+                        matches = parsedMatches,
+                        runAt = resolvedRunAt,
+                        inlineJs = customJs ?: rule.inlineJs,
+                        inlineCss = customCss ?: rule.inlineCss
+                    )
+                } else {
+                    rule.copy(matches = parsedMatches, runAt = resolvedRunAt)
+                }
+            }
+        } else {
+            listOf(
+                ExtensionContentScriptRule(
+                    matches = parsedMatches,
+                    inlineJs = customJs.orEmpty(),
+                    inlineCss = customCss.orEmpty(),
+                    runAt = resolvedRunAt,
+                    allFrames = true
+                )
+            )
+        }
+
+        // Persist custom JS/CSS to disk if custom extension directory exists
+        if (current.installDirPath.isNotBlank()) {
+            val dir = File(current.installDirPath)
+            if (dir.exists() && !current.isBuiltIn) {
+                if (customJs != null && current.kind == ExtensionKind.USERSCRIPT) {
+                    val f = File(dir, current.contentScripts.firstOrNull()?.jsFiles?.firstOrNull() ?: "content.js")
+                    runCatching { f.writeText(customJs, Charsets.UTF_8) }
+                }
+                if (customCss != null && current.kind == ExtensionKind.USERSTYLE) {
+                    val f = File(dir, current.contentScripts.firstOrNull()?.cssFiles?.firstOrNull() ?: "style.css")
+                    runCatching { f.writeText(customCss, Charsets.UTF_8) }
+                }
+            }
+        }
+
+        val updatedExt = current.copy(
+            name = cleanName,
+            hostPermissions = parsedMatches,
+            contentScripts = baseRules
+        )
+
+        val updatedList = _extensionsFlow.value.map { if (it.id == extensionId) updatedExt else it }
+        _extensionsFlow.value = updatedList
+        persistExtensions(updatedList)
+        return updatedExt
     }
 
     /**
@@ -325,16 +504,235 @@ class BrowserExtensionEngine(private val context: Context) {
     }
 
     /**
-     * Imports an extension package or script from a local storage Uri (`content://` or `file://`).
-     * Supports `.zip`, `.crx`, `.xpi`, `.user.js`, `.js`, `.css`, and `manifest.json`.
+     * Imports an extension package, script, or unpacked `file://` directory from a Uri.
+     * Supports `.zip`, `.crx`, `.xpi`, `.user.js`, `.js`, `.css`, `manifest.json`, and `file://` directories.
      */
     fun importExtensionFromUri(uri: Uri): Result<BrowserExtension> {
         return runCatching {
+            if (uri.scheme.equals("file", ignoreCase = true) && !uri.path.isNullOrBlank()) {
+                val localFile = File(uri.path!!)
+                if (localFile.isDirectory) {
+                    return@runCatching importUnpackedExtensionFromDirectory(localFile).getOrThrow()
+                }
+                if (localFile.isFile && localFile.name.equals("manifest.json", ignoreCase = true)) {
+                    val parentDir = localFile.parentFile
+                    if (parentDir != null && parentDir.isDirectory) {
+                        return@runCatching importUnpackedExtensionFromDirectory(
+                            sourceDir = parentDir,
+                            sourceLabel = parentDir.name.ifBlank { "unpacked-extension" }
+                        ).getOrThrow()
+                    }
+                }
+            }
             val displayName = resolveDisplayName(uri) ?: uri.lastPathSegment?.substringAfterLast('/') ?: "extension.zip"
             val input = context.contentResolver.openInputStream(uri)
                 ?: throw IllegalArgumentException("Unable to read selected extension file from storage.")
             input.use {
                 importExtensionFromStream(displayName, it).getOrThrow()
+            }
+        }
+    }
+
+    /**
+     * Imports an unpacked browser extension from a SAF directory tree Uri (`OpenDocumentTree`).
+     * Recursively copies all extension files (`manifest.json`, `_locales`, scripts, styles, icons, rules)
+     * into isolated cache storage with path-traversal protection and storage cleanup.
+     */
+    fun importUnpackedExtensionFromTreeUri(treeUri: Uri): Result<BrowserExtension> {
+        return runCatching {
+            if (treeUri.scheme.equals("file", ignoreCase = true) && !treeUri.path.isNullOrBlank()) {
+                return@runCatching importUnpackedExtensionFromDirectory(File(treeUri.path!!)).getOrThrow()
+            }
+
+            val rootDocId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
+                ?.takeIf { it.isNotBlank() }
+                ?: throw IllegalArgumentException("Selected item is not a valid extension folder.")
+
+            val rootDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId)
+            val folderDisplayName = resolveTreeDocumentDisplayName(rootDocUri)
+                ?: rootDocId.substringAfterLast(':').substringAfterLast('/').ifBlank { "unpacked-extension" }
+
+            val extId = "ext_" + UUID.randomUUID().toString().replace("-", "").take(14)
+            extensionsRootDir.mkdirs()
+            val extractRoot = File(extensionsRootDir, extId).apply { mkdirs() }
+            val canonicalExtractRoot = runCatching { extractRoot.canonicalPath }.getOrNull() ?: extractRoot.absolutePath
+
+            var copiedCount = 0
+            var totalBytesCopied = 0L
+            val maxTotalUncompressedBytes = 384L * 1024L * 1024L
+            val buf = ByteArray(32 * 1024)
+
+            fun copyTreeDirectory(parentDocId: String, relDirPrefix: String, depth: Int) {
+                if (depth > 16) return
+                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+                val projection = arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE
+                )
+                val childEntries = mutableListOf<Triple<String, String, String>>()
+                context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                    val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    while (cursor.moveToNext()) {
+                        val childId = if (idIdx >= 0) cursor.getString(idIdx).orEmpty() else ""
+                        val childName = if (nameIdx >= 0) cursor.getString(nameIdx).orEmpty() else ""
+                        val childMime = if (mimeIdx >= 0) cursor.getString(mimeIdx).orEmpty() else ""
+                        if (childId.isNotBlank() && childName.isNotBlank()) {
+                            childEntries.add(Triple(childId, childName, childMime))
+                        }
+                    }
+                } ?: throw IllegalStateException("Unable to list files inside the selected folder.")
+
+                for ((childId, rawName, childMime) in childEntries) {
+                    val safeSegment = rawName.replace('\\', '/').trim('/')
+                    if (safeSegment.isBlank() || safeSegment == "." || safeSegment == ".." || safeSegment.contains('/')) {
+                        continue
+                    }
+                    val relPath = if (relDirPrefix.isBlank()) safeSegment else "$relDirPrefix/$safeSegment"
+                    val isDir = childMime == DocumentsContract.Document.MIME_TYPE_DIR
+                    if (isDir) {
+                        if (shouldSkipUnnecessaryArchiveEntry("$relPath/")) continue
+                        val targetDir = File(extractRoot, relPath)
+                        val canonicalDir = runCatching { targetDir.canonicalPath }.getOrNull() ?: targetDir.absolutePath
+                        if (canonicalDir == canonicalExtractRoot || canonicalDir.startsWith(canonicalExtractRoot + File.separator)) {
+                            targetDir.mkdirs()
+                            copyTreeDirectory(childId, relPath, depth + 1)
+                        }
+                    } else {
+                        if (shouldSkipUnnecessaryArchiveEntry(relPath) ||
+                            com.example.data.security.MalwareProtectionEngine.isDisallowedExtensionBinaryName(relPath)
+                        ) continue
+                        val outFile = File(extractRoot, relPath)
+                        val canonicalOut = runCatching { outFile.canonicalPath }.getOrNull() ?: outFile.absolutePath
+                        if (!canonicalOut.startsWith(canonicalExtractRoot + File.separator)) continue
+                        if (copiedCount >= 6000) {
+                            throw IllegalArgumentException("Extension package exceeds 6,000-file safety limit.")
+                        }
+                        outFile.parentFile?.mkdirs()
+                        val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
+                        val inputStream = context.contentResolver.openInputStream(fileUri)
+                            ?: throw IllegalStateException("Unable to read '$relPath' from extension folder.")
+                        inputStream.use { input ->
+                            outFile.outputStream().use { out ->
+                                var read: Int
+                                while (input.read(buf).also { read = it } != -1) {
+                                    totalBytesCopied += read
+                                    if (totalBytesCopied > maxTotalUncompressedBytes) {
+                                        throw IllegalArgumentException("Unpacked extension folder exceeds 384MB size limit.")
+                                    }
+                                    out.write(buf, 0, read)
+                                }
+                            }
+                        }
+                        copiedCount++
+                    }
+                }
+            }
+
+            try {
+                copyTreeDirectory(rootDocId, "", 0)
+                if (copiedCount == 0) {
+                    throw IllegalArgumentException("Selected folder contains no extension files.")
+                }
+                val parsed = finalizeExtractedExtensionDirectory(
+                    extId = extId,
+                    sourceFileName = folderDisplayName,
+                    extractRoot = extractRoot,
+                    titleHint = folderDisplayName
+                )
+                registerInstalledExtension(parsed)
+            } catch (t: Throwable) {
+                runCatching { extractRoot.deleteRecursively() }
+                throw t
+            }
+        }
+    }
+
+    /**
+     * Imports an unpacked browser extension directly from a local filesystem directory.
+     */
+    fun importUnpackedExtensionFromDirectory(
+        sourceDir: File,
+        sourceLabel: String = sourceDir.name.ifBlank { "unpacked-extension" },
+        titleHint: String? = null
+    ): Result<BrowserExtension> {
+        return runCatching {
+            require(sourceDir.exists() && sourceDir.isDirectory) {
+                "Selected path is not an accessible extension folder."
+            }
+
+            val extId = "ext_" + UUID.randomUUID().toString().replace("-", "").take(14)
+            extensionsRootDir.mkdirs()
+            val extractRoot = File(extensionsRootDir, extId).apply { mkdirs() }
+            val canonicalExtractRoot = runCatching { extractRoot.canonicalPath }.getOrNull() ?: extractRoot.absolutePath
+            val canonicalSourceRoot = runCatching { sourceDir.canonicalPath }.getOrNull() ?: sourceDir.absolutePath
+
+            var copiedCount = 0
+            var totalBytesCopied = 0L
+            val maxTotalUncompressedBytes = 384L * 1024L * 1024L
+            val buf = ByteArray(32 * 1024)
+
+            try {
+                sourceDir.walkTopDown()
+                    .onEnter { dir ->
+                        if (dir == sourceDir) return@onEnter true
+                        val relDir = dir.relativeTo(sourceDir).path.replace('\\', '/')
+                        val canonicalDir = runCatching { dir.canonicalPath }.getOrNull() ?: dir.absolutePath
+                        canonicalDir.startsWith(canonicalSourceRoot) &&
+                            !shouldSkipUnnecessaryArchiveEntry("$relDir/")
+                    }
+                    .filter { it.isFile }
+                    .forEach { srcFile ->
+                        val relPath = srcFile.relativeTo(sourceDir).path
+                            .replace('\\', '/')
+                            .split('/')
+                            .filter { it.isNotBlank() && it != "." && it != ".." }
+                            .joinToString("/")
+                        if (relPath.isBlank() ||
+                            shouldSkipUnnecessaryArchiveEntry(relPath) ||
+                            com.example.data.security.MalwareProtectionEngine.isDisallowedExtensionBinaryName(relPath)
+                        ) return@forEach
+
+                        val outFile = File(extractRoot, relPath)
+                        val canonicalOut = runCatching { outFile.canonicalPath }.getOrNull() ?: outFile.absolutePath
+                        if (!canonicalOut.startsWith(canonicalExtractRoot + File.separator)) return@forEach
+                        if (copiedCount >= 6000) {
+                            throw IllegalArgumentException("Extension package exceeds 6,000-file safety limit.")
+                        }
+
+                        outFile.parentFile?.mkdirs()
+                        srcFile.inputStream().buffered(32 * 1024).use { input ->
+                            outFile.outputStream().use { out ->
+                                var read: Int
+                                while (input.read(buf).also { read = it } != -1) {
+                                    totalBytesCopied += read
+                                    if (totalBytesCopied > maxTotalUncompressedBytes) {
+                                        throw IllegalArgumentException("Unpacked extension folder exceeds 384MB size limit.")
+                                    }
+                                    out.write(buf, 0, read)
+                                }
+                            }
+                        }
+                        copiedCount++
+                    }
+
+                if (copiedCount == 0) {
+                    throw IllegalArgumentException("Selected folder contains no valid extension files.")
+                }
+
+                val cleanSourceLabel = sourceLabel.trim().ifBlank { "unpacked-extension" }
+                val parsed = finalizeExtractedExtensionDirectory(
+                    extId = extId,
+                    sourceFileName = cleanSourceLabel,
+                    extractRoot = extractRoot,
+                    titleHint = titleHint ?: cleanSourceLabel
+                )
+                registerInstalledExtension(parsed)
+            } catch (t: Throwable) {
+                runCatching { extractRoot.deleteRecursively() }
+                throw t
             }
         }
     }
@@ -355,23 +753,24 @@ class BrowserExtensionEngine(private val context: Context) {
         titleHint: String? = null
     ): Result<BrowserExtension> {
         return runCatching {
-            val tempFile = File(extensionsRootDir, "temp_ext_${UUID.randomUUID()}.tmp")
+            tempStagingDir.mkdirs()
+            val tempFile = File(tempStagingDir, "temp_ext_${UUID.randomUUID()}.tmp")
             try {
                 tempFile.outputStream().use { out ->
-                    val buf = ByteArray(8192)
+                    val buf = ByteArray(32 * 1024)
                     var read: Int
                     var totalRead = 0L
                     while (inputStream.read(buf).also { read = it } != -1) {
                         totalRead += read
-                        if (totalRead > 64 * 1024 * 1024L) {
-                            throw IllegalArgumentException("Extension file exceeds 64MB size limit.")
+                        if (totalRead > 256L * 1024L * 1024L) {
+                            throw IllegalArgumentException("Extension package exceeds 256MB compressed size limit.")
                         }
                         out.write(buf, 0, read)
                     }
                 }
                 require(tempFile.length() > 0) { "Selected extension file is empty." }
 
-                val headerBytes = ByteArray(512.coerceAtMost(tempFile.length().toInt()))
+                val headerBytes = ByteArray(65536.coerceAtMost(tempFile.length().toInt()))
                 tempFile.inputStream().use { it.read(headerBytes) }
 
                 val lowerName = fileName.lowercase(Locale.US).trim()
@@ -395,7 +794,7 @@ class BrowserExtensionEngine(private val context: Context) {
                     lowerName.endsWith(".json") -> installDirectManifestJsonExtension(fileName, tempFile.readText(Charsets.UTF_8))
                     else -> {
                         val text = tempFile.readText(Charsets.UTF_8)
-                        val trimmed = text.trimStart()
+                        val trimmed = text.trimStart('\uFEFF').trimStart()
                         if (trimmed.startsWith("{") && trimmed.contains("\"manifest_version\"")) {
                             installDirectManifestJsonExtension(fileName, text)
                         } else if (trimmed.startsWith("/* ==UserStyle==", ignoreCase = true)) {
@@ -406,31 +805,70 @@ class BrowserExtensionEngine(private val context: Context) {
                     }
                 }
 
-                val installed = parsedExtension.copy(
-                    storeId = resolvedStoreId ?: parsedExtension.storeId
+                val installed = registerInstalledExtension(
+                    parsedExtension = parsedExtension,
+                    resolvedStoreId = resolvedStoreId
                 )
-
-                val toReplace = _extensionsFlow.value.filter { existing ->
-                    !existing.isBuiltIn && (
-                        (!installed.storeId.isNullOrBlank() && existing.storeId.equals(installed.storeId, ignoreCase = true)) ||
-                            (existing.name.equals(installed.name, ignoreCase = true) && existing.sourceFileName == installed.sourceFileName)
-                        )
-                }
-                toReplace.forEach { old ->
-                    if (old.installDirPath.isNotBlank() && old.installDirPath != installed.installDirPath) {
-                        runCatching { File(old.installDirPath).deleteRecursively() }
-                    }
-                }
-                val replaceIds = toReplace.map { it.id }.toSet()
-                val filtered = _extensionsFlow.value.filterNot { it.id in replaceIds }
-                val updated = listOf(installed) + filtered
-                _extensionsFlow.value = updated
-                persistExtensions(updated)
                 installed
             } finally {
                 runCatching { tempFile.delete() }
             }
         }
+    }
+
+    private fun registerInstalledExtension(
+        parsedExtension: BrowserExtension,
+        resolvedStoreId: String? = null
+    ): BrowserExtension {
+        val installed = parsedExtension.copy(
+            storeId = resolvedStoreId ?: parsedExtension.storeId
+        )
+
+        val toReplace = _extensionsFlow.value.filter { existing ->
+            !existing.isBuiltIn && (
+                (!installed.storeId.isNullOrBlank() && existing.storeId.equals(installed.storeId, ignoreCase = true)) ||
+                    (existing.name.equals(installed.name, ignoreCase = true) && existing.sourceFileName == installed.sourceFileName)
+                )
+        }
+        toReplace.forEach { old ->
+            if (old.installDirPath.isNotBlank() && old.installDirPath != installed.installDirPath) {
+                runCatching { File(old.installDirPath).deleteRecursively() }
+                val rootContainer = File(extensionsRootDir, old.id)
+                if (rootContainer.exists() && rootContainer.absolutePath != installed.installDirPath) {
+                    runCatching { rootContainer.deleteRecursively() }
+                }
+            }
+        }
+        val replaceIds = toReplace.map { it.id }.toSet()
+        val filtered = _extensionsFlow.value.filterNot { it.id in replaceIds }
+        val updated = listOf(installed) + filtered
+        _extensionsFlow.value = updated
+        persistExtensions(updated)
+        pruneOrphanedExtensionDirectories()
+        return installed
+    }
+
+    private fun shouldSkipUnnecessaryArchiveEntry(safeRelPath: String): Boolean {
+        val lower = safeRelPath.lowercase(Locale.US)
+        // Skip source maps, OS metadata, IDE metadata, and git metadata that bloat storage on big extensions
+        if (lower.endsWith(".map") ||
+            lower.endsWith(".ts") ||
+            lower.endsWith(".md") ||
+            lower == "__macosx" ||
+            lower.startsWith("__macosx/") ||
+            lower.contains("/__macosx/") ||
+            lower == ".git" ||
+            lower.startsWith(".git/") ||
+            lower.contains("/.git/") ||
+            lower == ".idea" ||
+            lower.startsWith(".idea/") ||
+            lower == ".vscode" ||
+            lower.startsWith(".vscode/") ||
+            lower.endsWith(".ds_store")
+        ) {
+            return true
+        }
+        return false
     }
 
     private fun installArchiveExtensionFromFile(
@@ -440,12 +878,15 @@ class BrowserExtensionEngine(private val context: Context) {
         titleHint: String? = null
     ): BrowserExtension {
         val extId = "ext_" + UUID.randomUUID().toString().replace("-", "").take(14)
+        extensionsRootDir.mkdirs()
         val extractRoot = File(extensionsRootDir, extId).apply { mkdirs() }
         val canonicalExtractRoot = runCatching { extractRoot.canonicalPath }.getOrNull() ?: extractRoot.absolutePath
 
         var extractedCount = 0
         var totalBytesExtracted = 0L
-        archiveFile.inputStream().use { fileInput ->
+        val maxTotalUncompressedBytes = 384L * 1024L * 1024L // 384 MB safety ceiling for huge unpacked extensions
+
+        archiveFile.inputStream().buffered(32 * 1024).use { fileInput ->
             if (zipStartOffset > 0) {
                 var skipped = 0L
                 while (skipped < zipStartOffset) {
@@ -455,47 +896,47 @@ class BrowserExtensionEngine(private val context: Context) {
                 }
             }
             ZipInputStream(fileInput).use { zis ->
-                var entry = zis.nextEntry
+                val buf = ByteArray(32 * 1024)
+                var entry = runCatching { zis.nextEntry }.getOrNull()
                 while (entry != null) {
-                    if (extractedCount > 2000 || totalBytesExtracted > 64 * 1024 * 1024L) {
-                        extractRoot.deleteRecursively()
-                        throw IllegalArgumentException("Extension archive exceeds maximum file count or 64MB uncompressed size limit.")
-                    }
                     val safeRelPath = entry.name
                         .replace('\\', '/')
                         .split('/')
                         .filter { it.isNotBlank() && it != "." && it != ".." }
                         .joinToString("/")
 
-                    if (safeRelPath.isNotBlank()) {
+                    if (safeRelPath.isNotBlank() &&
+                        !shouldSkipUnnecessaryArchiveEntry(safeRelPath) &&
+                        !com.example.data.security.MalwareProtectionEngine.isDisallowedExtensionBinaryName(safeRelPath)
+                    ) {
                         val outFile = File(extractRoot, safeRelPath)
                         val canonicalOut = runCatching { outFile.canonicalPath }.getOrNull() ?: outFile.absolutePath
-                        if (!canonicalOut.startsWith(canonicalExtractRoot)) {
-                            entry = zis.nextEntry
-                            continue
-                        }
-
-                        if (entry.isDirectory) {
-                            outFile.mkdirs()
-                        } else {
-                            outFile.parentFile?.mkdirs()
-                            outFile.outputStream().use { out ->
-                                val buf = ByteArray(8192)
-                                var read: Int
-                                while (zis.read(buf).also { read = it } != -1) {
-                                    totalBytesExtracted += read
-                                    if (totalBytesExtracted > 64 * 1024 * 1024L) {
-                                        extractRoot.deleteRecursively()
-                                        throw IllegalArgumentException("Extension archive exceeds 64MB uncompressed size limit.")
-                                    }
-                                    out.write(buf, 0, read)
+                        if (canonicalOut.startsWith(canonicalExtractRoot + File.separator)) {
+                            if (entry.isDirectory) {
+                                outFile.mkdirs()
+                            } else {
+                                if (extractedCount >= 6000) {
+                                    extractRoot.deleteRecursively()
+                                    throw IllegalArgumentException("Extension archive exceeds 6,000-file safety limit.")
                                 }
+                                outFile.parentFile?.mkdirs()
+                                outFile.outputStream().use { out ->
+                                    var read: Int
+                                    while (zis.read(buf).also { read = it } != -1) {
+                                        totalBytesExtracted += read
+                                        if (totalBytesExtracted > maxTotalUncompressedBytes) {
+                                            extractRoot.deleteRecursively()
+                                            throw IllegalArgumentException("Extension archive exceeds 384MB uncompressed safety limit.")
+                                        }
+                                        out.write(buf, 0, read)
+                                    }
+                                }
+                                extractedCount++
                             }
-                            extractedCount++
                         }
                     }
-                    zis.closeEntry()
-                    entry = zis.nextEntry
+                    runCatching { zis.closeEntry() }
+                    entry = runCatching { zis.nextEntry }.getOrNull()
                 }
             }
         }
@@ -505,20 +946,47 @@ class BrowserExtensionEngine(private val context: Context) {
             throw IllegalArgumentException("Archive contains no valid extension files.")
         }
 
-        // Find manifest.json (at root or inside a single top-level directory)
+        return finalizeExtractedExtensionDirectory(
+            extId = extId,
+            sourceFileName = fileName,
+            extractRoot = extractRoot,
+            titleHint = titleHint
+        )
+    }
+
+    private fun finalizeExtractedExtensionDirectory(
+        extId: String,
+        sourceFileName: String,
+        extractRoot: File,
+        titleHint: String? = null
+    ): BrowserExtension {
+        val scanResult = com.example.data.security.MalwareProtectionEngine.scanExtensionDirectory(extractRoot)
+        if (!scanResult.isClean) {
+            com.example.data.security.MalwareProtectionEngine.recordThreatEvent(
+                context = context,
+                category = scanResult.threatCategory,
+                severity = com.example.data.security.SecuritySeverity.CRITICAL,
+                target = sourceFileName,
+                reason = scanResult.reason,
+                blocked = true
+            )
+            extractRoot.deleteRecursively()
+            throw SecurityException(scanResult.reason)
+        }
+        // Find manifest.json (at root or inside a nested directory)
         val manifestFile = findManifestFile(extractRoot)
         if (manifestFile != null) {
             val baseDir = manifestFile.parentFile ?: extractRoot
             return parseWebExtensionManifest(
                 extId = extId,
-                sourceFileName = fileName,
+                sourceFileName = sourceFileName,
                 baseDir = baseDir,
                 manifestJsonText = manifestFile.readText(Charsets.UTF_8),
                 titleHint = titleHint
             )
         }
 
-        // Fallback: if archive contains .user.js / .js / .css files without manifest.json, bundle them automatically!
+        // Fallback: if folder/archive contains .user.js / .js / .css files without manifest.json, bundle them automatically!
         val allFiles = extractRoot.walkTopDown().filter { it.isFile }.toList()
         val jsFiles = allFiles.filter { it.name.endsWith(".js", ignoreCase = true) }
             .map { it.relativeTo(extractRoot).path.replace('\\', '/') }
@@ -527,22 +995,32 @@ class BrowserExtensionEngine(private val context: Context) {
 
         if (jsFiles.isEmpty() && cssFiles.isEmpty()) {
             extractRoot.deleteRecursively()
-            throw IllegalArgumentException("No manifest.json, .js, or .css found in extension archive.")
+            throw IllegalArgumentException("No manifest.json, .js, or .css found in extension package.")
         }
 
-        val cleanTitle = titleHint?.takeIf { it.isNotBlank() }
-            ?: fileName.substringBeforeLast('.').replace('_', ' ').replace('-', ' ').trim()
-                .ifBlank { "Imported Archive Extension" }
+        // Check if any .js file has a ==UserScript== header with @name
+        var scriptExtractedName: String? = null
+        val firstJsFile = allFiles.firstOrNull { it.name.endsWith(".js", ignoreCase = true) }
+        if (firstJsFile != null && firstJsFile.length() < 2 * 1024 * 1024L) {
+            val headText = runCatching { firstJsFile.readText(Charsets.UTF_8).take(4096) }.getOrNull().orEmpty()
+            val nameMatch = Regex("""^//\s*@name\s+(.+)$""", RegexOption.MULTILINE).find(headText)
+            if (nameMatch != null) {
+                scriptExtractedName = nameMatch.groupValues[1].trim().takeIf { it.isNotBlank() }
+            }
+        }
+
+        val cleanTitle = scriptExtractedName
+            ?: cleanFallbackExtensionTitle(titleHint, sourceFileName)
 
         return BrowserExtension(
             id = extId,
             name = cleanTitle,
             version = "1.0.0",
-            description = "Imported archive with ${jsFiles.size} script(s) and ${cssFiles.size} style(s)",
+            description = "Imported unpacked extension with ${jsFiles.size} script(s) and ${cssFiles.size} style(s)",
             kind = ExtensionKind.WEB_EXTENSION_MV3,
             enabled = true,
             isBuiltIn = false,
-            sourceFileName = fileName,
+            sourceFileName = sourceFileName,
             installDirPath = extractRoot.absolutePath,
             permissions = listOf("storage", "activeTab", "scripting"),
             hostPermissions = listOf("<all_urls>"),
@@ -558,6 +1036,29 @@ class BrowserExtensionEngine(private val context: Context) {
         )
     }
 
+    private fun cleanFallbackExtensionTitle(titleHint: String?, sourceFileName: String): String {
+        val cleanedHint = titleHint
+            ?.replace(Regex("""\s*[-–|]\s*Chrome Web Store.*$""", RegexOption.IGNORE_CASE), "")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() && !CWS_ID_REGEX.matches(it) }
+        if (cleanedHint != null) return cleanedHint
+
+        val base = sourceFileName
+            .removeSuffix(".user.js")
+            .removeSuffix(".user.css")
+            .substringBeforeLast('.')
+            .replace(Regex("""\(\d+\)$"""), "")
+            .replace('_', ' ')
+            .replace('-', ' ')
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+        return if (base.isNotBlank() && !CWS_ID_REGEX.matches(base)) {
+            base
+        } else {
+            "Web Extension"
+        }
+    }
+
     private fun parseWebExtensionManifest(
         extId: String,
         sourceFileName: String,
@@ -565,24 +1066,42 @@ class BrowserExtensionEngine(private val context: Context) {
         manifestJsonText: String,
         titleHint: String? = null
     ): BrowserExtension {
-        val manifest = JSONObject(manifestJsonText)
+        val sanitizedJson = manifestJsonText.trimStart('\uFEFF').trim()
+        val manifest = JSONObject(sanitizedJson)
         val defaultLocale = manifest.optString("default_locale", "en").ifBlank { "en" }
         val i18nMap = loadLocaleMessages(baseDir, defaultLocale).toMutableMap()
         i18nMap["@@extension_id"] = extId
         i18nMap["@@ui_locale"] = defaultLocale
         i18nMap["@@bidi_dir"] = "ltr"
 
-        val rawName = manifest.optString("name", "").ifBlank {
-            titleHint?.takeIf { it.isNotBlank() } ?: sourceFileName.substringBeforeLast('.')
+        fun resolveCleanLabel(raw: String?): String? {
+            if (raw.isNullOrBlank()) return null
+            val resolved = resolveI18nPlaceholders(raw.trim(), i18nMap).trim()
+            return resolved.takeIf { it.isNotBlank() && !it.contains("__MSG_") }
         }
-        val resolvedName = resolveI18nPlaceholders(rawName, i18nMap)
-            .let { if (it.startsWith("__MSG_") && !titleHint.isNullOrBlank()) titleHint else it }
-            .ifBlank { titleHint ?: sourceFileName.substringBeforeLast('.') }
 
-        val version = manifest.optString("version", "1.0.0").ifBlank { "1.0.0" }
+        val actionObj = manifest.optJSONObject("action")
+            ?: manifest.optJSONObject("browser_action")
+            ?: manifest.optJSONObject("page_action")
+
+        val resolvedName = resolveCleanLabel(manifest.optString("name"))
+            ?: resolveCleanLabel(manifest.optString("short_name"))
+            ?: resolveCleanLabel(actionObj?.optString("default_title"))
+            ?: i18nMap["extname"]?.takeIf { it.isNotBlank() && !it.contains("__MSG_") }
+            ?: i18nMap["appname"]?.takeIf { it.isNotBlank() && !it.contains("__MSG_") }
+            ?: i18nMap["extensionname"]?.takeIf { it.isNotBlank() && !it.contains("__MSG_") }
+            ?: i18nMap["ext_name"]?.takeIf { it.isNotBlank() && !it.contains("__MSG_") }
+            ?: i18nMap["app_name"]?.takeIf { it.isNotBlank() && !it.contains("__MSG_") }
+            ?: cleanFallbackExtensionTitle(titleHint, sourceFileName)
+
+        val version = manifest.optString("version_name", "").takeIf { it.isNotBlank() }
+            ?: manifest.optString("version", "1.0.0").ifBlank { "1.0.0" }
         val rawDesc = manifest.optString("description", "")
-        val resolvedDesc = resolveI18nPlaceholders(rawDesc, i18nMap)
-            .ifBlank { "WebExtension package ($sourceFileName)" }
+        val resolvedDesc = resolveCleanLabel(rawDesc)
+            ?: i18nMap["extdesc"]?.takeIf { it.isNotBlank() }
+            ?: i18nMap["appdesc"]?.takeIf { it.isNotBlank() }
+            ?: i18nMap["description"]?.takeIf { it.isNotBlank() }
+            ?: "WebExtension package ($resolvedName)"
 
         val manifestVersion = manifest.optInt("manifest_version", 3)
         val kind = if (manifestVersion == 2) ExtensionKind.WEB_EXTENSION_MV2 else ExtensionKind.WEB_EXTENSION_MV3
@@ -592,6 +1111,12 @@ class BrowserExtensionEngine(private val context: Context) {
             for (i in 0 until arr.length()) {
                 val p = arr.optString(i, "").trim()
                 if (p.isNotBlank()) permissions.add(p)
+            }
+        }
+        manifest.optJSONArray("optional_permissions")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val p = arr.optString(i, "").trim()
+                if (p.isNotBlank() && p !in permissions) permissions.add(p)
             }
         }
 
@@ -610,31 +1135,57 @@ class BrowserExtensionEngine(private val context: Context) {
             hostPermissions.add("<all_urls>")
         }
 
-        // Parse popup (MV3 action / MV2 browser_action / page_action), falling back to options_ui / options_page
+        // Parse popup (MV3 action / MV2 browser_action / page_action), falling back to options_ui / options_page / side_panel
         fun resolveExistingPagePath(rawPath: String?): String? {
             val cleaned = rawPath?.trim()
                 ?.removePrefix("./")
                 ?.removePrefix("/")
                 ?.takeIf { it.isNotBlank() } ?: return null
             val filePart = cleaned.substringBefore('?').substringBefore('#')
-            return if (filePart.isNotBlank() && File(baseDir, filePart).exists()) cleaned else null
+            if (filePart.isBlank()) return null
+            if (File(baseDir, filePart).exists()) return cleaned
+            // Case-insensitive or nested lookup
+            val found = baseDir.walkTopDown().maxDepth(4).firstOrNull {
+                it.isFile && it.relativeTo(baseDir).path.replace('\\', '/').equals(filePart, ignoreCase = true)
+            } ?: baseDir.walkTopDown().maxDepth(3).firstOrNull {
+                it.isFile && it.name.equals(File(filePart).name, ignoreCase = true)
+            }
+            if (found != null) {
+                val suffix = cleaned.substringAfter(filePart, "")
+                return found.relativeTo(baseDir).path.replace('\\', '/') + suffix
+            }
+            return null
         }
 
         val actionPopup = resolveExistingPagePath(
             manifest.optJSONObject("action")?.optString("default_popup")
                 ?: manifest.optJSONObject("browser_action")?.optString("default_popup")
                 ?: manifest.optJSONObject("page_action")?.optString("default_popup")
+                ?: manifest.optJSONObject("side_panel")?.optString("default_path")
+                ?: manifest.optJSONObject("sidebar_action")?.optString("default_panel")
         )
+        val optionsUiObj = manifest.optJSONObject("options_ui")
         val optionsFallback = resolveExistingPagePath(
-            manifest.optJSONObject("options_ui")?.optString("page")
+            optionsUiObj?.optString("page")
                 ?: manifest.optString("options_page")
         )
+        val optionsOpenInTab = optionsUiObj?.optBoolean("open_in_tab", false) == true
+        val author = resolveCleanLabel(manifest.optString("author"))
+            ?: resolveCleanLabel(manifest.optJSONObject("developer")?.optString("name"))
+            ?: ""
+        val homepageUrl = manifest.optString("homepage_url", "").trim()
         val genericHtmlFallback = if (actionPopup == null && optionsFallback == null) {
-            baseDir.walkTopDown().maxDepth(3).firstOrNull {
+            val htmlCandidates = baseDir.walkTopDown().maxDepth(3).filter {
                 it.isFile && (it.name.endsWith(".html", true) || it.name.endsWith(".htm", true)) &&
-                !it.name.equals("background.html", true) && !it.name.equals("bg.html", true) &&
-                !it.name.equals("worker.html", true)
-            }?.relativeTo(baseDir)?.path?.replace('\\', '/')
+                    !it.name.equals("background.html", true) && !it.name.equals("bg.html", true) &&
+                    !it.name.equals("worker.html", true) && !it.name.equals("offscreen.html", true)
+            }.toList()
+            val prioritized = htmlCandidates.firstOrNull {
+                val n = it.name.lowercase(Locale.US)
+                n.contains("popup") || n.contains("options") || n.contains("panel") ||
+                    n.contains("dashboard") || n.contains("settings") || n.contains("index")
+            } ?: htmlCandidates.firstOrNull()
+            prioritized?.relativeTo(baseDir)?.path?.replace('\\', '/')
         } else {
             null
         }
@@ -754,7 +1305,11 @@ class BrowserExtensionEngine(private val context: Context) {
             permissions = permissions,
             hostPermissions = hostPermissions,
             contentScripts = contentRules,
-            netRules = netRules
+            netRules = netRules,
+            optionsPath = optionsFallback,
+            optionsOpenInTab = optionsOpenInTab,
+            author = author,
+            homepageUrl = homepageUrl
         )
     }
 
@@ -766,6 +1321,18 @@ class BrowserExtensionEngine(private val context: Context) {
     }
 
     private fun installUserScriptExtension(fileName: String, scriptContent: String): BrowserExtension {
+        val scanResult = com.example.data.security.MalwareProtectionEngine.scanExtensionScript(fileName, scriptContent)
+        if (!scanResult.isClean) {
+            com.example.data.security.MalwareProtectionEngine.recordThreatEvent(
+                context = context,
+                category = scanResult.threatCategory,
+                severity = com.example.data.security.SecuritySeverity.CRITICAL,
+                target = fileName,
+                reason = scanResult.reason,
+                blocked = true
+            )
+            throw SecurityException(scanResult.reason)
+        }
         val extId = "userscript_" + UUID.randomUUID().toString().replace("-", "").take(12)
         val extDir = File(extensionsRootDir, extId).apply { mkdirs() }
         val scriptFile = File(extDir, "userscript.user.js")
@@ -1013,7 +1580,7 @@ class BrowserExtensionEngine(private val context: Context) {
         val target = File(baseDir, cleanRel)
         val canonicalBase = runCatching { baseDir.canonicalPath }.getOrNull() ?: return null
         val canonicalTarget = runCatching { target.canonicalPath }.getOrNull() ?: return null
-        if (!canonicalTarget.startsWith(canonicalBase) || !target.exists() || !target.isFile) return null
+        if (!canonicalTarget.startsWith(canonicalBase + File.separator) || !target.exists() || !target.isFile) return null
         return runCatching { target.readText(Charsets.UTF_8) }.getOrNull()
     }
 
@@ -1161,6 +1728,110 @@ class BrowserExtensionEngine(private val context: Context) {
      * Intercepts `chrome-extension://<extId>/<path>`, `https://dragon-ext.local/<extId>/<path>`,
      * and active extensions' `declarative_net_request` rules inside `WebViewClient.shouldInterceptRequest`.
      */
+    private fun corsResponseHeaders(extraHeaders: Map<String, String> = emptyMap()): Map<String, String> {
+        val map = LinkedHashMap<String, String>()
+        map["Access-Control-Allow-Origin"] = "*"
+        map["Access-Control-Allow-Credentials"] = "true"
+        map["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS"
+        map["Access-Control-Allow-Headers"] = "*"
+        map["Access-Control-Expose-Headers"] = "*"
+        map["Cache-Control"] = "no-cache"
+        for ((k, v) in extraHeaders) {
+            val keyLower = k.lowercase(Locale.US)
+            if (!keyLower.startsWith("access-control-") &&
+                keyLower != "content-security-policy" &&
+                keyLower != "content-security-policy-report-only" &&
+                keyLower != "x-frame-options" &&
+                keyLower != "transfer-encoding" &&
+                keyLower != "content-encoding" &&
+                keyLower != "content-length"
+            ) {
+                map[k] = v
+            }
+        }
+        return map
+    }
+
+    fun proxyExtensionCrossOriginRequest(
+        targetUrl: String,
+        method: String = "GET",
+        requestHeaders: Map<String, String>? = null
+    ): WebResourceResponse {
+        val upperMethod = method.trim().uppercase(Locale.US).ifBlank { "GET" }
+        if (upperMethod == "OPTIONS") {
+            return WebResourceResponse(
+                "text/plain",
+                "UTF-8",
+                200,
+                "OK",
+                corsResponseHeaders(),
+                ByteArrayInputStream(ByteArray(0))
+            )
+        }
+        return try {
+            val builder = Request.Builder().url(targetUrl)
+            requestHeaders?.forEach { (k, v) ->
+                val kl = k.lowercase(Locale.US)
+                if (kl != "origin" && kl != "referer" && kl != "host" && kl != "accept-encoding") {
+                    builder.header(k, v)
+                }
+            }
+            if (requestHeaders?.keys?.none { it.equals("User-Agent", ignoreCase = true) } != false) {
+                builder.header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+                )
+            }
+            if (upperMethod == "HEAD") {
+                builder.head()
+            } else {
+                builder.get()
+            }
+            crossOriginHttpClient.newCall(builder.build()).execute().use { resp ->
+                val rawBytes = resp.body?.bytes() ?: ByteArray(0)
+                val contentTypeHeader = resp.header("Content-Type").orEmpty()
+                val mimeType = contentTypeHeader.substringBefore(';').trim().lowercase(Locale.US).ifBlank {
+                    if (targetUrl.substringBefore('?').endsWith(".json", ignoreCase = true)) {
+                        "application/json"
+                    } else {
+                        guessMimeTypeForFile(targetUrl.substringBefore('?').substringAfterLast('/'))
+                    }
+                }
+                val charset = contentTypeHeader.substringAfter("charset=", "UTF-8")
+                    .substringBefore(';')
+                    .trim()
+                    .ifBlank { "UTF-8" }
+                val upstreamHeaders = mutableMapOf<String, String>()
+                for (i in 0 until resp.headers.size) {
+                    upstreamHeaders[resp.headers.name(i)] = resp.headers.value(i)
+                }
+                upstreamHeaders["Content-Type"] = "$mimeType; charset=$charset"
+                val statusCode = if (resp.code in 100..599) resp.code else 200
+                val reasonPhrase = resp.message.ifBlank { "OK" }
+                WebResourceResponse(
+                    mimeType,
+                    charset,
+                    statusCode,
+                    reasonPhrase,
+                    corsResponseHeaders(upstreamHeaders),
+                    ByteArrayInputStream(rawBytes)
+                )
+            }
+        } catch (_: Exception) {
+            val isJson = targetUrl.substringBefore('?').endsWith(".json", ignoreCase = true)
+            val fallbackBody = if (isJson) "{}" else ""
+            val fallbackMime = if (isJson) "application/json" else "text/plain"
+            WebResourceResponse(
+                fallbackMime,
+                "UTF-8",
+                200,
+                "OK",
+                corsResponseHeaders(mapOf("Content-Type" to "$fallbackMime; charset=UTF-8")),
+                ByteArrayInputStream(fallbackBody.toByteArray(Charsets.UTF_8))
+            )
+        }
+    }
+
     /**
      * Intercepts `https://<hostSafeId>.dragon-ext.local/<path>`, `https://dragon-ext.local/<extId>/<path>`,
      * `chrome-extension://<extIdOrStoreId>/<path>`, `moz-extension://...`,
@@ -1172,7 +1843,10 @@ class BrowserExtensionEngine(private val context: Context) {
         isMainFrame: Boolean,
         fallbackExtId: String? = null,
         activeTabUrl: String = "https://www.google.com",
-        activeTabTitle: String = "Current Tab"
+        activeTabTitle: String = "Current Tab",
+        requestMethod: String = "GET",
+        requestHeaders: Map<String, String>? = null,
+        isExtensionPageContext: Boolean = false
     ): WebResourceResponse? {
         val lower = requestUrl.lowercase(Locale.US)
         val parsed = runCatching { Uri.parse(requestUrl) }.getOrNull()
@@ -1181,8 +1855,19 @@ class BrowserExtensionEngine(private val context: Context) {
         val isVirtualHost = parsedHostLower == "dragon-ext.local" || parsedHostLower.endsWith(".dragon-ext.local")
         val isExtScheme = lower.startsWith("chrome-extension://") || lower.startsWith("moz-extension://")
 
-        // 1. Serve extension bundled assets
+        // 1. Serve extension bundled assets & same-origin CORS proxy
         if (parsed != null && (isExtScheme || isVirtualHost)) {
+            if (requestMethod.equals("OPTIONS", ignoreCase = true)) {
+                return WebResourceResponse(
+                    "text/plain",
+                    "UTF-8",
+                    200,
+                    "OK",
+                    corsResponseHeaders(),
+                    ByteArrayInputStream(ByteArray(0))
+                )
+            }
+
             val allExts = _extensionsFlow.value
             val ext: BrowserExtension?
             val rawRelPath: String
@@ -1216,25 +1901,45 @@ class BrowserExtensionEngine(private val context: Context) {
                 rawRelPath = parsed.path?.removePrefix("/").orEmpty()
             }
 
-            if (ext == null || ext.installDirPath.isBlank()) return null
             val decodedRel = runCatching { Uri.decode(rawRelPath) }.getOrDefault(rawRelPath)
                 .substringBefore('?')
                 .substringBefore('#')
                 .trim()
                 .removePrefix("./")
                 .removePrefix("/")
+
+            if (decodedRel.equals("__dragon_cors_proxy__", ignoreCase = true)) {
+                val targetUrl = parsed.getQueryParameter("__url").orEmpty().trim()
+                if (targetUrl.startsWith("http://", ignoreCase = true) ||
+                    targetUrl.startsWith("https://", ignoreCase = true)
+                ) {
+                    return proxyExtensionCrossOriginRequest(
+                        targetUrl = targetUrl,
+                        method = requestMethod,
+                        requestHeaders = requestHeaders
+                    )
+                }
+                return WebResourceResponse(
+                    "application/json",
+                    "UTF-8",
+                    200,
+                    "OK",
+                    corsResponseHeaders(mapOf("Content-Type" to "application/json; charset=UTF-8")),
+                    ByteArrayInputStream("{}".toByteArray(Charsets.UTF_8))
+                )
+            }
+
+            if (ext == null || ext.installDirPath.isBlank()) return null
             val relPath = decodedRel.ifBlank {
                 ext.popupPath?.substringBefore('?')?.substringBefore('#').orEmpty()
             }
             if (relPath.isBlank()) return null
 
-            val headers = mapOf(
-                "Access-Control-Allow-Origin" to "*",
-                "Access-Control-Allow-Methods" to "GET, POST, OPTIONS",
-                "Cache-Control" to "no-cache"
-            )
+            val headers = corsResponseHeaders()
 
-            if (relPath.equals("__dragon_bg.html", ignoreCase = true)) {
+            if (relPath.equals("__dragon_bg.html", ignoreCase = true) ||
+                relPath.equals("__dragon_background.html", ignoreCase = true)
+            ) {
                 val bgHtml = buildExtensionBackgroundRunnerHtml(
                     ext = ext,
                     activeTabUrl = activeTabUrl,
@@ -1252,11 +1957,17 @@ class BrowserExtensionEngine(private val context: Context) {
 
             val baseDir = File(ext.installDirPath)
             var targetFile = File(baseDir, relPath)
-            if (!targetFile.exists() && ext.popupPath != null && ext.popupPath.contains('/')) {
-                val popupDir = ext.popupPath.substringBeforeLast('/')
-                val nestedCandidate = File(baseDir, "$popupDir/$relPath")
-                if (nestedCandidate.exists() && nestedCandidate.isFile) {
-                    targetFile = nestedCandidate
+            if (!targetFile.exists()) {
+                val candidateDirs = listOfNotNull(
+                    ext.popupPath?.takeIf { it.contains('/') }?.substringBeforeLast('/'),
+                    ext.optionsPath?.takeIf { it.contains('/') }?.substringBeforeLast('/')
+                ).distinct()
+                for (subDir in candidateDirs) {
+                    val nestedCandidate = File(baseDir, "$subDir/$relPath")
+                    if (nestedCandidate.exists() && nestedCandidate.isFile) {
+                        targetFile = nestedCandidate
+                        break
+                    }
                 }
             }
             val canonicalBase = runCatching { baseDir.canonicalPath }.getOrNull() ?: return null
@@ -1304,6 +2015,16 @@ class BrowserExtensionEngine(private val context: Context) {
                 "OK",
                 headers,
                 FileInputStream(targetFile)
+            )
+        }
+
+        // 1b. If an extension page/worker makes a direct subresource request to an external HTTP(S) origin,
+        // proxy it with permissive CORS headers so host_permissions (<all_urls>) never fail CORS in WebView.
+        if (isExtensionPageContext && !isMainFrame && (lower.startsWith("http://") || lower.startsWith("https://"))) {
+            return proxyExtensionCrossOriginRequest(
+                targetUrl = requestUrl,
+                method = requestMethod,
+                requestHeaders = requestHeaders
             )
         }
 
@@ -1428,10 +2149,14 @@ class BrowserExtensionEngine(private val context: Context) {
             <head>
             <meta charset="utf-8">
             <script>
+            window.__dragonIsBackgroundWorker = true;
+            try { history.replaceState(null, '', '/__dragon_background.html'); } catch (e) {}
             (function() {
                 try {
                     if (window.parent && window.parent !== window) {
                         window.__dragonExtMessageListeners = window.parent.__dragonExtMessageListeners = window.parent.__dragonExtMessageListeners || [];
+                        window.__dragonExtBgMessageListeners = window.parent.__dragonExtBgMessageListeners = window.parent.__dragonExtBgMessageListeners || [];
+                        window.__dragonExtPopupMessageListeners = window.parent.__dragonExtPopupMessageListeners = window.parent.__dragonExtPopupMessageListeners || [];
                         window.__dragonExtConnectListeners = window.parent.__dragonExtConnectListeners = window.parent.__dragonExtConnectListeners || [];
                         window.__dragonExtStorageChangedListeners = window.parent.__dragonExtStorageChangedListeners = window.parent.__dragonExtStorageChangedListeners || [];
                         window.__dragonExtStorageCache = window.parent.__dragonExtStorageCache = window.parent.__dragonExtStorageCache || {};
@@ -1444,44 +2169,39 @@ class BrowserExtensionEngine(private val context: Context) {
             ${buildGlobalExtensionApiPolyfillJs()}
             (function() {
                 try {
+                    if (window.__dragonInstallExtensionNetworkHooks) {
+                        window.__dragonInstallExtensionNetworkHooks('$extHost');
+                    }
                     var scope = window.__dragonCreateExtensionScope(${JSONObject.quote(ext.id)}, $extMetaJson, $initialKvJson, $i18nJson, $activeTabContextJson);
                     window.chrome = scope.chrome;
                     window.browser = scope.browser;
                     window.clients = window.clients || {
                         matchAll: function() { return Promise.resolve([{ id: 'popup_client', type: 'window', url: 'https://$extHost/' }]); },
                         openWindow: function(u) { if (u && scope.chrome && scope.chrome.tabs) scope.chrome.tabs.create({ url: u }); return Promise.resolve(null); },
-                        claim: function() { return Promise.resolve(); }
+                        claim: function() { return Promise.resolve(); },
+                        get: function(id) { return Promise.resolve({ id: id || 'popup_client', type: 'window', url: 'https://$extHost/' }); }
                     };
                     window.skipWaiting = window.skipWaiting || function() { return Promise.resolve(); };
                     window.registration = window.registration || { scope: 'https://$extHost/', active: { state: 'activated' } };
                     window.importScripts = window.importScripts || function() {
                         for (var i = 0; i < arguments.length; i++) {
                             try {
-                                var src = String(arguments[i] || '').replace(/^\/+/, '');
+                                var src = String(arguments[i] || '').replace(/^\.\//, '').replace(/^\/+/, '');
                                 if (!src) continue;
                                 var xhr = new XMLHttpRequest();
                                 xhr.open('GET', 'https://$extHost/' + src, false);
                                 xhr.send(null);
                                 if (xhr.status >= 200 && xhr.status < 300 && xhr.responseText) {
-                                    (0, eval)(xhr.responseText);
+                                    var s = document.createElement('script');
+                                    s.type = 'text/javascript';
+                                    s.text = xhr.responseText;
+                                    (document.head || document.documentElement).appendChild(s);
                                 }
-                            } catch (e) {}
+                            } catch (e) {
+                                console.warn('[DragonExtBg] importScripts error:', e);
+                            }
                         }
                     };
-                    var origFetch = window.fetch;
-                    if (typeof origFetch === 'function') {
-                        window.fetch = function(input, init) {
-                            try {
-                                var raw = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
-                                if (/^(chrome|moz)-extension:\/\//i.test(raw)) {
-                                    var path = raw.replace(/^(chrome|moz)-extension:\/\/[^\/]+\/?/i, '');
-                                    var mapped = 'https://$extHost/' + path;
-                                    input = (typeof input === 'string') ? mapped : new Request(mapped, input);
-                                }
-                            } catch (e) {}
-                            return origFetch.call(this, input, init);
-                        };
-                    }
                 } catch (e) {}
             })();
             </script>
@@ -1561,34 +2281,8 @@ class BrowserExtensionEngine(private val context: Context) {
             ${buildGlobalExtensionApiPolyfillJs()}
             (function() {
                 try {
-                    var mapExtUrl = function(rawUrl) {
-                        var s = String(rawUrl || '');
-                        if (/^(chrome|moz)-extension:\/\//i.test(s)) {
-                            var path = s.replace(/^(chrome|moz)-extension:\/\/[^\/]+\/?/i, '');
-                            return 'https://$extHost/' + path;
-                        }
-                        return s;
-                    };
-                    var origFetch = window.fetch;
-                    if (typeof origFetch === 'function') {
-                        window.fetch = function(input, init) {
-                            try {
-                                var raw = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
-                                if (/^(chrome|moz)-extension:\/\//i.test(raw)) {
-                                    var mapped = mapExtUrl(raw);
-                                    input = (typeof input === 'string') ? mapped : new Request(mapped, input);
-                                }
-                            } catch (e) {}
-                            return origFetch.call(this, input, init);
-                        };
-                    }
-                    if (window.XMLHttpRequest && window.XMLHttpRequest.prototype && window.XMLHttpRequest.prototype.open) {
-                        var origXhrOpen = window.XMLHttpRequest.prototype.open;
-                        window.XMLHttpRequest.prototype.open = function(method, url) {
-                            var rest = Array.prototype.slice.call(arguments, 2);
-                            var nextUrl = (typeof url === 'string') ? mapExtUrl(url) : url;
-                            return origXhrOpen.apply(this, [method, nextUrl].concat(rest));
-                        };
+                    if (window.__dragonInstallExtensionNetworkHooks) {
+                        window.__dragonInstallExtensionNetworkHooks('$extHost');
                     }
                     var scope = window.__dragonCreateExtensionScope(${JSONObject.quote(ext.id)}, $extMetaJson, $initialKvJson, $i18nJson, $activeTabContextJson);
                     window.chrome = scope.chrome;
@@ -1602,25 +2296,14 @@ class BrowserExtensionEngine(private val context: Context) {
                 }
                 window.addEventListener('error', function(ev) {
                     try {
-                        var msg = '';
-                        if (ev && ev.message) {
-                            msg = ev.message;
-                        } else if (ev && ev.target && (ev.target.src || ev.target.href)) {
-                            msg = 'Resource failed: ' + (ev.target.src || ev.target.href);
-                        }
-                        if (msg && window.DragonExtensionBridge && window.DragonExtensionBridge.onPopupError) {
-                            window.DragonExtensionBridge.onPopupError(msg);
+                        var msg = (ev && ev.message) ? String(ev.message) : '';
+                        if (msg && !/ResizeObserver|Failed to fetch|NetworkError|Load failed|CORS/i.test(msg)) {
+                            if (window.DragonExtensionBridge && window.DragonExtensionBridge.onPopupError) {
+                                window.DragonExtensionBridge.onPopupError(msg);
+                            }
                         }
                     } catch (e) {}
                 }, true);
-                window.addEventListener('unhandledrejection', function(ev) {
-                    try {
-                        if (window.DragonExtensionBridge && window.DragonExtensionBridge.onPopupError) {
-                            var reason = ev && ev.reason ? (ev.reason.message || String(ev.reason)) : 'Promise rejection';
-                            window.DragonExtensionBridge.onPopupError(reason);
-                        }
-                    } catch (e) {}
-                });
             })();
             </script>
         """.trimIndent()
@@ -1665,33 +2348,185 @@ class BrowserExtensionEngine(private val context: Context) {
         }
     }
 
+    fun readExtensionManifestPrettyJson(ext: BrowserExtension): String {
+        val fromDisk = if (ext.installDirPath.isNotBlank()) {
+            val dir = File(ext.installDirPath)
+            val mFile = if (dir.exists() && dir.isDirectory) findManifestFile(dir) else null
+            mFile?.let { runCatching { it.readText(Charsets.UTF_8) }.getOrNull() }
+        } else null
+        val raw = (fromDisk ?: ext.manifestJson).trimStart('\uFEFF').trim()
+        if (raw.isBlank() || raw == "{}") {
+            return buildExtMetaJson(ext).let {
+                runCatching { JSONObject(it).toString(2) }.getOrDefault(it)
+            }
+        }
+        return runCatching { JSONObject(raw).toString(2) }.getOrDefault(raw)
+    }
+
+    fun computeExtensionDiskStats(ext: BrowserExtension): Pair<Int, Long> {
+        if (ext.installDirPath.isBlank()) return 0 to 0L
+        val dir = File(ext.installDirPath)
+        if (!dir.exists() || !dir.isDirectory) return 0 to 0L
+        var count = 0
+        var bytes = 0L
+        runCatching {
+            dir.walkTopDown().forEach { f ->
+                if (f.isFile) {
+                    count++
+                    bytes += f.length()
+                }
+            }
+        }
+        return count to bytes
+    }
+
+    fun buildExtensionVirtualUrl(ext: BrowserExtension, relPath: String): String {
+        val clean = relPath.trim().removePrefix("./").removePrefix("/")
+        return "https://${extensionVirtualHost(ext.id)}/$clean"
+    }
+
+    fun translateExtensionSchemeToVirtualUrl(rawUrl: String): String? {
+        val parsed = runCatching { Uri.parse(rawUrl) }.getOrNull() ?: return null
+        val scheme = parsed.scheme?.lowercase(Locale.US) ?: return null
+        if (scheme != "chrome-extension" && scheme != "moz-extension") return null
+        val hostToken = parsed.host?.lowercase(Locale.US).orEmpty()
+        val ext = _extensionsFlow.value.find { candidate ->
+            candidate.id.equals(hostToken, ignoreCase = true) ||
+                candidate.id.replace('_', '-').equals(hostToken, ignoreCase = true) ||
+                candidate.storeId.equals(hostToken, ignoreCase = true)
+        } ?: return null
+        val rel = parsed.path?.removePrefix("/").orEmpty()
+        val query = parsed.query?.let { "?$it" }.orEmpty()
+        val frag = parsed.fragment?.let { "#$it" }.orEmpty()
+        return "https://${extensionVirtualHost(ext.id)}/$rel$query$frag"
+    }
+
     /**
-     * Reads the extension's `popup.html` (or `options.html` fallback) and injects the extension API bridge
-     * + active browser tab context so its UI and `chrome.*` calls render cleanly without CORS/path breakage.
+     * Reads the extension's `popup.html` (or explicit `targetPagePath`, such as `options.html`),
+     * or generates a rich interactive Modification & Control Panel HTML if no bundled HTML exists.
+     * Injects the extension API bridge + active browser tab context so `chrome.*` calls work live.
      */
     fun loadExtensionPopupHtml(
         ext: BrowserExtension,
         activeTabUrl: String = "https://www.google.com",
-        activeTabTitle: String = "Current Tab"
+        activeTabTitle: String = "Current Tab",
+        targetPagePath: String? = null
     ): Pair<String, String>? {
-        val rawPopupRel = ext.popupPath ?: return null
-        if (ext.installDirPath.isBlank()) return null
-        val cleanPopupRel = rawPopupRel
-            .removePrefix("./")
-            .removePrefix("/")
-        val cleanFileRel = cleanPopupRel.substringBefore('?').substringBefore('#')
-        val popupFile = File(ext.installDirPath, cleanFileRel)
-        if (!popupFile.exists() || !popupFile.isFile) return null
+        val rawPopupRel = targetPagePath?.takeIf { it.isNotBlank() } ?: ext.popupPath
+        if (!rawPopupRel.isNullOrBlank() && ext.installDirPath.isNotBlank()) {
+            val cleanPopupRel = rawPopupRel
+                .removePrefix("./")
+                .removePrefix("/")
+            val cleanFileRel = cleanPopupRel.substringBefore('?').substringBefore('#')
+            val popupFile = File(ext.installDirPath, cleanFileRel)
+            if (popupFile.exists() && popupFile.isFile) {
+                val rawHtml = runCatching { popupFile.readText(Charsets.UTF_8) }.getOrNull()
+                if (!rawHtml.isNullOrBlank()) {
+                    val enhancedHtml = buildExtensionPageBootstrapHtml(
+                        ext = ext,
+                        rawHtml = rawHtml,
+                        activeTabUrl = activeTabUrl,
+                        activeTabTitle = activeTabTitle
+                    )
+                    val baseUrl = "https://${extensionVirtualHost(ext.id)}/$cleanPopupRel"
+                    return baseUrl to enhancedHtml
+                }
+            }
+        }
 
-        val rawHtml = runCatching { popupFile.readText(Charsets.UTF_8) }.getOrNull() ?: return null
+        // Fallback: generate an interactive Modification & Live Control Panel HTML for extensions
+        // without a dedicated popup.html (such as Userscripts, Userstyles, or background/content-script extensions).
+        val generatedPanelHtml = buildSynthesizedModificationPanelHtml(ext, activeTabUrl, activeTabTitle)
         val enhancedHtml = buildExtensionPageBootstrapHtml(
             ext = ext,
-            rawHtml = rawHtml,
+            rawHtml = generatedPanelHtml,
             activeTabUrl = activeTabUrl,
             activeTabTitle = activeTabTitle
         )
-        val baseUrl = "https://${extensionVirtualHost(ext.id)}/$cleanPopupRel"
+        val baseUrl = "https://${extensionVirtualHost(ext.id)}/__dragon_panel.html"
         return baseUrl to enhancedHtml
+    }
+
+    private fun buildSynthesizedModificationPanelHtml(
+        ext: BrowserExtension,
+        activeTabUrl: String,
+        activeTabTitle: String
+    ): String {
+        val safeName = ext.name.replace("<", "&lt;").replace(">", "&gt;")
+        val safeDesc = ext.description.replace("<", "&lt;").replace(">", "&gt;")
+        val matchesText = ext.hostPermissions.ifEmpty { listOf("<all_urls>") }.joinToString(", ")
+        val scriptCount = ext.contentScripts.sumOf { it.jsFiles.size + if (it.inlineJs.isNotBlank()) 1 else 0 }
+        val styleCount = ext.contentScripts.sumOf { it.cssFiles.size + if (it.inlineCss.isNotBlank()) 1 else 0 }
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body { background:#0B121E; color:#E6EDF3; font-family:system-ui,-apple-system,sans-serif; padding:14px; margin:0; }
+                .card { background:#111B2E; border:1px solid #1E2D4A; border-radius:12px; padding:12px; margin-bottom:12px; }
+                .title { font-size:15px; font-weight:700; color:#00E5FF; margin:0 0 4px 0; }
+                .sub { font-size:12px; color:#8B949E; margin:0 0 8px 0; }
+                .badge { display:inline-block; background:#00E5FF22; color:#00E5FF; border:1px solid #00E5FF55; border-radius:6px; padding:2px 7px; font-size:11px; font-weight:600; margin-right:6px; }
+                .btn { background:#00E5FF; color:#06101E; border:none; border-radius:8px; padding:8px 12px; font-size:12px; font-weight:700; cursor:pointer; margin-right:6px; margin-top:6px; }
+                .btn-sec { background:#1E2D4A; color:#E6EDF3; }
+                textarea, input { width:100%; box-sizing:border-box; background:#070C15; color:#00E676; border:1px solid #263859; border-radius:8px; padding:8px; font-family:monospace; font-size:12px; margin-top:6px; }
+            </style>
+            </head>
+            <body>
+                <div class="card">
+                    <div class="title">$safeName <span class="badge">v${ext.version}</span> <span class="badge">${ext.kind.badge}</span></div>
+                    <div class="sub">$safeDesc</div>
+                    <div style="font-size:11px;color:#A5D6FF;">Active Tab: <b>${activeTabTitle.replace("<", "&lt;")}</b> (${activeTabUrl.take(60).replace("<", "&lt;")})</div>
+                    <div style="font-size:11px;color:#8B949E;margin-top:4px;">Match Rules: <code>$matchesText</code> • Scripts: $scriptCount • Styles: $styleCount • DNR Rules: ${ext.netRules.size}</div>
+                    <button class="btn" onclick="reapplyNow()">Run / Apply on Current Tab</button>
+                    <button class="btn btn-sec" onclick="reloadTab()">Reload Tab</button>
+                </div>
+                <div class="card">
+                    <div class="title" style="font-size:13px;">Extension Storage (chrome.storage.local / GM Values)</div>
+                    <div class="sub">Modify live JSON settings stored by this extension:</div>
+                    <textarea id="kvEditor" rows="5"></textarea>
+                    <button class="btn" onclick="saveKv()">Save Storage JSON</button>
+                    <button class="btn btn-sec" onclick="clearKv()">Reset Storage</button>
+                    <span id="kvStatus" style="font-size:11px;color:#00E676;margin-left:6px;"></span>
+                </div>
+                <script>
+                    function loadKv() {
+                        chrome.storage.local.get(null, function(items) {
+                            document.getElementById('kvEditor').value = JSON.stringify(items || {}, null, 2);
+                        });
+                    }
+                    function saveKv() {
+                        try {
+                            var parsed = JSON.parse(document.getElementById('kvEditor').value || '{}');
+                            chrome.storage.local.set(parsed, function() {
+                                document.getElementById('kvStatus').textContent = 'Saved!';
+                                setTimeout(function(){ document.getElementById('kvStatus').textContent = ''; }, 1500);
+                            });
+                        } catch (e) {
+                            document.getElementById('kvStatus').textContent = 'Invalid JSON';
+                        }
+                    }
+                    function clearKv() {
+                        chrome.storage.local.clear(function() {
+                            loadKv();
+                            document.getElementById('kvStatus').textContent = 'Cleared!';
+                        });
+                    }
+                    function reapplyNow() {
+                        if (window.DragonExtensionBridge && window.DragonExtensionBridge.reloadActiveTab) {
+                            window.DragonExtensionBridge.reloadActiveTab();
+                        }
+                    }
+                    function reloadTab() {
+                        chrome.tabs.reload();
+                    }
+                    loadKv();
+                </script>
+            </body>
+            </html>
+        """.trimIndent()
     }
 
     // --- Native Bridge Storage & Cross-Origin XHR helpers for `@JavascriptInterface` ---
@@ -1749,6 +2584,21 @@ class BrowserExtensionEngine(private val context: Context) {
                     put("responseText", "")
                 }.toString()
             }
+            if (com.example.data.security.MalwareProtectionEngine.isSsrfOrInternalUrl(url)) {
+                return JSONObject().apply {
+                    put("status", 403)
+                    put("statusText", "Blocked private/internal SSRF target")
+                    put("responseText", "")
+                }.toString()
+            }
+            val urlVerdict = com.example.data.security.MalwareProtectionEngine.inspectUrl(url, context)
+            if (urlVerdict.isBlocked) {
+                return JSONObject().apply {
+                    put("status", 403)
+                    put("statusText", "Blocked malware target: ${urlVerdict.category}")
+                    put("responseText", "")
+                }.toString()
+            }
             val headersObj = reqObj.optJSONObject("headers")
             val bodyData = if (reqObj.has("data") && !reqObj.isNull("data")) reqObj.optString("data") else null
 
@@ -1801,9 +2651,136 @@ class BrowserExtensionEngine(private val context: Context) {
         (function() {
             if (window.__dragonCreateExtensionScope) return;
             window.__dragonExtMessageListeners = window.__dragonExtMessageListeners || [];
+            window.__dragonExtBgMessageListeners = window.__dragonExtBgMessageListeners || [];
+            window.__dragonExtPopupMessageListeners = window.__dragonExtPopupMessageListeners || [];
             window.__dragonExtConnectListeners = window.__dragonExtConnectListeners || [];
             window.__dragonExtStorageChangedListeners = window.__dragonExtStorageChangedListeners || [];
             window.__dragonExtStorageCache = window.__dragonExtStorageCache || {};
+
+            try {
+                if (typeof Promise !== 'undefined' && typeof Promise.withResolvers !== 'function') {
+                    Promise.withResolvers = function() {
+                        var resolve, reject;
+                        var promise = new Promise(function(res, rej) {
+                            resolve = res;
+                            reject = rej;
+                        });
+                        return { promise: promise, resolve: resolve, reject: reject };
+                    };
+                }
+            } catch (e) {}
+
+            try {
+                if (!navigator.locks || typeof navigator.locks.request !== 'function') {
+                    var locksShim = {
+                        request: function(name, optionsOrCb, maybeCb) {
+                            var fn = (typeof optionsOrCb === 'function') ? optionsOrCb : maybeCb;
+                            if (typeof fn === 'function') {
+                                return Promise.resolve().then(function() { return fn({ name: name, mode: 'exclusive' }); });
+                            }
+                            return Promise.resolve();
+                        },
+                        query: function() { return Promise.resolve({ held: [], pending: [] }); }
+                    };
+                    Object.defineProperty(navigator, 'locks', { value: locksShim, configurable: true });
+                }
+            } catch (e) {}
+
+            window.__dragonInstallExtensionNetworkHooks = function(extHost) {
+                if (window.__dragonExtNetHooksInstalled) return;
+                window.__dragonExtNetHooksInstalled = true;
+                var rewriteExtOrCorsUrl = function(rawUrl) {
+                    var s = String(rawUrl || '');
+                    if (/^(chrome|moz)-extension:\/\//i.test(s)) {
+                        var path = s.replace(/^(chrome|moz)-extension:\/\/[^\/]+\/?/i, '');
+                        return { url: 'https://' + extHost + '/' + path, externalUrl: null };
+                    }
+                    if (/^https?:\/\//i.test(s)) {
+                        var m = s.match(/^https?:\/\/([^\/:?#]+)/i);
+                        var targetHost = (m && m[1]) ? m[1].toLowerCase() : '';
+                        if (targetHost && targetHost !== 'dragon-ext.local' && !/\.dragon-ext\.local$/i.test(targetHost)) {
+                            return {
+                                url: 'https://' + extHost + '/__dragon_cors_proxy__?__url=' + encodeURIComponent(s),
+                                externalUrl: s
+                            };
+                        }
+                    }
+                    return { url: s, externalUrl: null };
+                };
+                var mapExtUrl = function(rawUrl) {
+                    return rewriteExtOrCorsUrl(rawUrl).url;
+                };
+
+                var origFetch = window.fetch;
+                if (typeof origFetch === 'function') {
+                    window.fetch = function(input, init) {
+                        try {
+                            var raw = (typeof input === 'string') ? input : (input && input.url ? input.url : (typeof URL !== 'undefined' && input instanceof URL ? input.href : ''));
+                            var method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+                            var info = rewriteExtOrCorsUrl(raw);
+                            if (info.externalUrl) {
+                                if (method !== 'GET' && method !== 'HEAD' && window.DragonExtensionBridge && window.DragonExtensionBridge.gmXhr) {
+                                    return new Promise(function(resolve) {
+                                        try {
+                                            var hdrs = {};
+                                            if (init && init.headers) {
+                                                if (typeof init.headers.forEach === 'function') {
+                                                    init.headers.forEach(function(v, k) { hdrs[k] = v; });
+                                                } else if (typeof init.headers === 'object') {
+                                                    Object.assign(hdrs, init.headers);
+                                                }
+                                            }
+                                            var bodyStr = (init && typeof init.body === 'string') ? init.body : null;
+                                            var rawResp = window.DragonExtensionBridge.gmXhr(JSON.stringify({
+                                                method: method,
+                                                url: info.externalUrl,
+                                                headers: hdrs,
+                                                data: bodyStr
+                                            }));
+                                            var parsed = JSON.parse(rawResp || '{}');
+                                            var st = (parsed.status >= 100 && parsed.status <= 599) ? parsed.status : 200;
+                                            var resp = new Response(parsed.responseText || '{}', {
+                                                status: st,
+                                                statusText: parsed.statusText || 'OK',
+                                                headers: { 'Content-Type': 'application/json' }
+                                            });
+                                            try { Object.defineProperty(resp, 'url', { value: info.externalUrl }); } catch (e) {}
+                                            resolve(resp);
+                                        } catch (err) {
+                                            resolve(new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+                                        }
+                                    });
+                                }
+                                var nextInit = init ? Object.assign({}, init) : undefined;
+                                return origFetch.call(this, info.url, nextInit).then(function(resp) {
+                                    try { Object.defineProperty(resp, 'url', { value: info.externalUrl }); } catch (e) {}
+                                    return resp;
+                                }).catch(function() {
+                                    return new Response('{}', { status: 200, statusText: 'OK', headers: { 'Content-Type': 'application/json' } });
+                                });
+                            }
+                            if (info.url !== raw) {
+                                input = (typeof input === 'string' || (typeof URL !== 'undefined' && input instanceof URL)) ? info.url : new Request(info.url, input);
+                            }
+                        } catch (e) {}
+                        return origFetch.call(this, input, init);
+                    };
+                }
+
+                if (window.XMLHttpRequest && window.XMLHttpRequest.prototype && window.XMLHttpRequest.prototype.open) {
+                    var origXhrOpen = window.XMLHttpRequest.prototype.open;
+                    window.XMLHttpRequest.prototype.open = function(method, url) {
+                        var rest = Array.prototype.slice.call(arguments, 2);
+                        var nextUrl = url;
+                        try {
+                            if (typeof url === 'string' || (typeof URL !== 'undefined' && url instanceof URL)) {
+                                nextUrl = rewriteExtOrCorsUrl(String(url)).url;
+                            }
+                        } catch (e) {}
+                        return origXhrOpen.apply(this, [method, nextUrl].concat(rest));
+                    };
+                }
+            };
 
             window.__dragonCreateExtensionScope = function(extId, extMeta, initialKv, i18nMap, activeTabContext) {
                 window.__dragonExtStorageCache[extId] = Object.assign({}, initialKv || {}, window.__dragonExtStorageCache[extId] || {});
@@ -1824,17 +2801,22 @@ class BrowserExtensionEngine(private val context: Context) {
                         if (window.DragonExtensionBridge && window.DragonExtensionBridge.storageGet) {
                             var raw = window.DragonExtensionBridge.storageGet(extId);
                             if (raw) {
-                                window.__dragonExtStorageCache[extId] = JSON.parse(raw);
+                                window.__dragonExtStorageCache[extId] = Object.assign({}, window.__dragonExtStorageCache[extId] || {}, JSON.parse(raw));
                             }
                         }
                     } catch (e) {}
                     return window.__dragonExtStorageCache[extId] || {};
                 };
 
-                var makeEventTarget = function(arr) {
+                var makeEventTarget = function(arr, onFirstAdded) {
                     return {
                         addListener: function(fn) {
-                            if (typeof fn === 'function' && arr.indexOf(fn) === -1) arr.push(fn);
+                            if (typeof fn === 'function' && arr.indexOf(fn) === -1) {
+                                arr.push(fn);
+                                if (typeof onFirstAdded === 'function') {
+                                    try { onFirstAdded(fn); } catch (e) {}
+                                }
+                            }
                         },
                         removeListener: function(fn) {
                             var idx = arr.indexOf(fn);
@@ -1927,30 +2909,100 @@ class BrowserExtensionEngine(private val context: Context) {
                         }
                         return Promise.resolve();
                     },
+                    setAccessLevel: function(accessOptions, callback) {
+                        if (typeof callback === 'function') setTimeout(callback, 0);
+                        return Promise.resolve();
+                    },
+                    getKeys: function(callback) {
+                        var keys = Object.keys(readStore());
+                        if (typeof callback === 'function') setTimeout(function() { callback(keys); }, 0);
+                        return Promise.resolve(keys);
+                    },
                     getBytesInUse: function(keys, callback) {
                         var cb = (typeof keys === 'function') ? keys : callback;
                         var bytes = JSON.stringify(readStore()).length;
                         if (typeof cb === 'function') setTimeout(function() { cb(bytes); }, 0);
                         return Promise.resolve(bytes);
                     },
+                    QUOTA_BYTES: 10485760,
+                    QUOTA_BYTES_PER_ITEM: 8192,
+                    MAX_ITEMS: 512,
                     onChanged: makeEventTarget(window.__dragonExtStorageChangedListeners)
                 };
 
-                var onMessageEvent = makeEventTarget(window.__dragonExtMessageListeners);
+                var onMessageEvent = {
+                    addListener: function(fn) {
+                        if (typeof fn !== 'function') return;
+                        if (window.__dragonExtMessageListeners.indexOf(fn) === -1) {
+                            window.__dragonExtMessageListeners.push(fn);
+                        }
+                        var targetArr = window.__dragonIsBackgroundWorker ? window.__dragonExtBgMessageListeners : window.__dragonExtPopupMessageListeners;
+                        if (targetArr && targetArr.indexOf(fn) === -1) {
+                            targetArr.push(fn);
+                        }
+                    },
+                    removeListener: function(fn) {
+                        var idx = window.__dragonExtMessageListeners.indexOf(fn);
+                        if (idx >= 0) window.__dragonExtMessageListeners.splice(idx, 1);
+                        if (window.__dragonExtBgMessageListeners) {
+                            var bIdx = window.__dragonExtBgMessageListeners.indexOf(fn);
+                            if (bIdx >= 0) window.__dragonExtBgMessageListeners.splice(bIdx, 1);
+                        }
+                        if (window.__dragonExtPopupMessageListeners) {
+                            var pIdx = window.__dragonExtPopupMessageListeners.indexOf(fn);
+                            if (pIdx >= 0) window.__dragonExtPopupMessageListeners.splice(pIdx, 1);
+                        }
+                    },
+                    hasListener: function(fn) { return window.__dragonExtMessageListeners.indexOf(fn) >= 0; },
+                    hasListeners: function() { return window.__dragonExtMessageListeners.length > 0; }
+                };
                 var onConnectEvent = makeEventTarget(window.__dragonExtConnectListeners);
+                var onInstalledListeners = [];
+                var onInstalledEvent = makeEventTarget(onInstalledListeners, function(fn) {
+                    if (window.__dragonIsBackgroundWorker) {
+                        Promise.resolve().then(function() {
+                            try {
+                                fn({ reason: 'install', previousVersion: undefined });
+                            } catch (e) {}
+                        });
+                    }
+                });
 
                 var createPortPair = function(portName) {
                     var clientMsgListeners = [];
                     var clientDiscListeners = [];
                     var hostMsgListeners = [];
                     var hostDiscListeners = [];
+                    var pendingToHost = [];
+                    var pendingToClient = [];
+                    var senderMeta = {
+                        id: extId,
+                        url: currentTabUrl,
+                        origin: 'https://' + extHostSafe,
+                        tab: { id: 1, windowId: 1, active: true, url: currentTabUrl, pendingUrl: currentTabUrl, title: currentTabTitle }
+                    };
                     var clientPort = {
                         name: portName || 'dragon-port',
-                        sender: { id: extId, url: currentTabUrl },
-                        onMessage: makeEventTarget(clientMsgListeners),
+                        sender: senderMeta,
+                        onMessage: makeEventTarget(clientMsgListeners, function() {
+                            if (pendingToClient.length > 0) {
+                                var queued = pendingToClient.splice(0, pendingToClient.length);
+                                setTimeout(function() {
+                                    for (var q = 0; q < queued.length; q++) {
+                                        for (var i = 0; i < clientMsgListeners.length; i++) {
+                                            try { clientMsgListeners[i](queued[q], clientPort); } catch (e) {}
+                                        }
+                                    }
+                                }, 0);
+                            }
+                        }),
                         onDisconnect: makeEventTarget(clientDiscListeners),
                         postMessage: function(msg) {
                             setTimeout(function() {
+                                if (hostMsgListeners.length === 0) {
+                                    pendingToHost.push(msg);
+                                    return;
+                                }
                                 for (var i = 0; i < hostMsgListeners.length; i++) {
                                     try { hostMsgListeners[i](msg, hostPort); } catch (e) {}
                                 }
@@ -1964,11 +3016,26 @@ class BrowserExtensionEngine(private val context: Context) {
                     };
                     var hostPort = {
                         name: portName || 'dragon-port',
-                        sender: { id: extId, url: currentTabUrl },
-                        onMessage: makeEventTarget(hostMsgListeners),
+                        sender: senderMeta,
+                        onMessage: makeEventTarget(hostMsgListeners, function() {
+                            if (pendingToHost.length > 0) {
+                                var queued = pendingToHost.splice(0, pendingToHost.length);
+                                setTimeout(function() {
+                                    for (var q = 0; q < queued.length; q++) {
+                                        for (var i = 0; i < hostMsgListeners.length; i++) {
+                                            try { hostMsgListeners[i](queued[q], hostPort); } catch (e) {}
+                                        }
+                                    }
+                                }, 0);
+                            }
+                        }),
                         onDisconnect: makeEventTarget(hostDiscListeners),
                         postMessage: function(msg) {
                             setTimeout(function() {
+                                if (clientMsgListeners.length === 0) {
+                                    pendingToClient.push(msg);
+                                    return;
+                                }
                                 for (var i = 0; i < clientMsgListeners.length; i++) {
                                     try { clientMsgListeners[i](msg, clientPort); } catch (e) {}
                                 }
@@ -1987,33 +3054,84 @@ class BrowserExtensionEngine(private val context: Context) {
                     var args = Array.prototype.slice.call(arguments);
                     var cb = (args.length > 0 && typeof args[args.length - 1] === 'function') ? args.pop() : null;
                     var message = (args.length >= 2 && typeof args[0] === 'string') ? args[1] : args[0];
+                    var fromBg = !!window.__dragonIsBackgroundWorker;
                     return new Promise(function(resolve) {
                         var attempts = 0;
+                        var settledAfterBgReady = false;
                         var attemptDispatch = function() {
-                            if (window.__dragonExtHasBackground && !window.__dragonExtBgReady &&
-                                window.__dragonExtMessageListeners.length === 0 && attempts < 14) {
-                                attempts++;
-                                setTimeout(attemptDispatch, 25);
-                                return;
+                            var bgListeners = window.__dragonExtBgMessageListeners || [];
+                            if (!fromBg && window.__dragonExtHasBackground) {
+                                if (bgListeners.length === 0 && (!window.__dragonExtBgReady || attempts < 20) && attempts < 120) {
+                                    attempts++;
+                                    setTimeout(attemptDispatch, 25);
+                                    return;
+                                }
+                                if (!settledAfterBgReady && bgListeners.length > 0) {
+                                    settledAfterBgReady = true;
+                                    setTimeout(attemptDispatch, 20);
+                                    return;
+                                }
                             }
                             var responded = false;
                             var finish = function(reply) {
                                 if (!responded) {
                                     responded = true;
-                                    if (cb) cb(reply);
+                                    if (cb) {
+                                        try { cb(reply); } catch (e) {}
+                                    }
                                     resolve(reply);
                                 }
                             };
-                            for (var i = 0; i < window.__dragonExtMessageListeners.length; i++) {
+                            var senderObj = {
+                                id: extId,
+                                url: currentTabUrl,
+                                origin: 'https://' + extHostSafe,
+                                tab: { id: 1, windowId: 1, active: true, url: currentTabUrl, pendingUrl: currentTabUrl, title: currentTabTitle }
+                            };
+                            var targetListeners = [];
+                            if (!fromBg && bgListeners.length > 0) {
+                                targetListeners = bgListeners.slice();
+                                var popListeners = window.__dragonExtPopupMessageListeners || [];
+                                for (var p = 0; p < popListeners.length; p++) {
+                                    if (targetListeners.indexOf(popListeners[p]) === -1) {
+                                        targetListeners.push(popListeners[p]);
+                                    }
+                                }
+                            } else {
+                                targetListeners = (window.__dragonExtMessageListeners || []).slice();
+                            }
+                            var pendingPromises = 0;
+                            var explicitAsyncCallback = false;
+                            for (var i = 0; i < targetListeners.length; i++) {
                                 try {
-                                    window.__dragonExtMessageListeners[i](
-                                        message,
-                                        { id: extId, url: currentTabUrl, tab: { id: 1, url: currentTabUrl, title: currentTabTitle } },
-                                        finish
-                                    );
+                                    var ret = targetListeners[i](message, senderObj, finish);
+                                    if (ret && typeof ret.then === 'function') {
+                                        pendingPromises++;
+                                        ret.then(function(val) {
+                                            pendingPromises--;
+                                            if (val !== undefined) {
+                                                finish(val);
+                                            } else if (pendingPromises === 0 && !explicitAsyncCallback) {
+                                                finish(undefined);
+                                            }
+                                        }).catch(function() {
+                                            pendingPromises--;
+                                            if (pendingPromises === 0 && !explicitAsyncCallback) {
+                                                finish(undefined);
+                                            }
+                                        });
+                                    } else if (ret === true) {
+                                        explicitAsyncCallback = true;
+                                    } else if (ret !== undefined && ret !== false) {
+                                        finish(ret);
+                                    }
                                 } catch (e) {}
                             }
-                            setTimeout(function() { finish({}); }, 180);
+                            if (pendingPromises === 0 && !explicitAsyncCallback) {
+                                setTimeout(function() { finish(undefined); }, 60);
+                            } else {
+                                setTimeout(function() { finish(undefined); }, 2500);
+                            }
                         };
                         setTimeout(attemptDispatch, 0);
                     });
@@ -2023,6 +3141,8 @@ class BrowserExtensionEngine(private val context: Context) {
                     runtime: {
                         id: extId,
                         lastError: null,
+                        OnInstalledReason: { INSTALL: 'install', UPDATE: 'update', CHROME_UPDATE: 'chrome_update', SHARED_MODULE_UPDATE: 'shared_module_update' },
+                        ContextType: { TAB: 'TAB', POPUP: 'POPUP', BACKGROUND: 'BACKGROUND', OFFSCREEN_DOCUMENT: 'OFFSCREEN_DOCUMENT', SIDE_PANEL: 'SIDE_PANEL' },
                         getManifest: function() { return extMeta || { name: extId, version: "1.0", manifest_version: 3 }; },
                         getURL: function(path) {
                             var clean = String(path || '').replace(/^\/+/, '');
@@ -2051,11 +3171,13 @@ class BrowserExtensionEngine(private val context: Context) {
                         },
                         sendMessage: dispatchSendMessage,
                         connect: function(connectInfo) {
-                            var pair = createPortPair(connectInfo && connectInfo.name);
+                            var nm = (typeof connectInfo === 'string') ? connectInfo : (connectInfo && connectInfo.name);
+                            var pair = createPortPair(nm);
                             var connAttempts = 0;
                             var fireConnect = function() {
-                                if (window.__dragonExtHasBackground && !window.__dragonExtBgReady &&
-                                    window.__dragonExtConnectListeners.length === 0 && connAttempts < 14) {
+                                if (window.__dragonExtHasBackground &&
+                                    window.__dragonExtConnectListeners.length === 0 &&
+                                    connAttempts < 60) {
                                     connAttempts++;
                                     setTimeout(fireConnect, 25);
                                     return;
@@ -2075,11 +3197,21 @@ class BrowserExtensionEngine(private val context: Context) {
                             if (typeof cb === 'function') setTimeout(cb, 0);
                             return Promise.resolve();
                         },
+                        connectNative: function(application) {
+                            return createPortPair(application || 'native-app').client;
+                        },
+                        sendNativeMessage: function(application, message, cb) {
+                            var c = (typeof message === 'function') ? message : cb;
+                            if (typeof c === 'function') setTimeout(function() { c({}); }, 0);
+                            return Promise.resolve({});
+                        },
                         onMessage: onMessageEvent,
                         onMessageExternal: makeEventTarget([]),
                         onConnect: onConnectEvent,
                         onConnectExternal: makeEventTarget([]),
-                        onInstalled: makeEventTarget([]),
+                        onUserScriptConnect: makeEventTarget([]),
+                        onUserScriptMessage: makeEventTarget([]),
+                        onInstalled: onInstalledEvent,
                         onStartup: makeEventTarget([]),
                         onSuspend: makeEventTarget([]),
                         onSuspendCanceled: makeEventTarget([]),
@@ -2139,13 +3271,25 @@ class BrowserExtensionEngine(private val context: Context) {
                         }
                     },
                     tabs: {
+                        TAB_ID_NONE: -1,
                         query: function(queryInfo, callback) {
-                            var tabs = [{ id: 1, windowId: 1, index: 0, active: true, highlighted: true, currentWindow: true, status: 'complete', url: currentTabUrl, title: currentTabTitle }];
-                            if (typeof callback === 'function') setTimeout(function() { callback(tabs); }, 0);
+                            var cb = (typeof queryInfo === 'function') ? queryInfo : callback;
+                            var tabs = [{
+                                id: 1, windowId: 1, index: 0, active: true, highlighted: true, currentWindow: true,
+                                incognito: false, pinned: false, audible: false, discarded: false, autoDiscardable: true,
+                                mutedInfo: { muted: false }, groupId: -1, favIconUrl: '', status: 'complete',
+                                url: currentTabUrl, pendingUrl: currentTabUrl, title: currentTabTitle
+                            }];
+                            if (typeof cb === 'function') setTimeout(function() { cb(tabs); }, 0);
                             return Promise.resolve(tabs);
                         },
                         get: function(tabId, callback) {
-                            var t = { id: tabId || 1, windowId: 1, index: 0, active: true, highlighted: true, currentWindow: true, status: 'complete', url: currentTabUrl, title: currentTabTitle };
+                            var t = {
+                                id: tabId || 1, windowId: 1, index: 0, active: true, highlighted: true, currentWindow: true,
+                                incognito: false, pinned: false, audible: false, discarded: false, autoDiscardable: true,
+                                mutedInfo: { muted: false }, groupId: -1, favIconUrl: '', status: 'complete',
+                                url: currentTabUrl, pendingUrl: currentTabUrl, title: currentTabTitle
+                            };
                             if (typeof callback === 'function') setTimeout(function() { callback(t); }, 0);
                             return Promise.resolve(t);
                         },
@@ -2156,22 +3300,38 @@ class BrowserExtensionEngine(private val context: Context) {
                             var cb = (typeof windowId === 'function') ? windowId : callback;
                             return chromeObj.tabs.get(1, cb);
                         },
+                        getAllInWindow: function(windowId, callback) {
+                            var cb = (typeof windowId === 'function') ? windowId : callback;
+                            return chromeObj.tabs.query({ currentWindow: true }, cb);
+                        },
                         create: function(createProperties, callback) {
                             var targetUrl = createProperties && createProperties.url ? String(createProperties.url) : '';
-                            if (targetUrl && window.DragonExtensionBridge && window.DragonExtensionBridge.openTab) {
-                                window.DragonExtensionBridge.openTab(targetUrl);
+                            if (targetUrl) {
+                                if (window.__dragonIsBackgroundWorker) {
+                                    if (targetUrl.indexOf('#/settings') >= 0 && window.parent && window.parent !== window) {
+                                        try { window.parent.location.hash = targetUrl.substring(targetUrl.indexOf('#')); } catch (e) {}
+                                    }
+                                } else if (window.DragonExtensionBridge && window.DragonExtensionBridge.openTab) {
+                                    window.DragonExtensionBridge.openTab(targetUrl);
+                                }
                             }
-                            var created = { id: 2, windowId: 1, url: targetUrl, active: true };
+                            var created = {
+                                id: 2, windowId: 1, index: 1, url: targetUrl, pendingUrl: targetUrl, active: true,
+                                incognito: false, pinned: false, status: 'complete'
+                            };
                             if (typeof callback === 'function') setTimeout(function() { callback(created); }, 0);
                             return Promise.resolve(created);
                         },
                         update: function(tabIdOrProps, maybeProps, callback) {
                             var props = (typeof tabIdOrProps === 'object') ? tabIdOrProps : (maybeProps || {});
                             var cb = (typeof maybeProps === 'function') ? maybeProps : callback;
-                            if (props && props.url && window.DragonExtensionBridge && window.DragonExtensionBridge.updateActiveTabUrl) {
+                            if (props && props.url && !window.__dragonIsBackgroundWorker && window.DragonExtensionBridge && window.DragonExtensionBridge.updateActiveTabUrl) {
                                 window.DragonExtensionBridge.updateActiveTabUrl(String(props.url));
                             }
-                            var updated = { id: 1, windowId: 1, url: (props && props.url) || currentTabUrl, title: currentTabTitle };
+                            var updated = {
+                                id: 1, windowId: 1, index: 0, active: true,
+                                url: (props && props.url) || currentTabUrl, pendingUrl: (props && props.url) || currentTabUrl, title: currentTabTitle
+                            };
                             if (typeof cb === 'function') setTimeout(function() { cb(updated); }, 0);
                             return Promise.resolve(updated);
                         },
@@ -2185,17 +3345,24 @@ class BrowserExtensionEngine(private val context: Context) {
                         },
                         remove: function(tabIds, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
                         duplicate: function(tabId, cb) { return chromeObj.tabs.get(2, cb); },
+                        highlight: function(info, cb) { return chromeObj.windows.getCurrent(null, cb); },
+                        goBack: function(tabId, cb) { var c = (typeof tabId === 'function') ? tabId : cb; if (typeof c === 'function') setTimeout(c, 0); return Promise.resolve(); },
+                        goForward: function(tabId, cb) { var c = (typeof tabId === 'function') ? tabId : cb; if (typeof c === 'function') setTimeout(c, 0); return Promise.resolve(); },
                         getZoom: function(tabId, cb) { var c = (typeof tabId === 'function') ? tabId : cb; if (typeof c === 'function') setTimeout(function() { c(1.0); }, 0); return Promise.resolve(1.0); },
                         setZoom: function(tabId, factor, cb) { var c = (typeof factor === 'function') ? factor : cb; if (typeof c === 'function') setTimeout(c, 0); return Promise.resolve(); },
+                        getZoomSettings: function(tabId, cb) { var c = (typeof tabId === 'function') ? tabId : cb; var s = { mode: 'automatic', scope: 'per-origin', defaultZoomFactor: 1.0 }; if (typeof c === 'function') setTimeout(function() { c(s); }, 0); return Promise.resolve(s); },
+                        setZoomSettings: function(tabId, s, cb) { var c = (typeof s === 'function') ? s : cb; if (typeof c === 'function') setTimeout(c, 0); return Promise.resolve(); },
                         detectLanguage: function(tabId, cb) { var c = (typeof tabId === 'function') ? tabId : cb; if (typeof c === 'function') setTimeout(function() { c('en'); }, 0); return Promise.resolve('en'); },
                         captureVisibleTab: function(winId, opts, cb) { var c = (typeof opts === 'function') ? opts : cb; if (typeof c === 'function') setTimeout(function() { c(''); }, 0); return Promise.resolve(''); },
+                        connect: function(tabId, connectInfo) { return chromeObj.runtime.connect(connectInfo); },
                         sendMessage: function(tabId, message, options, callback) {
                             var cb = (typeof options === 'function') ? options : callback;
                             if (window.DragonExtensionBridge && window.DragonExtensionBridge.evalInActiveTab && activeTabContext) {
                                 var evalCode = '(function(){try{if(window.__dragonExtMessageListeners){for(var i=0;i<window.__dragonExtMessageListeners.length;i++){window.__dragonExtMessageListeners[i](' + JSON.stringify(message) + ',{id:' + JSON.stringify(extId) + ',tab:{id:1}},function(){});}}}catch(e){}})();';
                                 window.DragonExtensionBridge.evalInActiveTab(evalCode);
                             }
-                            return dispatchSendMessage(message, cb);
+                            if (typeof cb === 'function') setTimeout(function() { cb(undefined); }, 0);
+                            return Promise.resolve(undefined);
                         },
                         executeScript: function(tabId, details, callback) {
                             var det = (typeof tabId === 'object') ? tabId : details;
@@ -2207,7 +3374,23 @@ class BrowserExtensionEngine(private val context: Context) {
                             var cb = (typeof details === 'function') ? details : callback;
                             return chromeObj.scripting.insertCSS(det, cb);
                         },
-                        onUpdated: makeEventTarget([]),
+                        removeCSS: function(tabId, details, callback) {
+                            var cb = (typeof details === 'function') ? details : callback;
+                            if (typeof cb === 'function') setTimeout(cb, 0);
+                            return Promise.resolve();
+                        },
+                        onUpdated: makeEventTarget([], function(fn) {
+                            if (window.__dragonIsBackgroundWorker) {
+                                setTimeout(function() {
+                                    try {
+                                        fn(1, { status: 'complete', url: currentTabUrl }, {
+                                            id: 1, windowId: 1, index: 0, active: true, highlighted: true, currentWindow: true,
+                                            incognito: false, pinned: false, status: 'complete', url: currentTabUrl, pendingUrl: currentTabUrl, title: currentTabTitle
+                                        });
+                                    } catch (e) {}
+                                }, 10);
+                            }
+                        }),
                         onActivated: makeEventTarget([]),
                         onRemoved: makeEventTarget([]),
                         onCreated: makeEventTarget([]),
@@ -2218,12 +3401,28 @@ class BrowserExtensionEngine(private val context: Context) {
                         onAttached: makeEventTarget([]),
                         onDetached: makeEventTarget([])
                     },
+                    tabGroups: {
+                        TAB_GROUP_ID_NONE: -1,
+                        query: function(info, cb) { var c = (typeof info === 'function') ? info : cb; if (typeof c === 'function') setTimeout(function() { c([]); }, 0); return Promise.resolve([]); },
+                        get: function(id, cb) { var g = { id: id || 1, collapsed: false, color: 'grey', title: '', windowId: 1 }; if (typeof cb === 'function') setTimeout(function() { cb(g); }, 0); return Promise.resolve(g); },
+                        update: function(id, props, cb) { var g = { id: id || 1, collapsed: false, color: 'grey', title: '', windowId: 1 }; if (typeof cb === 'function') setTimeout(function() { cb(g); }, 0); return Promise.resolve(g); },
+                        onCreated: makeEventTarget([]),
+                        onUpdated: makeEventTarget([]),
+                        onRemoved: makeEventTarget([]),
+                        onMoved: makeEventTarget([])
+                    },
                     windows: {
                         WINDOW_ID_CURRENT: 1,
                         WINDOW_ID_NONE: -1,
                         getCurrent: function(getInfo, cb) {
                             var callback = (typeof getInfo === 'function') ? getInfo : cb;
-                            var w = { id: 1, focused: true, type: 'normal', incognito: false, state: 'normal', tabs: [{ id: 1, windowId: 1, active: true, url: currentTabUrl, title: currentTabTitle }] };
+                            var w = {
+                                id: 1, focused: true, type: 'normal', incognito: false, state: 'normal',
+                                tabs: [{
+                                    id: 1, windowId: 1, index: 0, active: true, highlighted: true,
+                                    url: currentTabUrl, pendingUrl: currentTabUrl, title: currentTabTitle, status: 'complete'
+                                }]
+                            };
                             if (typeof callback === 'function') setTimeout(function() { callback(w); }, 0);
                             return Promise.resolve(w);
                         },
@@ -2234,15 +3433,21 @@ class BrowserExtensionEngine(private val context: Context) {
                         },
                         getAll: function(getInfo, cb) {
                             var callback = (typeof getInfo === 'function') ? getInfo : cb;
-                            var list = [{ id: 1, focused: true, type: 'normal', incognito: false, state: 'normal' }];
+                            var list = [{
+                                id: 1, focused: true, type: 'normal', incognito: false, state: 'normal',
+                                tabs: [{
+                                    id: 1, windowId: 1, index: 0, active: true, highlighted: true,
+                                    url: currentTabUrl, pendingUrl: currentTabUrl, title: currentTabTitle, status: 'complete'
+                                }]
+                            }];
                             if (typeof callback === 'function') setTimeout(function() { callback(list); }, 0);
                             return Promise.resolve(list);
                         },
                         create: function(createData, cb) {
-                            if (createData && createData.url && window.DragonExtensionBridge && window.DragonExtensionBridge.openTab) {
+                            if (createData && createData.url && !window.__dragonIsBackgroundWorker && window.DragonExtensionBridge && window.DragonExtensionBridge.openTab) {
                                 window.DragonExtensionBridge.openTab(String(createData.url));
                             }
-                            var w = { id: 2, focused: true, type: 'normal' };
+                            var w = { id: 2, focused: true, type: 'normal', tabs: [] };
                             if (typeof cb === 'function') setTimeout(function() { cb(w); }, 0);
                             return Promise.resolve(w);
                         },
@@ -2254,7 +3459,8 @@ class BrowserExtensionEngine(private val context: Context) {
                         remove: function(winId, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
                         onFocusChanged: makeEventTarget([]),
                         onCreated: makeEventTarget([]),
-                        onRemoved: makeEventTarget([])
+                        onRemoved: makeEventTarget([]),
+                        onBoundsChanged: makeEventTarget([])
                     },
                     scripting: {
                         executeScript: function(injection, callback) {
@@ -2312,6 +3518,7 @@ class BrowserExtensionEngine(private val context: Context) {
                             if (typeof cb === 'function') setTimeout(cb, 0);
                             return Promise.resolve();
                         },
+                        ExecutionWorld: { ISOLATED: 'ISOLATED', MAIN: 'MAIN' },
                         getRegisteredContentScripts: function(filter, cb) {
                             var c = (typeof filter === 'function') ? filter : cb;
                             if (typeof c === 'function') setTimeout(function() { c([]); }, 0);
@@ -2334,6 +3541,12 @@ class BrowserExtensionEngine(private val context: Context) {
                         disable: function(tabId, cb) { var c = (typeof tabId === 'function') ? tabId : cb; if (typeof c === 'function') setTimeout(c, 0); return Promise.resolve(); },
                         isEnabled: function(tabId, cb) { var c = (typeof tabId === 'function') ? tabId : cb; if (typeof c === 'function') setTimeout(function() { c(true); }, 0); return Promise.resolve(true); },
                         openPopup: function(opts, cb) { var c = (typeof opts === 'function') ? opts : cb; if (typeof c === 'function') setTimeout(c, 0); return Promise.resolve(); },
+                        getUserSettings: function(cb) {
+                            var s = { isOnToolbar: true };
+                            if (typeof cb === 'function') setTimeout(function() { cb(s); }, 0);
+                            return Promise.resolve(s);
+                        },
+                        onUserSettingsChanged: makeEventTarget([]),
                         onClicked: makeEventTarget([])
                     },
                     permissions: {
@@ -2341,35 +3554,91 @@ class BrowserExtensionEngine(private val context: Context) {
                         request: function(perms, cb) { if (typeof cb === 'function') setTimeout(function() { cb(true); }, 0); return Promise.resolve(true); },
                         remove: function(perms, cb) { if (typeof cb === 'function') setTimeout(function() { cb(true); }, 0); return Promise.resolve(true); },
                         getAll: function(cb) {
-                            var out = { permissions: (extMeta && extMeta.permissions) || [], origins: ['<all_urls>'] };
+                            var hosts = (extMeta && Array.isArray(extMeta.host_permissions) && extMeta.host_permissions.length) ? extMeta.host_permissions : ['<all_urls>'];
+                            var out = { permissions: (extMeta && extMeta.permissions) || [], origins: hosts };
                             if (typeof cb === 'function') setTimeout(function() { cb(out); }, 0);
                             return Promise.resolve(out);
                         },
                         onAdded: makeEventTarget([]),
                         onRemoved: makeEventTarget([])
                     },
-                    contextMenus: { create: function() {}, update: function() {}, remove: function() {}, removeAll: function(cb) { if (typeof cb === 'function') cb(); }, onClicked: makeEventTarget([]) },
-                    alarms: { create: function() {}, clear: function(name, cb) { if (typeof cb === 'function') cb(true); return Promise.resolve(true); }, clearAll: function(cb) { if (typeof cb === 'function') cb(true); return Promise.resolve(true); }, get: function(name, cb) { if (typeof cb === 'function') cb(null); return Promise.resolve(null); }, getAll: function(cb) { if (cb) cb([]); return Promise.resolve([]); }, onAlarm: makeEventTarget([]) },
-                    declarativeNetRequest: {
-                        MAX_NUMBER_OF_STATIC_RULESETS: 50,
-                        MAX_NUMBER_OF_DYNAMIC_AND_SESSION_RULES: 5000,
-                        MAX_NUMBER_OF_REGEX_RULES: 1000,
-                        GUARANTEED_MINIMUM_STATIC_RULES: 30000,
-                        GETMATCHEDRULES_QUOTA_INTERVAL: 10,
-                        ResourceType: { MAIN_FRAME: 'main_frame', SUB_FRAME: 'sub_frame', STYLESHEET: 'stylesheet', SCRIPT: 'script', IMAGE: 'image', FONT: 'font', OBJECT: 'object', XMLHTTPREQUEST: 'xmlhttprequest', PING: 'ping', CSP_REPORT: 'csp_report', MEDIA: 'media', WEBSOCKET: 'websocket', OTHER: 'other' },
-                        RuleActionType: { BLOCK: 'block', REDIRECT: 'redirect', ALLOW: 'allow', UPGRADE_SCHEME: 'upgradeScheme', MODIFY_HEADERS: 'modifyHeaders', ALLOW_ALL_REQUESTS: 'allowAllRequests' },
-                        updateDynamicRules: function(opts, cb) { if (typeof cb === 'function') cb(); return Promise.resolve(); },
-                        getDynamicRules: function(cb) { if (cb) cb([]); return Promise.resolve([]); },
-                        updateSessionRules: function(opts, cb) { if (typeof cb === 'function') cb(); return Promise.resolve(); },
-                        getSessionRules: function(cb) { if (cb) cb([]); return Promise.resolve([]); },
-                        updateEnabledRulesets: function(opts, cb) { if (typeof cb === 'function') cb(); return Promise.resolve(); },
-                        getEnabledRulesets: function(cb) { if (cb) cb([]); return Promise.resolve([]); },
-                        getAvailableStaticRuleCount: function(cb) { if (cb) cb(30000); return Promise.resolve(30000); },
-                        isRegexSupported: function(opts, cb) { var r = { isSupported: true }; if (cb) cb(r); return Promise.resolve(r); },
-                        getMatchedRules: function(filter, cb) { var c = (typeof filter === 'function') ? filter : cb; var r = { rulesMatchedInfo: [] }; if (c) c(r); return Promise.resolve(r); },
-                        setExtensionActionOptions: function(opts, cb) { if (cb) cb(); return Promise.resolve(); },
-                        onRuleMatchedDebug: makeEventTarget([])
+                    contextMenus: {
+                        ContextType: { ALL: 'all', PAGE: 'page', FRAME: 'frame', SELECTION: 'selection', LINK: 'link', EDITABLE: 'editable', IMAGE: 'image', VIDEO: 'video', AUDIO: 'audio', ACTION: 'action', BROWSER_ACTION: 'browser_action', PAGE_ACTION: 'page_action' },
+                        ItemType: { NORMAL: 'normal', CHECKBOX: 'checkbox', RADIO: 'radio', SEPARATOR: 'separator' },
+                        create: function(props, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return (props && props.id) || 'menu_1'; },
+                        update: function(id, props, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
+                        remove: function(id, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
+                        removeAll: function(cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
+                        onClicked: makeEventTarget([])
                     },
+                    alarms: {
+                        create: function(name, info, cb) { var c = (typeof info === 'function') ? info : cb; if (typeof c === 'function') setTimeout(c, 0); return Promise.resolve(); },
+                        clear: function(name, cb) { var c = (typeof name === 'function') ? name : cb; if (typeof c === 'function') setTimeout(function() { c(true); }, 0); return Promise.resolve(true); },
+                        clearAll: function(cb) { if (typeof cb === 'function') setTimeout(function() { cb(true); }, 0); return Promise.resolve(true); },
+                        get: function(name, cb) { var c = (typeof name === 'function') ? name : cb; if (typeof c === 'function') setTimeout(function() { c(null); }, 0); return Promise.resolve(null); },
+                        getAll: function(cb) { if (typeof cb === 'function') setTimeout(function() { cb([]); }, 0); return Promise.resolve([]); },
+                        onAlarm: makeEventTarget([])
+                    },
+                    declarativeNetRequest: (function() {
+                        var defaultRulesets = [];
+                        try {
+                            var rRes = extMeta && extMeta.declarative_net_request && extMeta.declarative_net_request.rule_resources;
+                            if (Array.isArray(rRes)) {
+                                for (var rIdx = 0; rIdx < rRes.length; rIdx++) {
+                                    if (rRes[rIdx] && rRes[rIdx].id && rRes[rIdx].enabled !== false) {
+                                        defaultRulesets.push(String(rRes[rIdx].id));
+                                    }
+                                }
+                            }
+                        } catch (e) {}
+                        var enabledRulesetsState = defaultRulesets.slice();
+                        return {
+                            MAX_NUMBER_OF_STATIC_RULESETS: 50,
+                            MAX_NUMBER_OF_ENABLED_STATIC_RULESETS: 50,
+                            MAX_NUMBER_OF_DYNAMIC_AND_SESSION_RULES: 5000,
+                            MAX_NUMBER_OF_UNSAFE_DYNAMIC_RULES: 5000,
+                            MAX_NUMBER_OF_UNSAFE_SESSION_RULES: 5000,
+                            MAX_NUMBER_OF_REGEX_RULES: 1000,
+                            GUARANTEED_MINIMUM_STATIC_RULES: 30000,
+                            GETMATCHEDRULES_QUOTA_INTERVAL: 10,
+                            DYNAMIC_RULESET_ID: '_dynamic',
+                            SESSION_RULESET_ID: '_session',
+                            DomainType: { FIRST_PARTY: 'firstParty', THIRD_PARTY: 'thirdParty' },
+                            ResourceType: { MAIN_FRAME: 'main_frame', SUB_FRAME: 'sub_frame', STYLESHEET: 'stylesheet', SCRIPT: 'script', IMAGE: 'image', FONT: 'font', OBJECT: 'object', XMLHTTPREQUEST: 'xmlhttprequest', PING: 'ping', CSP_REPORT: 'csp_report', MEDIA: 'media', WEBSOCKET: 'websocket', OTHER: 'other' },
+                            RuleActionType: { BLOCK: 'block', REDIRECT: 'redirect', ALLOW: 'allow', UPGRADE_SCHEME: 'upgradeScheme', MODIFY_HEADERS: 'modifyHeaders', ALLOW_ALL_REQUESTS: 'allowAllRequests' },
+                            updateDynamicRules: function(opts, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
+                            getDynamicRules: function(filter, cb) { var c = (typeof filter === 'function') ? filter : cb; if (typeof c === 'function') setTimeout(function() { c([]); }, 0); return Promise.resolve([]); },
+                            updateSessionRules: function(opts, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
+                            getSessionRules: function(filter, cb) { var c = (typeof filter === 'function') ? filter : cb; if (typeof c === 'function') setTimeout(function() { c([]); }, 0); return Promise.resolve([]); },
+                            updateStaticRules: function(opts, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
+                            getDisabledRuleIds: function(opts, cb) { var c = (typeof opts === 'function') ? opts : cb; if (typeof c === 'function') setTimeout(function() { c([]); }, 0); return Promise.resolve([]); },
+                            updateEnabledRulesets: function(opts, cb) {
+                                try {
+                                    if (opts && Array.isArray(opts.disableRulesetIds)) {
+                                        enabledRulesetsState = enabledRulesetsState.filter(function(id) { return opts.disableRulesetIds.indexOf(id) === -1; });
+                                    }
+                                    if (opts && Array.isArray(opts.enableRulesetIds)) {
+                                        opts.enableRulesetIds.forEach(function(id) {
+                                            if (enabledRulesetsState.indexOf(id) === -1) enabledRulesetsState.push(id);
+                                        });
+                                    }
+                                } catch (e) {}
+                                if (typeof cb === 'function') setTimeout(cb, 0);
+                                return Promise.resolve();
+                            },
+                            getEnabledRulesets: function(cb) {
+                                var copy = enabledRulesetsState.slice();
+                                if (typeof cb === 'function') setTimeout(function() { cb(copy); }, 0);
+                                return Promise.resolve(copy);
+                            },
+                            getAvailableStaticRuleCount: function(cb) { if (typeof cb === 'function') setTimeout(function() { cb(30000); }, 0); return Promise.resolve(30000); },
+                            isRegexSupported: function(opts, cb) { var r = { isSupported: true }; if (typeof cb === 'function') setTimeout(function() { cb(r); }, 0); return Promise.resolve(r); },
+                            getMatchedRules: function(filter, cb) { var c = (typeof filter === 'function') ? filter : cb; var r = { rulesMatchedInfo: [] }; if (typeof c === 'function') setTimeout(function() { c(r); }, 0); return Promise.resolve(r); },
+                            testMatchOutcome: function(req, cb) { var r = { matchedRules: [] }; if (typeof cb === 'function') setTimeout(function() { cb(r); }, 0); return Promise.resolve(r); },
+                            setExtensionActionOptions: function(opts, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
+                            onRuleMatchedDebug: makeEventTarget([])
+                        };
+                    })(),
                     webRequest: {
                         ResourceType: { MAIN_FRAME: 'main_frame', SUB_FRAME: 'sub_frame', STYLESHEET: 'stylesheet', SCRIPT: 'script', IMAGE: 'image', FONT: 'font', OBJECT: 'object', XMLHTTPREQUEST: 'xmlhttprequest', PING: 'ping', CSP_REPORT: 'csp_report', MEDIA: 'media', WEBSOCKET: 'websocket', OTHER: 'other' },
                         onBeforeRequest: makeEventTarget([]),
@@ -2380,22 +3649,54 @@ class BrowserExtensionEngine(private val context: Context) {
                         onBeforeRedirect: makeEventTarget([]),
                         onCompleted: makeEventTarget([]),
                         onErrorOccurred: makeEventTarget([]),
-                        handlerBehaviorChanged: function(cb) { if (typeof cb === 'function') cb(); return Promise.resolve(); }
+                        handlerBehaviorChanged: function(cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); }
                     },
                     management: {
                         getSelf: function(cb) { var info = { id: extId, name: (extMeta && extMeta.name) || extId, version: (extMeta && extMeta.version) || '1.0', enabled: true, installType: 'normal', type: 'extension' }; if (typeof cb === 'function') setTimeout(function() { cb(info); }, 0); return Promise.resolve(info); },
+                        get: function(id, cb) { return chromeObj.management.getSelf(cb); },
                         getAll: function(cb) { if (typeof cb === 'function') setTimeout(function() { cb([]); }, 0); return Promise.resolve([]); },
+                        getPermissionWarningsById: function(id, cb) { if (typeof cb === 'function') setTimeout(function() { cb([]); }, 0); return Promise.resolve([]); },
+                        setEnabled: function(id, enabled, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
                         onInstalled: makeEventTarget([]),
                         onUninstalled: makeEventTarget([]),
                         onEnabled: makeEventTarget([]),
                         onDisabled: makeEventTarget([])
                     },
                     commands: { getAll: function(cb) { if (typeof cb === 'function') setTimeout(function() { cb([]); }, 0); return Promise.resolve([]); }, onCommand: makeEventTarget([]) },
-                    notifications: { create: function(id, opts, cb) { var callback = (typeof id === 'object') ? opts : cb; var msg = (typeof id === 'object' ? id.message : (opts && opts.message)) || ''; if (msg && window.DragonExtensionBridge && window.DragonExtensionBridge.showToast) window.DragonExtensionBridge.showToast(msg); if (typeof callback === 'function') setTimeout(function() { callback('notif_1'); }, 0); return Promise.resolve('notif_1'); }, clear: function(id, cb) { if (typeof cb === 'function') setTimeout(function() { cb(true); }, 0); return Promise.resolve(true); }, onClicked: makeEventTarget([]), onClosed: makeEventTarget([]) },
+                    notifications: {
+                        create: function(id, opts, cb) { var callback = (typeof id === 'object') ? opts : cb; var msg = (typeof id === 'object' ? id.message : (opts && opts.message)) || ''; if (msg && window.DragonExtensionBridge && window.DragonExtensionBridge.showToast) window.DragonExtensionBridge.showToast(msg); if (typeof callback === 'function') setTimeout(function() { callback('notif_1'); }, 0); return Promise.resolve('notif_1'); },
+                        update: function(id, opts, cb) { if (typeof cb === 'function') setTimeout(function() { cb(true); }, 0); return Promise.resolve(true); },
+                        clear: function(id, cb) { if (typeof cb === 'function') setTimeout(function() { cb(true); }, 0); return Promise.resolve(true); },
+                        getAll: function(cb) { if (typeof cb === 'function') setTimeout(function() { cb({}); }, 0); return Promise.resolve({}); },
+                        getPermissionLevel: function(cb) { if (typeof cb === 'function') setTimeout(function() { cb('granted'); }, 0); return Promise.resolve('granted'); },
+                        onClicked: makeEventTarget([]),
+                        onClosed: makeEventTarget([]),
+                        onButtonClicked: makeEventTarget([]),
+                        onPermissionLevelChanged: makeEventTarget([]),
+                        onShowSettings: makeEventTarget([])
+                    },
                     fontSettings: { getFontList: function(cb) { var list = [{ fontId: 'sans-serif', displayName: 'Sans Serif' }, { fontId: 'serif', displayName: 'Serif' }, { fontId: 'monospace', displayName: 'Monospace' }]; if (typeof cb === 'function') setTimeout(function() { cb(list); }, 0); return Promise.resolve(list); } },
-                    sidePanel: { setOptions: function(o, cb) { if (typeof cb === 'function') cb(); return Promise.resolve(); }, setPanelBehavior: function(o, cb) { if (typeof cb === 'function') cb(); return Promise.resolve(); } },
+                    sidePanel: {
+                        setOptions: function(o, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
+                        getOptions: function(o, cb) { var c = (typeof o === 'function') ? o : cb; var r = { enabled: true }; if (typeof c === 'function') setTimeout(function() { c(r); }, 0); return Promise.resolve(r); },
+                        setPanelBehavior: function(o, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); },
+                        getPanelBehavior: function(cb) { var r = { openPanelOnActionClick: false }; if (typeof cb === 'function') setTimeout(function() { cb(r); }, 0); return Promise.resolve(r); },
+                        open: function(o, cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); }
+                    },
                     offscreen: { createDocument: function(p, cb) { if (typeof cb === 'function') cb(); return Promise.resolve(); }, hasDocument: function(cb) { if (cb) cb(false); return Promise.resolve(false); }, closeDocument: function(cb) { if (typeof cb === 'function') cb(); return Promise.resolve(); } },
-                    webNavigation: { getAllFrames: function(d, cb) { if (typeof cb === 'function') cb([{ frameId: 0, url: currentTabUrl }]); return Promise.resolve([{ frameId: 0, url: currentTabUrl }]); }, onCommitted: makeEventTarget([]), onCompleted: makeEventTarget([]), onBeforeNavigate: makeEventTarget([]), onDOMContentLoaded: makeEventTarget([]) },
+                    webNavigation: {
+                        getFrame: function(d, cb) { var f = { frameId: 0, parentFrameId: -1, url: currentTabUrl, errorOccurred: false }; if (typeof cb === 'function') cb(f); return Promise.resolve(f); },
+                        getAllFrames: function(d, cb) { if (typeof cb === 'function') cb([{ frameId: 0, parentFrameId: -1, url: currentTabUrl, errorOccurred: false }]); return Promise.resolve([{ frameId: 0, parentFrameId: -1, url: currentTabUrl, errorOccurred: false }]); },
+                        onCommitted: makeEventTarget([]),
+                        onCompleted: makeEventTarget([]),
+                        onBeforeNavigate: makeEventTarget([]),
+                        onDOMContentLoaded: makeEventTarget([]),
+                        onHistoryStateUpdated: makeEventTarget([]),
+                        onReferenceFragmentUpdated: makeEventTarget([]),
+                        onCreatedNavigationTarget: makeEventTarget([]),
+                        onErrorOccurred: makeEventTarget([]),
+                        onTabReplaced: makeEventTarget([])
+                    },
                     cookies: { get: function(d, cb) { if (typeof cb === 'function') cb(null); return Promise.resolve(null); }, getAll: function(d, cb) { if (typeof cb === 'function') cb([]); return Promise.resolve([]); }, set: function(d, cb) { if (typeof cb === 'function') cb(null); return Promise.resolve(null); }, remove: function(d, cb) { if (typeof cb === 'function') cb(null); return Promise.resolve(null); }, onChanged: makeEventTarget([]) },
                     downloads: { download: function(opts, cb) { if (opts && opts.url && window.DragonExtensionBridge && window.DragonExtensionBridge.openTab) window.DragonExtensionBridge.openTab(String(opts.url)); if (typeof cb === 'function') cb(1); return Promise.resolve(1); }, search: function(q, cb) { if (typeof cb === 'function') cb([]); return Promise.resolve([]); } },
                     history: { search: function(q, cb) { if (typeof cb === 'function') cb([]); return Promise.resolve([]); } },
@@ -2414,6 +3715,7 @@ class BrowserExtensionEngine(private val context: Context) {
                 };
                 chromeObj.browserAction = chromeObj.action;
                 chromeObj.pageAction = chromeObj.action;
+                chromeObj.menus = chromeObj.contextMenus;
 
                 var gmGetValue = function(key, defaultValue) {
                     var store = readStore();
@@ -2706,6 +4008,8 @@ class BrowserExtensionEngine(private val context: Context) {
                 val installDirPath = obj.optString("installDirPath", "")
                 val enabled = obj.optBoolean("enabled", true)
                 val installedAtMs = obj.optLong("installedAtMs", System.currentTimeMillis())
+                val savedName = obj.optString("name", "").takeIf { it.isNotBlank() }
+                val savedStoreId = obj.optString("storeId", "").takeIf { it.isNotBlank() }
 
                 val diskManifest = if (installDirPath.isNotBlank()) {
                     val dir = File(installDirPath)
@@ -2714,12 +4018,19 @@ class BrowserExtensionEngine(private val context: Context) {
 
                 val loadedExt = if (diskManifest != null) {
                     runCatching {
-                        parseWebExtensionManifest(
+                        val parsed = parseWebExtensionManifest(
                             extId = id,
                             sourceFileName = obj.optString("sourceFileName", "extension.zip"),
                             baseDir = diskManifest.parentFile ?: File(installDirPath),
-                            manifestJsonText = diskManifest.readText(Charsets.UTF_8)
-                        ).copy(enabled = enabled, installedAtMs = installedAtMs)
+                            manifestJsonText = diskManifest.readText(Charsets.UTF_8),
+                            titleHint = savedName
+                        )
+                        parsed.copy(
+                            name = if (!savedName.isNullOrBlank() && !savedName.startsWith("__MSG_")) savedName else parsed.name,
+                            enabled = enabled,
+                            storeId = savedStoreId ?: parsed.storeId,
+                            installedAtMs = installedAtMs
+                        )
                     }.getOrNull()
                 } else null
 
@@ -2774,7 +4085,7 @@ class BrowserExtensionEngine(private val context: Context) {
                 loaded.add(
                     BrowserExtension(
                         id = id,
-                        name = obj.optString("name", "Extension"),
+                        name = savedName ?: "Extension",
                         version = obj.optString("version", "1.0.0"),
                         description = obj.optString("description", ""),
                         kind = kind,
@@ -2784,14 +4095,18 @@ class BrowserExtensionEngine(private val context: Context) {
                         installDirPath = installDirPath,
                         popupPath = obj.optString("popupPath", "").takeIf { it.isNotBlank() },
                         backgroundScriptPath = obj.optString("backgroundScriptPath", "").takeIf { it.isNotBlank() },
-                        storeId = obj.optString("storeId", "").takeIf { it.isNotBlank() },
+                        storeId = savedStoreId,
                         i18nMessagesJson = "{}",
                         manifestJson = "{}",
                         permissions = jsonStringArrayToList(obj.optJSONArray("permissions")),
                         hostPermissions = jsonStringArrayToList(obj.optJSONArray("hostPermissions")).ifEmpty { listOf("<all_urls>") },
                         contentScripts = rules,
                         netRules = netRules,
-                        installedAtMs = installedAtMs
+                        installedAtMs = installedAtMs,
+                        optionsPath = obj.optString("optionsPath", "").takeIf { it.isNotBlank() },
+                        optionsOpenInTab = obj.optBoolean("optionsOpenInTab", false),
+                        author = obj.optString("author", ""),
+                        homepageUrl = obj.optString("homepageUrl", "")
                     )
                 )
             }
@@ -2826,19 +4141,23 @@ class BrowserExtensionEngine(private val context: Context) {
                         put("allFrames", r.allFrames)
                     })
                 }
+                // Do not bloat SharedPreferences XML with thousands of disk-backed DNR rules
                 val netRulesArr = JSONArray()
-                for (n in ext.netRules) {
-                    netRulesArr.put(JSONObject().apply {
-                        put("id", n.id)
-                        put("actionType", n.actionType)
-                        put("urlFilter", n.urlFilter)
-                        put("redirectUrl", n.redirectUrl ?: "")
-                        put("initiatorDomains", JSONArray(n.initiatorDomains))
-                        put("excludedInitiatorDomains", JSONArray(n.excludedInitiatorDomains))
-                        put("requestDomains", JSONArray(n.requestDomains))
-                        put("excludedRequestDomains", JSONArray(n.excludedRequestDomains))
-                        put("isRegexFilter", n.isRegexFilter)
-                    })
+                val shouldPersistNetRulesInline = ext.installDirPath.isBlank() || ext.netRules.size <= 60
+                if (shouldPersistNetRulesInline) {
+                    for (n in ext.netRules.take(60)) {
+                        netRulesArr.put(JSONObject().apply {
+                            put("id", n.id)
+                            put("actionType", n.actionType)
+                            put("urlFilter", n.urlFilter)
+                            put("redirectUrl", n.redirectUrl ?: "")
+                            put("initiatorDomains", JSONArray(n.initiatorDomains))
+                            put("excludedInitiatorDomains", JSONArray(n.excludedInitiatorDomains))
+                            put("requestDomains", JSONArray(n.requestDomains))
+                            put("excludedRequestDomains", JSONArray(n.excludedRequestDomains))
+                            put("isRegexFilter", n.isRegexFilter)
+                        })
+                    }
                 }
                 arr.put(JSONObject().apply {
                     put("id", ext.id)
@@ -2860,6 +4179,10 @@ class BrowserExtensionEngine(private val context: Context) {
                     put("contentScripts", rulesArr)
                     put("netRules", netRulesArr)
                     put("installedAtMs", ext.installedAtMs)
+                    put("optionsPath", ext.optionsPath ?: "")
+                    put("optionsOpenInTab", ext.optionsOpenInTab)
+                    put("author", ext.author)
+                    put("homepageUrl", ext.homepageUrl)
                 })
             }
             prefs.edit().putString("installed_extensions_v1", arr.toString()).apply()
@@ -2872,6 +4195,25 @@ class BrowserExtensionEngine(private val context: Context) {
                 if (cursor.moveToFirst()) {
                     val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                     if (idx >= 0) cursor.getString(idx) else null
+                } else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun resolveTreeDocumentDisplayName(docUri: Uri): String? {
+        return try {
+            context.contentResolver.query(
+                docUri,
+                arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    if (idx >= 0) cursor.getString(idx)?.takeIf { it.isNotBlank() } else null
                 } else null
             }
         } catch (_: Exception) {
@@ -2946,28 +4288,75 @@ class BrowserExtensionEngine(private val context: Context) {
     private fun findManifestFile(rootDir: File): File? {
         val direct = File(rootDir, "manifest.json")
         if (direct.exists() && direct.isFile) return direct
-        return rootDir.walkTopDown().maxDepth(3).firstOrNull {
-            it.isFile && it.name.equals("manifest.json", ignoreCase = true)
-        }
+        return rootDir.walkTopDown()
+            .maxDepth(4)
+            .onEnter { dir -> !dir.name.equals("node_modules", ignoreCase = true) }
+            .filter { it.isFile && it.name.equals("manifest.json", ignoreCase = true) }
+            .minByOrNull { file ->
+                file.relativeTo(rootDir).path.replace('\\', '/').count { it == '/' }
+            }
     }
 
     private fun loadLocaleMessages(baseDir: File, defaultLocale: String): Map<String, String> {
-        val candidateFiles = listOf(
-            File(baseDir, "_locales/en/messages.json"),
-            File(baseDir, "_locales/en_US/messages.json"),
-            File(baseDir, "_locales/$defaultLocale/messages.json")
-        ).distinctBy { it.absolutePath }
+        val localesRoot = baseDir.listFiles()?.firstOrNull {
+            it.isDirectory && it.name.equals("_locales", ignoreCase = true)
+        } ?: File(baseDir, "_locales")
+
+        if (!localesRoot.exists() || !localesRoot.isDirectory) return emptyMap()
+
+        val normDefault = defaultLocale.trim().replace('-', '_')
+        val langOnly = normDefault.substringBefore('_').lowercase(Locale.US)
+        val priorityNames = listOf(
+            "en",
+            "en_us",
+            "en-us",
+            "en_gb",
+            langOnly,
+            normDefault.lowercase(Locale.US),
+            defaultLocale.trim().lowercase(Locale.US)
+        ).distinct()
+
+        val allLocaleDirs = localesRoot.listFiles()?.filter { it.isDirectory }.orEmpty()
+        val orderedDirs = mutableListOf<File>()
+        // First add non-priority fallback dirs so priority dirs overwrite them
+        allLocaleDirs.filter { dir ->
+            dir.name.lowercase(Locale.US) !in priorityNames
+        }.take(4).forEach { orderedDirs.add(it) }
+        // Then add priority dirs in ascending priority order (defaultLocale and English win)
+        for (pName in priorityNames) {
+            allLocaleDirs.firstOrNull { it.name.equals(pName, ignoreCase = true) }?.let { dir ->
+                orderedDirs.remove(dir)
+                orderedDirs.add(dir)
+            }
+        }
 
         val merged = mutableMapOf<String, String>()
-        for (msgFile in candidateFiles) {
-            if (!msgFile.exists() || !msgFile.isFile) continue
+        for (localeDir in orderedDirs) {
+            val msgFile = localeDir.listFiles()?.firstOrNull {
+                it.isFile && it.name.equals("messages.json", ignoreCase = true)
+            } ?: continue
             runCatching {
-                val obj = JSONObject(msgFile.readText(Charsets.UTF_8))
+                val rawJson = msgFile.readText(Charsets.UTF_8).trimStart('\uFEFF').trim()
+                val obj = JSONObject(rawJson)
                 val keys = obj.keys()
                 while (keys.hasNext()) {
                     val k = keys.next()
-                    val msg = obj.optJSONObject(k)?.optString("message", "").orEmpty()
+                    val entryObj = obj.optJSONObject(k) ?: continue
+                    var msg = entryObj.optString("message", "")
                     if (msg.isNotBlank()) {
+                        // Resolve Chrome i18n $PLACEHOLDER$ tokens defined in entryObj.placeholders
+                        val placeholdersObj = entryObj.optJSONObject("placeholders")
+                        if (placeholdersObj != null && msg.contains('$')) {
+                            val pKeys = placeholdersObj.keys()
+                            while (pKeys.hasNext()) {
+                                val pk = pKeys.next()
+                                val pContent = placeholdersObj.optJSONObject(pk)?.optString("content", "").orEmpty()
+                                    .replace("$1", "")
+                                if (pContent.isNotBlank()) {
+                                    msg = msg.replace("$$pk$", pContent, ignoreCase = true)
+                                }
+                            }
+                        }
                         merged[k] = msg
                         merged[k.lowercase(Locale.US)] = msg
                     }
@@ -2978,8 +4367,8 @@ class BrowserExtensionEngine(private val context: Context) {
     }
 
     private fun resolveI18nPlaceholders(raw: String, i18nMap: Map<String, String>): String {
-        if (!raw.contains("__MSG_")) return raw
-        return Regex("""__MSG_([A-Za-z0-9_@]+)__""").replace(raw) { match ->
+        if (!raw.contains("__MSG_", ignoreCase = true)) return raw
+        return Regex("""__MSG_([A-Za-z0-9_@.-]+)__""", RegexOption.IGNORE_CASE).replace(raw) { match ->
             val key = match.groupValues[1]
             i18nMap[key] ?: i18nMap[key.lowercase(Locale.US)] ?: match.value
         }
@@ -3006,47 +4395,126 @@ class BrowserExtensionEngine(private val context: Context) {
         return map
     }
 
+    /**
+     * Stream-parses `declarative_net_request` JSON rule files using `JsonReader` so large
+     * adblock/privacy extensions (with 10MB–30MB JSON rulesets) do not cause OOM or storage issues.
+     */
     private fun parseDeclarativeNetRulesFile(file: File): List<ExtensionNetRule> {
-        return try {
-            val arr = JSONArray(file.readText(Charsets.UTF_8))
-            val list = mutableListOf<ExtensionNetRule>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.optJSONObject(i) ?: continue
-                val id = obj.optInt("id", i + 1)
-                val actionObj = obj.optJSONObject("action") ?: continue
-                val actionType = actionObj.optString("type", "block")
-                val redirectUrl = actionObj.optJSONObject("redirect")?.optString("url")
-                val condObj = obj.optJSONObject("condition") ?: continue
-                val regexFilter = condObj.optString("regexFilter", "").trim()
-                val urlFilter = if (regexFilter.isNotBlank()) regexFilter else condObj.optString("urlFilter", "").trim()
-                val requestDomains = jsonStringArrayToList(condObj.optJSONArray("requestDomains"))
-                    .map { it.lowercase(Locale.US) }
-                val excludedRequestDomains = jsonStringArrayToList(condObj.optJSONArray("excludedRequestDomains"))
-                    .map { it.lowercase(Locale.US) }
-                if (urlFilter.isNotBlank() || requestDomains.isNotEmpty()) {
-                    list.add(
-                        ExtensionNetRule(
-                            id = id,
-                            actionType = actionType,
-                            urlFilter = urlFilter,
-                            redirectUrl = redirectUrl,
-                            initiatorDomains = jsonStringArrayToList(condObj.optJSONArray("initiatorDomains")).ifEmpty {
-                                jsonStringArrayToList(condObj.optJSONArray("domains"))
-                            }.map { it.lowercase(Locale.US) },
-                            excludedInitiatorDomains = jsonStringArrayToList(condObj.optJSONArray("excludedInitiatorDomains")).ifEmpty {
-                                jsonStringArrayToList(condObj.optJSONArray("excludedDomains"))
-                            }.map { it.lowercase(Locale.US) },
-                            requestDomains = requestDomains,
-                            excludedRequestDomains = excludedRequestDomains,
-                            isRegexFilter = regexFilter.isNotBlank()
-                        )
-                    )
+        val list = mutableListOf<ExtensionNetRule>()
+        val maxRulesPerFile = 1200
+        try {
+            FileInputStream(file).buffered(32 * 1024).use { fis ->
+                JsonReader(InputStreamReader(fis, Charsets.UTF_8)).use { reader ->
+                    reader.isLenient = true
+                    if (reader.peek() != JsonToken.BEGIN_ARRAY) return emptyList()
+                    reader.beginArray()
+                    var ruleCounter = 0
+                    while (reader.hasNext()) {
+                        if (list.size >= maxRulesPerFile) {
+                            reader.skipValue()
+                            continue
+                        }
+                        if (reader.peek() != JsonToken.BEGIN_OBJECT) {
+                            reader.skipValue()
+                            continue
+                        }
+                        ruleCounter++
+                        var id = ruleCounter
+                        var actionType = "block"
+                        var redirectUrl: String? = null
+                        var urlFilter = ""
+                        var regexFilter = ""
+                        var initiatorDomains = emptyList<String>()
+                        var excludedInitiatorDomains = emptyList<String>()
+                        var requestDomains = emptyList<String>()
+                        var excludedRequestDomains = emptyList<String>()
+
+                        reader.beginObject()
+                        while (reader.hasNext()) {
+                            when (reader.nextName()) {
+                                "id" -> if (reader.peek() == JsonToken.NUMBER) id = runCatching { reader.nextInt() }.getOrDefault(ruleCounter) else reader.skipValue()
+                                "action" -> if (reader.peek() == JsonToken.BEGIN_OBJECT) {
+                                    reader.beginObject()
+                                    while (reader.hasNext()) {
+                                        when (reader.nextName()) {
+                                            "type" -> if (reader.peek() == JsonToken.STRING) actionType = reader.nextString() else reader.skipValue()
+                                            "redirect" -> if (reader.peek() == JsonToken.BEGIN_OBJECT) {
+                                                reader.beginObject()
+                                                while (reader.hasNext()) {
+                                                    if (reader.nextName() == "url" && reader.peek() == JsonToken.STRING) {
+                                                        redirectUrl = reader.nextString()
+                                                    } else {
+                                                        reader.skipValue()
+                                                    }
+                                                }
+                                                reader.endObject()
+                                            } else reader.skipValue()
+                                            else -> reader.skipValue()
+                                        }
+                                    }
+                                    reader.endObject()
+                                } else reader.skipValue()
+                                "condition" -> if (reader.peek() == JsonToken.BEGIN_OBJECT) {
+                                    reader.beginObject()
+                                    while (reader.hasNext()) {
+                                        when (reader.nextName()) {
+                                            "urlFilter" -> if (reader.peek() == JsonToken.STRING) urlFilter = reader.nextString().trim() else reader.skipValue()
+                                            "regexFilter" -> if (reader.peek() == JsonToken.STRING) regexFilter = reader.nextString().trim() else reader.skipValue()
+                                            "initiatorDomains", "domains" -> initiatorDomains = readStringListFromJsonReader(reader)
+                                            "excludedInitiatorDomains", "excludedDomains" -> excludedInitiatorDomains = readStringListFromJsonReader(reader)
+                                            "requestDomains" -> requestDomains = readStringListFromJsonReader(reader)
+                                            "excludedRequestDomains" -> excludedRequestDomains = readStringListFromJsonReader(reader)
+                                            else -> reader.skipValue()
+                                        }
+                                    }
+                                    reader.endObject()
+                                } else reader.skipValue()
+                                else -> reader.skipValue()
+                            }
+                        }
+                        reader.endObject()
+
+                        val finalFilter = if (regexFilter.isNotBlank()) regexFilter else urlFilter
+                        if (finalFilter.isNotBlank() || requestDomains.isNotEmpty()) {
+                            list.add(
+                                ExtensionNetRule(
+                                    id = id,
+                                    actionType = actionType,
+                                    urlFilter = finalFilter,
+                                    redirectUrl = redirectUrl,
+                                    initiatorDomains = initiatorDomains,
+                                    excludedInitiatorDomains = excludedInitiatorDomains,
+                                    requestDomains = requestDomains,
+                                    excludedRequestDomains = excludedRequestDomains,
+                                    isRegexFilter = regexFilter.isNotBlank()
+                                )
+                            )
+                        }
+                    }
+                    reader.endArray()
                 }
             }
-            list
-        } catch (_: Exception) {
-            emptyList()
+        } catch (_: Exception) {}
+        return list
+    }
+
+    private fun readStringListFromJsonReader(reader: JsonReader): List<String> {
+        if (reader.peek() != JsonToken.BEGIN_ARRAY) {
+            reader.skipValue()
+            return emptyList()
         }
+        val out = mutableListOf<String>()
+        reader.beginArray()
+        while (reader.hasNext()) {
+            if (reader.peek() == JsonToken.STRING) {
+                val s = reader.nextString().trim().lowercase(Locale.US)
+                if (s.isNotBlank()) out.add(s)
+            } else {
+                reader.skipValue()
+            }
+        }
+        reader.endArray()
+        return out
     }
 
     private fun jsonStringArrayToList(arr: JSONArray?): List<String> {

@@ -16,8 +16,8 @@ android {
     applicationId = "com.android.ddm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = 21
+    versionName = "2.1"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -80,27 +80,9 @@ secrets {
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
-val compileXposedStubs by tasks.registering(JavaCompile::class) {
-  source = fileTree("src/xposedStub/java")
-  destinationDirectory.set(layout.buildDirectory.dir("intermediates/xposedStubClasses"))
-  sourceCompatibility = "11"
-  targetCompatibility = "11"
-  classpath = files()
-}
-
-val jarXposedStubs by tasks.registering(org.gradle.jvm.tasks.Jar::class) {
-  dependsOn(compileXposedStubs)
-  from(compileXposedStubs.map { it.destinationDirectory })
-  exclude("android/content/**")
-  exclude("android/app/Application.class")
-  archiveFileName.set("xposed-api-82-stub.jar")
-  destinationDirectory.set(layout.buildDirectory.dir("intermediates/xposedStubJar"))
-}
-
 // Some unused dependencies are commented out below instead of being removed.
 // This makes it easy to add them back in the future if needed.
 dependencies {
-  compileOnly(files(jarXposedStubs.map { it.archiveFile }))
   implementation(platform(libs.androidx.compose.bom))
   implementation(platform(libs.firebase.bom))
   // implementation(libs.accompanist.permissions)
@@ -128,14 +110,14 @@ dependencies {
   implementation(libs.converter.moshi)
   implementation(libs.firebase.ai)
   // Uncomment to use Firestore:
-  // implementation(libs.firebase.firestore)
+  implementation(libs.firebase.firestore)
 
   // Uncomment ALL FOUR of the following dependencies together to use Firebase Auth and Google
   // Sign-In via Credential Manager:
-  // implementation(libs.firebase.auth)
-  // implementation(libs.androidx.credentials)
-  // implementation(libs.androidx.credentials.play.services)
-  // implementation(libs.googleid)
+  implementation(libs.firebase.auth)
+  implementation(libs.androidx.credentials)
+  implementation(libs.androidx.credentials.play.services)
+  implementation(libs.googleid)
   implementation(libs.firebase.appcheck.recaptcha)
   implementation(libs.firebase.appcheck.debug)
   implementation(libs.kotlinx.coroutines.android)

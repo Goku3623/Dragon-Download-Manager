@@ -1,8 +1,12 @@
 package com.example
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -56,13 +60,32 @@ class MainActivity : ComponentActivity() {
     private val repository by lazy { KernelRepository.getInstance(applicationContext) }
 
     private val openDownloaderSignal = kotlinx.coroutines.flow.MutableStateFlow(0)
+    private val openBrowserSignal = kotlinx.coroutines.flow.MutableStateFlow(0)
+
+    private val pipActionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == com.example.data.browser.BrowserPipController.ACTION_PIP_TOGGLE_PLAY) {
+                com.example.data.browser.BrowserPipController.dispatchTogglePlayPause()
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         configurePowerEfficientRefreshRateWindow()
+        runCatching {
+            ContextCompat.registerReceiver(
+                this,
+                pipActionReceiver,
+                IntentFilter(com.example.data.browser.BrowserPipController.ACTION_PIP_TOGGLE_PLAY),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+        }
         if (intent?.getBooleanExtra(com.example.receiver.DownloadNotificationReceiver.EXTRA_OPEN_DOWNLOADER_TAB, false) == true) {
             openDownloaderSignal.value += 1
+        } else if (intent?.getBooleanExtra(com.example.service.DragonMediaPlaybackService.EXTRA_OPEN_BROWSER_TAB, false) == true) {
+            openBrowserSignal.value += 1
         }
 
         setContent {
@@ -70,6 +93,7 @@ class MainActivity : ComponentActivity() {
             val isAmoledBlack by repository.isAmoledBlackFlow.collectAsState()
             val themeConfig by repository.themeConfigFlow.collectAsState()
             val downloaderNavTrigger by openDownloaderSignal.collectAsState()
+            val browserNavTrigger by openBrowserSignal.collectAsState()
 
             DragonKernelTheme(
                 accentIndex = accentIndex,
@@ -99,9 +123,23 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                LaunchedEffect(Unit) {
+                    com.example.data.browser.BrowserPipController.stateFlow.collect { pipState ->
+                        com.example.data.browser.BrowserPipController.syncActivityPipParams(
+                            this@MainActivity,
+                            pipState
+                        )
+                        com.example.service.DragonMediaPlaybackService.syncWithPlaybackState(
+                            this@MainActivity.applicationContext,
+                            pipState
+                        )
+                    }
+                }
+
                 DragonDownloadManagerMainScreen(
                     repository = repository,
-                    openDownloaderTrigger = downloaderNavTrigger
+                    openDownloaderTrigger = downloaderNavTrigger,
+                    openBrowserTrigger = browserNavTrigger
                 )
             }
         }
@@ -112,29 +150,70 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         if (intent.getBooleanExtra(com.example.receiver.DownloadNotificationReceiver.EXTRA_OPEN_DOWNLOADER_TAB, false)) {
             openDownloaderSignal.value += 1
+        } else if (intent.getBooleanExtra(com.example.service.DragonMediaPlaybackService.EXTRA_OPEN_BROWSER_TAB, false)) {
+            openBrowserSignal.value += 1
         }
     }
 
     override fun onResume() {
         super.onResume()
+        com.example.data.browser.BrowserPipController.onActivityResumedChanged(true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            com.example.data.browser.BrowserPipController.onPipModeChanged(isInPictureInPictureMode)
+        }
         repository.onMainActivityVisibilityChanged(true)
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val dm = repository.downloadManager
                 dm.ensurePersistedTasksLoaded()
-                dm.notificationController.syncTasks(dm.tasksFlow.value, force = true)
+                dm.pruneDeletedCompletedTasks()
+                dm.notificationController.syncTasks(dm.tasksFlow.value, force = false)
             } catch (_: Exception) {}
         }
     }
 
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            com.example.data.browser.BrowserPipController.syncActivityPipParams(this)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (!isInPictureInPictureMode && com.example.data.browser.BrowserPipController.stateFlow.value.shouldEnterPipOnMinimize) {
+                com.example.data.browser.BrowserPipController.enterPipNow(this)
+            }
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        if (!isInPictureInPictureMode &&
+            com.example.data.browser.BrowserPipController.stateFlow.value.shouldKeepBackgroundMediaAlive &&
+            !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
+        ) {
+            // User tapped the cross (X) button in System PiP: minimize to background playback instead of closing video.
+            com.example.data.browser.BrowserPipController.setBackgroundMinimized(true)
+        }
+        com.example.data.browser.BrowserPipController.onPipModeChanged(isInPictureInPictureMode)
+        com.example.data.browser.BrowserPipController.syncActivityPipParams(this)
+    }
+
     override fun onPause() {
         super.onPause()
+        com.example.data.browser.BrowserPipController.onActivityResumedChanged(false)
         repository.onMainActivityVisibilityChanged(false)
     }
 
     override fun onStop() {
         super.onStop()
+        com.example.data.browser.BrowserPipController.onActivityResumedChanged(false)
         repository.onMainActivityVisibilityChanged(false)
+    }
+
+    override fun onDestroy() {
+        runCatching { unregisterReceiver(pipActionReceiver) }
+        super.onDestroy()
     }
 
     private fun configurePowerEfficientRefreshRateWindow() {
@@ -150,13 +229,33 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun DragonDownloadManagerMainScreen(
     repository: KernelRepository,
-    openDownloaderTrigger: Int = 0
+    openDownloaderTrigger: Int = 0,
+    openBrowserTrigger: Int = 0
 ) {
-    var isBrowserOpen by remember { mutableStateOf(false) }
+    var isBrowserOpen by remember {
+        mutableStateOf(
+            com.example.data.browser.BackgroundMediaWebViewStore.hasRetainedWebViews() ||
+                com.example.data.browser.BrowserPipController.stateFlow.value.shouldKeepBackgroundMediaAlive
+        )
+    }
+
+    LaunchedEffect(isBrowserOpen) {
+        if (isBrowserOpen || !com.example.data.browser.BackgroundMediaWebViewStore.hasRetainedWebViews()) {
+            com.example.data.browser.BrowserPipController.updateBrowserOpen(isBrowserOpen)
+        }
+    }
 
     LaunchedEffect(openDownloaderTrigger) {
         if (openDownloaderTrigger > 0) {
+            com.example.data.browser.BrowserPipController.isExplicitBrowserClose = true
             isBrowserOpen = false
+        }
+    }
+
+    LaunchedEffect(openBrowserTrigger) {
+        if (openBrowserTrigger > 0) {
+            com.example.data.browser.BrowserPipController.isExplicitBrowserClose = false
+            isBrowserOpen = true
         }
     }
 
@@ -210,8 +309,12 @@ fun DragonDownloadManagerMainScreen(
         if (isBrowserOpen) {
             BrowserScreen(
                 repository = repository,
-                onCloseBrowser = { isBrowserOpen = false },
+                onCloseBrowser = {
+                    com.example.data.browser.BrowserPipController.isExplicitBrowserClose = true
+                    isBrowserOpen = false
+                },
                 onOpenDownloadsTab = {
+                    com.example.data.browser.BrowserPipController.isExplicitBrowserClose = true
                     isBrowserOpen = false
                 }
             )
@@ -230,6 +333,7 @@ private fun DragonDownloaderTopBar(
     val tasks by downloadManager.tasksFlow.collectAsState()
     val isNotifVisible by downloadManager.notificationController.isPanelVisibleFlow.collectAsState()
     val activeCount = tasks.count { it.stage.isActive || it.isSmartRetrying }
+    val totalActiveSpeedBps = tasks.filter { it.stage.isActive && !it.isSmartRetrying }.sumOf { it.speedBytesPerSec }
     val primaryColor = MaterialTheme.colorScheme.primary
 
     Column(
@@ -253,7 +357,7 @@ private fun DragonDownloaderTopBar(
                 AsyncImage(
                     model = remember(context) {
                         ImageRequest.Builder(context)
-                            .data(R.drawable.ic_ddm_logo_1794749688571)
+                            .data(R.drawable.ic_ddm_cloud_bolt_logo_1794942953000)
                             .size(96, 96)
                             .crossfade(false)
                             .build()
@@ -261,7 +365,7 @@ private fun DragonDownloaderTopBar(
                     contentDescription = "Dragon Download Manager Logo",
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
-                        .size(26.dp)
+                        .size(28.dp)
                         .clip(CircleShape)
                         .border(1.dp, primaryColor.copy(alpha = 0.6f), CircleShape)
                 )
@@ -288,6 +392,12 @@ private fun DragonDownloaderTopBar(
             ) {
                 // Download Notification Panel Status / Pin Pill
                 val notifColor = if (isNotifVisible) SuccessGreen else WarningOrange
+                val pillLabel = when {
+                    activeCount > 0 && totalActiveSpeedBps > 0L ->
+                        "$activeCount DL • ${com.example.data.model.formatBytes(totalActiveSpeedBps)}/s"
+                    activeCount > 0 -> "$activeCount DL"
+                    else -> "NOTIF"
+                }
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(if (isMaterial3Bar) 12.dp else 8.dp))
@@ -312,7 +422,7 @@ private fun DragonDownloaderTopBar(
                             modifier = Modifier.size(12.dp)
                         )
                         Text(
-                            text = if (activeCount > 0) "$activeCount DL" else "NOTIF",
+                            text = pillLabel,
                             fontSize = 10.sp,
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.ExtraBold,

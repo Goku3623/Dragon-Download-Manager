@@ -243,12 +243,7 @@ object FrameGenMiniOverlayManager {
             FrameGenFloatingStyle.TACTICAL_HUD_CARD -> buildCardLayout(appContext, root, scale, ::dp, isLiquidGlass = false)
         }
 
-        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_PHONE
-        }
+        val overlayType = WindowManager.LayoutParams.TYPE_APPLICATION_PANEL
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,

@@ -146,8 +146,13 @@ class WebViewMediaExtractor(private val context: Context) {
     fun getCookiesForUrl(url: String): String? {
         ensureSavedCookiesLoaded()
         ensureConsentCookiesSeeded()
+        val cm = try {
+            CookieManager.getInstance()
+        } catch (_: Throwable) {
+            null
+        }
         val webKitCookies = try {
-            CookieManager.getInstance().getCookie(url)
+            cm?.getCookie(url)
         } catch (_: Throwable) {
             null
         }
@@ -155,6 +160,20 @@ class WebViewMediaExtractor(private val context: Context) {
             java.net.URI(url).host?.lowercase(Locale.US)?.removePrefix("www.")?.removePrefix("m.") ?: ""
         } catch (_: Exception) {
             ""
+        }
+        val parentDomainCookies = try {
+            val hostParts = host.split('.').filter { it.isNotBlank() }
+            if (hostParts.size >= 3) {
+                val baseDomain = hostParts.takeLast(2).joinToString(".")
+                listOfNotNull(
+                    cm?.getCookie("https://$baseDomain"),
+                    cm?.getCookie("https://www.$baseDomain")
+                ).joinToString("; ")
+            } else {
+                null
+            }
+        } catch (_: Throwable) {
+            null
         }
         val customCookie = customCookiesByDomain.entries.firstOrNull { (domain, _) ->
             host == domain || host.endsWith(".$domain")
@@ -172,12 +191,27 @@ class WebViewMediaExtractor(private val context: Context) {
             }
         } else null
 
-        val parts = mutableListOf<String>()
-        if (!defaultGateCookie.isNullOrBlank()) parts.add(defaultGateCookie)
-        if (!webKitCookies.isNullOrBlank()) parts.add(webKitCookies)
-        if (!customCookie.isNullOrBlank()) parts.add(customCookie)
+        val mergedMap = LinkedHashMap<String, String>()
+        fun absorbCookies(raw: String?) {
+            if (raw.isNullOrBlank()) return
+            raw.split(";").forEach { token ->
+                val trimmed = token.trim()
+                val eq = trimmed.indexOf('=')
+                if (eq > 0) {
+                    val key = trimmed.substring(0, eq).trim()
+                    val value = trimmed.substring(eq + 1).trim()
+                    if (key.isNotEmpty() && value.isNotEmpty()) {
+                        mergedMap[key] = value
+                    }
+                }
+            }
+        }
+        absorbCookies(defaultGateCookie)
+        absorbCookies(parentDomainCookies)
+        absorbCookies(webKitCookies)
+        absorbCookies(customCookie)
 
-        return if (parts.isEmpty()) null else parts.joinToString("; ")
+        return if (mergedMap.isEmpty()) null else mergedMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
     }
 
     fun setCustomCookieForDomain(domain: String, cookieString: String) {

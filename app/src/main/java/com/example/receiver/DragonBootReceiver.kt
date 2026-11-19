@@ -19,7 +19,9 @@ class DragonBootReceiver : BroadcastReceiver() {
                 try {
                     val repo = KernelRepository.getInstance(context.applicationContext)
                     val dm = repo.downloadManager
-                    dm.notificationController.syncTasks(dm.tasksFlow.value, force = true)
+                    dm.ensurePersistedTasksLoaded()
+                    dm.pruneDeletedCompletedTasks()
+                    dm.notificationController.syncTasks(dm.tasksFlow.value, force = false)
                 } catch (_: Exception) {}
             }
         }

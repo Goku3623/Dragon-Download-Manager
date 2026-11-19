@@ -9,6 +9,8 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import okhttp3.Call
@@ -17,20 +19,25 @@ import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.ByteBuffer
+import java.util.ArrayDeque
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicLongArray
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.coroutines.coroutineContext
+import kotlin.math.roundToLong
 
 /**
  * IDM-grade multi-connection HTTP Range & parallel HLS download accelerator.
@@ -39,9 +46,13 @@ import kotlin.coroutines.coroutineContext
  * - High-concurrency OkHttp Dispatcher (up to 64 total, 32 per host) and 32-socket ConnectionPool.
  * - Dynamic 1-to-16 parallel HTTP Range chunking (`bytes=start-end`) for files >= 512 KB.
  * - Per-chunk resumable `.part` files with metadata verification so Pause/Resume picks up mid-chunk.
+ * - Sliding-window + EMA real-time network bandwidth estimator (`SpeedWindowTracker`) that excludes
+ *   DNS/TLS handshake latency, decouples socket reads from disk flushes via 256 KB buffered streams,
+ *   and updates live every 350ms.
  * - Automatic retry per chunk and seamless fallback to single-connection 256 KB buffered streaming if
  *   a server ignores Range headers or returns 200 OK instead of 206 Partial Content.
- * - Ordered parallel HLS segment downloader (up to 8 concurrent segment workers + AES-128 decryption).
+ * - Ordered parallel HLS segment downloader (up to 8 concurrent segment workers + AES-128 decryption)
+ *   with live per-chunk byte counting.
  */
 class IdmAcceleratedDownloader(
     private val httpClient: OkHttpClient
@@ -90,9 +101,93 @@ class IdmAcceleratedDownloader(
     private class RangeNotHonoredException(message: String = "Server did not honor multi-connection Range request") :
         IOException(message)
 
+    /**
+     * Thread-safe sliding-window + EMA bandwidth tracker.
+     * - Starts the clock only when the first actual payload byte arrives so DNS/TLS/HTTP connection
+     *   setup time never drags down the initial speed reading.
+     * - Computes throughput over a rolling [windowMs] (default 2000ms) window and smooths transient
+     *   kernel socket burst jitter while remaining immediately responsive to real speed changes.
+     * - Decays smoothly toward 0 B/s if no bytes are received for > 1200ms.
+     */
+    internal class SpeedWindowTracker(
+        initialBytes: Long,
+        private val windowMs: Long = 2_000L
+    ) {
+        private data class Sample(val timeMs: Long, val totalBytes: Long)
+
+        private val lock = Any()
+        private val samples = ArrayDeque<Sample>(32)
+        private var baselineBytes: Long = initialBytes
+        private var lastZeroBytesTimeMs: Long = 0L
+        private var lastByteReceivedMs: Long = 0L
+        private var lastKnownBytes: Long = initialBytes
+        private var smoothedBps: Double = 0.0
+
+        fun onStreamConnected(nowMs: Long = SystemClock.elapsedRealtime()) {
+            synchronized(lock) {
+                if (samples.isEmpty()) {
+                    lastZeroBytesTimeMs = nowMs
+                }
+            }
+        }
+
+        fun sampleSpeedBps(currentTotalBytes: Long, nowMs: Long = SystemClock.elapsedRealtime()): Long {
+            synchronized(lock) {
+                val safeBytes = currentTotalBytes.coerceAtLeast(baselineBytes)
+                if (safeBytes > lastKnownBytes) {
+                    if (samples.isEmpty()) {
+                        val gapFromZero = if (lastZeroBytesTimeMs > 0L) nowMs - lastZeroBytesTimeMs else -1L
+                        val anchorMs = if (gapFromZero in 1L..1_500L) {
+                            lastZeroBytesTimeMs
+                        } else {
+                            (nowMs - 250L).coerceAtLeast(0L)
+                        }
+                        samples.addLast(Sample(anchorMs, lastKnownBytes))
+                    }
+                    lastKnownBytes = safeBytes
+                    lastByteReceivedMs = nowMs
+                    samples.addLast(Sample(nowMs, safeBytes))
+                } else if (samples.isEmpty()) {
+                    lastZeroBytesTimeMs = nowMs
+                    return 0L
+                }
+
+                // Prune samples older than windowMs while keeping at least one anchor sample
+                val cutoffMs = nowMs - windowMs
+                while (samples.size > 2 && samples.first.timeMs < cutoffMs) {
+                    samples.removeFirst()
+                }
+
+                val stallDurationMs = if (lastByteReceivedMs > 0L) nowMs - lastByteReceivedMs else 0L
+                if (stallDurationMs > 2_500L) {
+                    smoothedBps = 0.0
+                    samples.clear()
+                    baselineBytes = safeBytes
+                    lastKnownBytes = safeBytes
+                    lastZeroBytesTimeMs = nowMs
+                    return 0L
+                }
+
+                val oldest = samples.first
+                val elapsedMs = (nowMs - oldest.timeMs).coerceAtLeast(50L)
+                val deltaBytes = (safeBytes - oldest.totalBytes).coerceAtLeast(0L)
+                val windowBps = (deltaBytes * 1000.0) / elapsedMs.toDouble()
+
+                smoothedBps = when {
+                    smoothedBps <= 0.0 -> windowBps
+                    stallDurationMs > 1_100L -> smoothedBps * 0.55
+                    else -> (windowBps * 0.80) + (smoothedBps * 0.20)
+                }
+
+                return smoothedBps.roundToLong().coerceAtLeast(0L)
+            }
+        }
+    }
+
     companion object {
         private const val CHUNK_THRESHOLD_BYTES = 512L * 1024L // 512 KB
-        private const val CHUNK_BUFFER_BYTES = 128 * 1024 // 128 KB per worker
+        private const val CHUNK_BUFFER_BYTES = 64 * 1024 // 64 KB socket read buffer per worker
+        private const val FILE_STREAM_BUFFER_BYTES = 256 * 1024 // 256 KB buffered disk output per worker
         private const val SINGLE_BUFFER_BYTES = 256 * 1024 // 256 KB single stream
         internal const val REPORT_INTERVAL_MS = 350L
 
@@ -107,12 +202,14 @@ class IdmAcceleratedDownloader(
 
         fun createFastOkHttpClient(dns: okhttp3.Dns = okhttp3.Dns.SYSTEM): OkHttpClient {
             val dispatcher = Dispatcher().apply {
-                maxRequests = 48
-                maxRequestsPerHost = 24
+                maxRequests = 64
+                maxRequestsPerHost = 32
             }
-            val connectionPool = ConnectionPool(16, 60, TimeUnit.SECONDS)
+            val connectionPool = ConnectionPool(32, 60, TimeUnit.SECONDS)
             return OkHttpClient.Builder()
                 .dns(dns)
+                .proxySelector(com.example.data.browser.BrowserProxyManager.okHttpProxySelector)
+                .proxyAuthenticator(com.example.data.browser.BrowserProxyManager.okHttpProxyAuthenticator)
                 .dispatcher(dispatcher)
                 .connectionPool(connectionPool)
                 .connectTimeout(25, TimeUnit.SECONDS)
@@ -145,6 +242,7 @@ class IdmAcceleratedDownloader(
         requestHeadersProvider: (targetUrl: String) -> Map<String, String>,
         isPausedOrCancelled: () -> Boolean,
         onSmartRetry: ((attempt: Int, maxAttempts: Int, reason: String) -> Unit)? = null,
+        onAssembling: (() -> Unit)? = null,
         onProgress: (IdmProgressUpdate) -> Unit
     ): DownloadOutcome {
         if (isPausedOrCancelled()) throw CancellationException("Download paused or cancelled")
@@ -180,7 +278,7 @@ class IdmAcceleratedDownloader(
         }
 
         if (initialSegmentCount > 1) {
-            // Smart Retry connection step-down ladder (e.g., 16x -> 8x -> 4x -> 1x)
+            // Smart Retry connection step-down ladder (e.g., 16x -> 8x -> 4x -> 2x)
             val candidateCounts = LinkedHashSet<Int>().apply {
                 add(initialSegmentCount)
                 if (initialSegmentCount > 4) add((initialSegmentCount / 2).coerceAtLeast(4))
@@ -206,6 +304,7 @@ class IdmAcceleratedDownloader(
                         requestHeadersProvider = requestHeadersProvider,
                         isPausedOrCancelled = isPausedOrCancelled,
                         onSmartRetry = onSmartRetry,
+                        onAssembling = onAssembling,
                         onProgress = onProgress
                     )
                     return DownloadOutcome.Completed(
@@ -306,9 +405,11 @@ class IdmAcceleratedDownloader(
                         return UrlProbeMeta(resolvedUrl, totalBytes, hasAuthoritativeTotal, false, contentType)
                     }
                     if (contentType.contains("text/html", true)) {
-                        return UrlProbeMeta(resolvedUrl, totalBytes, hasAuthoritativeTotal, false, contentType)
-                    }
-                    if (acceptRanges && hasAuthoritativeTotal && totalBytes > 0L) {
+                        // Some file hosts reject HEAD with an HTML body; clear contentType so GET probe verifies
+                        contentType = ""
+                        acceptRanges = false
+                        hasAuthoritativeTotal = false
+                    } else if (acceptRanges && hasAuthoritativeTotal && totalBytes > 0L) {
                         return UrlProbeMeta(resolvedUrl, totalBytes, true, true, contentType)
                     }
                 }
@@ -386,6 +487,7 @@ class IdmAcceleratedDownloader(
         requestHeadersProvider: (String) -> Map<String, String>,
         isPausedOrCancelled: () -> Boolean,
         onSmartRetry: ((attempt: Int, maxAttempts: Int, reason: String) -> Unit)? = null,
+        onAssembling: (() -> Unit)? = null,
         onProgress: (IdmProgressUpdate) -> Unit
     ): Long {
         val chunkDir = chunkDirFor(workDir, destFile).apply { mkdirs() }
@@ -414,9 +516,12 @@ class IdmAcceleratedDownloader(
             segmentProgressBytes.set(i, existing)
         }
 
+        val initialDownloaded = sumArray(segmentProgressBytes).coerceAtMost(totalBytes)
+        val speedTracker = SpeedWindowTracker(initialBytes = initialDownloaded)
         val reportLock = Any()
-        val lastReportMs = AtomicLong(SystemClock.elapsedRealtime())
-        val lastReportBytes = AtomicLong(sumArray(segmentProgressBytes))
+        val lastReportMs = AtomicLong(0L)
+        val liveSocketCount = AtomicInteger(0)
+        val anySegmentReceived206 = AtomicBoolean(false)
 
         fun maybeEmitProgress(force: Boolean = false) {
             val now = SystemClock.elapsedRealtime()
@@ -426,22 +531,22 @@ class IdmAcceleratedDownloader(
                 val curMs = SystemClock.elapsedRealtime()
                 val baseMs = lastReportMs.get()
                 if (!force && curMs - baseMs < REPORT_INTERVAL_MS) return
-                val elapsedMs = (curMs - baseMs).coerceAtLeast(1L)
+                lastReportMs.set(curMs)
                 val totalNow = sumArray(segmentProgressBytes).coerceAtMost(totalBytes)
-                val delta = (totalNow - lastReportBytes.get()).coerceAtLeast(0L)
-                val speedBps = if (elapsedMs > 0L) (delta * 1000L) / elapsedMs else 0L
+                val speedBps = speedTracker.sampleSpeedBps(totalNow, curMs)
                 val segFractions = (0 until segmentCount).map { idx ->
                     val len = segmentExpectedLengths[idx].coerceAtLeast(1L)
                     (segmentProgressBytes.get(idx).toFloat() / len.toFloat()).coerceIn(0f, 1f)
                 }
-                lastReportMs.set(curMs)
-                lastReportBytes.set(totalNow)
+                val activeConns = liveSocketCount.get().let { live ->
+                    if (live > 0) live else segmentCount
+                }
                 onProgress(
                     IdmProgressUpdate(
                         downloadedBytes = totalNow,
                         totalBytes = totalBytes,
                         speedBytesPerSec = speedBps,
-                        activeConnections = segmentCount,
+                        activeConnections = activeConns,
                         segmentProgress = segFractions,
                         supportsResume = true
                     )
@@ -460,164 +565,208 @@ class IdmAcceleratedDownloader(
 
         try {
             coroutineScope {
-                val jobs = (0 until segmentCount).map { segIdx ->
-                    async(Dispatchers.IO) {
-                        val (segStart, segEnd) = segmentRanges[segIdx]
-                        val expectedLen = segmentExpectedLengths[segIdx]
-                        val partFile = File(chunkDir, "part_$segIdx.bin")
-
-                        var attempt = 0
-                        var done = false
-                        while (!done) {
-                            coroutineContext.ensureActive()
-                            if (isPausedOrCancelled()) {
-                                cancelAllActiveCalls()
-                                throw CancellationException("Download paused or cancelled")
+                val tickerJob = launch(Dispatchers.Default) {
+                    while (isActive && !isPausedOrCancelled()) {
+                        delay(REPORT_INTERVAL_MS)
+                        maybeEmitProgress(force = true)
+                    }
+                }
+                try {
+                    val jobs = (0 until segmentCount).map { segIdx ->
+                        async(Dispatchers.IO) {
+                            if (segIdx > 0) {
+                                // Slight stagger prevents CDN burst-connection rate limiters from rejecting parallel sockets
+                                delay(segIdx * 25L)
                             }
+                            val (segStart, segEnd) = segmentRanges[segIdx]
+                            val expectedLen = segmentExpectedLengths[segIdx]
+                            val partFile = File(chunkDir, "part_$segIdx.bin")
 
-                            val currentLen = if (partFile.exists()) {
-                                val rawLen = partFile.length()
-                                if (rawLen > expectedLen) {
-                                    partFile.delete()
-                                    0L
-                                } else {
-                                    rawLen
+                            var attempt = 0
+                            var done = false
+                            while (!done) {
+                                coroutineContext.ensureActive()
+                                if (isPausedOrCancelled()) {
+                                    cancelAllActiveCalls()
+                                    throw CancellationException("Download paused or cancelled")
                                 }
-                            } else 0L
 
-                            if (currentLen >= expectedLen) {
-                                segmentProgressBytes.set(segIdx, expectedLen)
-                                done = true
-                                break
-                            }
+                                val currentLen = if (partFile.exists()) {
+                                    val rawLen = partFile.length()
+                                    if (rawLen > expectedLen) {
+                                        partFile.delete()
+                                        0L
+                                    } else {
+                                        rawLen
+                                    }
+                                } else 0L
 
-                            val reqStart = segStart + currentLen
-                            val headers = requestHeadersProvider(url)
-                            val reqBuilder = Request.Builder()
-                                .url(url)
-                                .header("Accept-Encoding", "identity")
-                                .header("Range", "bytes=$reqStart-$segEnd")
-                            headers.forEach { (k, v) -> reqBuilder.header(k, v) }
+                                segmentProgressBytes.set(segIdx, currentLen)
+                                if (currentLen >= expectedLen) {
+                                    done = true
+                                    break
+                                }
 
-                            val call = httpClient.newCall(reqBuilder.build())
-                            activeCalls.add(call)
-                            try {
-                                call.execute().use { resp ->
-                                    if (resp.code == 200 || resp.code == 416) {
-                                        throw RangeNotHonoredException("Server returned HTTP ${resp.code} for byte range $reqStart-$segEnd")
-                                    }
-                                    if (resp.code == 403 || resp.code == 410) {
-                                        throw RangeNotHonoredException("Server rejected parallel range request (HTTP ${resp.code})")
-                                    }
-                                    if (resp.code == 429 || resp.code in 500..504) {
-                                        throw IOException("Transient HTTP ${resp.code} for byte range $reqStart-$segEnd")
-                                    }
-                                    if (resp.code != 206) {
-                                        throw IOException("Unexpected HTTP ${resp.code} for byte range $reqStart-$segEnd")
-                                    }
+                                val reqStart = segStart + currentLen
+                                val headers = requestHeadersProvider(url)
+                                val reqBuilder = Request.Builder()
+                                    .url(url)
+                                    .header("Accept-Encoding", "identity")
+                                    .header("Range", "bytes=$reqStart-$segEnd")
+                                headers.forEach { (k, v) -> reqBuilder.header(k, v) }
 
-                                    // Verify Content-Range start matches requested offset so servers that ignore offsets don't corrupt assembly
-                                    val contentRange = resp.header("Content-Range")
-                                    if (!contentRange.isNullOrBlank() && contentRange.startsWith("bytes ", ignoreCase = true)) {
-                                        val actualStart = contentRange.substringAfter(" ")
-                                            .substringBefore("-")
-                                            .trim()
-                                            .toLongOrNull()
-                                        if (actualStart != null && actualStart != reqStart) {
-                                            throw RangeNotHonoredException("Mismatched Content-Range start ($actualStart != $reqStart)")
+                                val call = httpClient.newCall(reqBuilder.build())
+                                activeCalls.add(call)
+                                var countedSocket = false
+                                try {
+                                    call.execute().use { resp ->
+                                        if (resp.code == 200 || resp.code == 416) {
+                                            throw RangeNotHonoredException("Server returned HTTP ${resp.code} for byte range $reqStart-$segEnd")
                                         }
-                                    }
-
-                                    val contentEncoding = resp.header("Content-Encoding")?.lowercase(Locale.US) ?: ""
-                                    if (contentEncoding.isNotBlank() && contentEncoding != "identity") {
-                                        throw RangeNotHonoredException("Compressed response ($contentEncoding) incompatible with Range chunks")
-                                    }
-
-                                    val body = resp.body ?: throw IOException("Empty chunk body")
-                                    val input = body.byteStream()
-                                    val buffer = ByteArray(CHUNK_BUFFER_BYTES)
-                                    var writtenForSeg = currentLen
-                                    FileOutputStream(partFile, currentLen > 0L).use { fos ->
-                                        while (writtenForSeg < expectedLen) {
-                                            coroutineContext.ensureActive()
-                                            if (isPausedOrCancelled()) {
-                                                cancelAllActiveCalls()
-                                                throw CancellationException("Download paused or cancelled")
+                                        if (resp.code == 403 || resp.code == 410) {
+                                            if (anySegmentReceived206.get()) {
+                                                // Secondary connection throttled by CDN; treat as retryable IOException
+                                                throw IOException("CDN connection throttle HTTP ${resp.code} on chunk $segIdx")
                                             }
-                                            val maxToRead = minOf(buffer.size.toLong(), expectedLen - writtenForSeg).toInt()
-                                            val read = input.read(buffer, 0, maxToRead)
-                                            if (read == -1) break
-                                            fos.write(buffer, 0, read)
-                                            writtenForSeg += read
-                                            segmentProgressBytes.set(segIdx, writtenForSeg)
-                                            maybeEmitProgress(force = false)
+                                            throw RangeNotHonoredException("Server rejected parallel range request (HTTP ${resp.code})")
                                         }
-                                        fos.flush()
+                                        if (resp.code == 429 || resp.code in 500..504) {
+                                            throw IOException("Transient HTTP ${resp.code} for byte range $reqStart-$segEnd")
+                                        }
+                                        if (resp.code != 206) {
+                                            throw IOException("Unexpected HTTP ${resp.code} for byte range $reqStart-$segEnd")
+                                        }
+
+                                        // Verify Content-Range start matches requested offset so servers that ignore offsets don't corrupt assembly
+                                        val contentRange = resp.header("Content-Range")
+                                        if (!contentRange.isNullOrBlank() && contentRange.startsWith("bytes ", ignoreCase = true)) {
+                                            val actualStart = contentRange.substringAfter(" ")
+                                                .substringBefore("-")
+                                                .trim()
+                                                .toLongOrNull()
+                                            if (actualStart != null && actualStart != reqStart) {
+                                                throw RangeNotHonoredException("Mismatched Content-Range start ($actualStart != $reqStart)")
+                                            }
+                                        }
+
+                                        val contentEncoding = resp.header("Content-Encoding")?.lowercase(Locale.US) ?: ""
+                                        if (contentEncoding.isNotBlank() && contentEncoding != "identity") {
+                                            throw RangeNotHonoredException("Compressed response ($contentEncoding) incompatible with Range chunks")
+                                        }
+
+                                        if (anySegmentReceived206.compareAndSet(false, true)) {
+                                            speedTracker.onStreamConnected()
+                                        }
+                                        liveSocketCount.incrementAndGet()
+                                        countedSocket = true
+
+                                        val body = resp.body ?: throw IOException("Empty chunk body")
+                                        val input = body.byteStream()
+                                        val buffer = ByteArray(CHUNK_BUFFER_BYTES)
+                                        var writtenForSeg = currentLen
+                                        BufferedOutputStream(
+                                            FileOutputStream(partFile, currentLen > 0L),
+                                            FILE_STREAM_BUFFER_BYTES
+                                        ).use { bos ->
+                                            while (writtenForSeg < expectedLen) {
+                                                coroutineContext.ensureActive()
+                                                if (isPausedOrCancelled()) {
+                                                    cancelAllActiveCalls()
+                                                    throw CancellationException("Download paused or cancelled")
+                                                }
+                                                val maxToRead = minOf(buffer.size.toLong(), expectedLen - writtenForSeg).toInt()
+                                                val read = input.read(buffer, 0, maxToRead)
+                                                if (read == -1) break
+                                                writtenForSeg += read
+                                                segmentProgressBytes.set(segIdx, writtenForSeg)
+                                                maybeEmitProgress(force = false)
+                                                bos.write(buffer, 0, read)
+                                            }
+                                            bos.flush()
+                                        }
+                                        if (writtenForSeg >= expectedLen) {
+                                            done = true
+                                        } else if (attempt < 4) {
+                                            attempt++
+                                            val backoffMs = (350L * (1 shl (attempt - 1))).coerceAtMost(3500L) + (segIdx * 45L)
+                                            onSmartRetry?.invoke(
+                                                attempt,
+                                                4,
+                                                "Resuming chunk #${segIdx + 1} from ${writtenForSeg * 100 / expectedLen}%"
+                                            )
+                                            delay(backoffMs)
+                                        } else {
+                                            throw IOException("Chunk $segIdx truncated ($writtenForSeg / $expectedLen bytes)")
+                                        }
                                     }
-                                    if (writtenForSeg >= expectedLen) {
-                                        done = true
-                                    } else if (attempt < 4) {
+                                } catch (ce: CancellationException) {
+                                    throw ce
+                                } catch (rnhe: RangeNotHonoredException) {
+                                    cancelAllActiveCalls()
+                                    throw rnhe
+                                } catch (e: IOException) {
+                                    if (isPausedOrCancelled()) {
+                                        throw CancellationException("Download paused or cancelled")
+                                    }
+                                    if (attempt < 4) {
                                         attempt++
-                                        val backoffMs = (350L * (1 shl (attempt - 1))).coerceAtMost(3500L) + (segIdx * 45L)
+                                        val backoffMs = (400L * (1 shl (attempt - 1))).coerceAtMost(4000L) + (segIdx * 50L)
                                         onSmartRetry?.invoke(
                                             attempt,
                                             4,
-                                            "Resuming chunk #${segIdx + 1} from ${writtenForSeg * 100 / expectedLen}%"
+                                            "Recovering chunk #${segIdx + 1} (${e.javaClass.simpleName})"
                                         )
                                         delay(backoffMs)
                                     } else {
-                                        throw IOException("Chunk $segIdx truncated ($writtenForSeg / $expectedLen bytes)")
+                                        cancelAllActiveCalls()
+                                        throw e
                                     }
+                                } finally {
+                                    if (countedSocket) {
+                                        liveSocketCount.decrementAndGet()
+                                    }
+                                    activeCalls.remove(call)
                                 }
-                            } catch (ce: CancellationException) {
-                                throw ce
-                            } catch (rnhe: RangeNotHonoredException) {
-                                cancelAllActiveCalls()
-                                throw rnhe
-                            } catch (e: IOException) {
-                                if (isPausedOrCancelled()) {
-                                    throw CancellationException("Download paused or cancelled")
-                                }
-                                if (attempt < 4) {
-                                    attempt++
-                                    val backoffMs = (400L * (1 shl (attempt - 1))).coerceAtMost(4000L) + (segIdx * 50L)
-                                    onSmartRetry?.invoke(
-                                        attempt,
-                                        4,
-                                        "Recovering chunk #${segIdx + 1} (${e.javaClass.simpleName})"
-                                    )
-                                    delay(backoffMs)
-                                } else {
-                                    cancelAllActiveCalls()
-                                    throw e
-                                }
-                            } finally {
-                                activeCalls.remove(call)
                             }
                         }
                     }
+                    jobs.awaitAll()
+                } finally {
+                    tickerJob.cancel()
                 }
-                jobs.awaitAll()
             }
         } catch (t: Throwable) {
             cancelAllActiveCalls()
             throw t
         }
 
-        // Verify all chunks and assemble sequentially into destFile
+        // Notify caller that network transfer is 100% done and chunk assembly is starting
+        onAssembling?.invoke()
+
+        // Verify all chunks and assemble sequentially into destFile while freeing each chunk immediately
         if (destFile.exists()) destFile.delete()
         destFile.parentFile?.mkdirs()
 
-        FileOutputStream(destFile, false).use { outStream ->
+        for (i in 0 until segmentCount) {
+            if (isPausedOrCancelled()) throw CancellationException("Download paused or cancelled")
+            val partFile = File(chunkDir, "part_$i.bin")
+            val expectedLen = segmentExpectedLengths[i]
+            if (!partFile.exists() || partFile.length() != expectedLen) {
+                throw IOException("Chunk $i verification failed (${partFile.length()} != $expectedLen)")
+            }
+        }
+
+        val firstPart = File(chunkDir, "part_0.bin")
+        val renamedFirst = firstPart.renameTo(destFile)
+        val startIdx = if (renamedFirst) 1 else 0
+
+        FileOutputStream(destFile, renamedFirst).use { outStream ->
             val outChannel = outStream.channel
             val copyBuffer = ByteArray(SINGLE_BUFFER_BYTES)
-            for (i in 0 until segmentCount) {
+            for (i in startIdx until segmentCount) {
                 if (isPausedOrCancelled()) throw CancellationException("Download paused or cancelled")
                 val partFile = File(chunkDir, "part_$i.bin")
                 val expectedLen = segmentExpectedLengths[i]
-                if (!partFile.exists() || partFile.length() != expectedLen) {
-                    throw IOException("Chunk $i verification failed (${partFile.length()} != $expectedLen)")
-                }
                 FileInputStream(partFile).use { inStream ->
                     val inChannel = inStream.channel
                     var transferred = 0L
@@ -638,6 +787,7 @@ class IdmAcceleratedDownloader(
                         }
                     }
                 }
+                runCatching { partFile.delete() }
             }
             outStream.flush()
         }
@@ -647,7 +797,6 @@ class IdmAcceleratedDownloader(
             throw IOException("Assembled file size mismatch ($finalLen != $totalBytes)")
         }
 
-        maybeEmitProgress(force = true)
         try {
             chunkDir.deleteRecursively()
         } catch (_: Exception) {
@@ -763,37 +912,37 @@ class IdmAcceleratedDownloader(
                     val acceptsRangesHeader = resp.code == 206 || resp.header("Accept-Ranges")?.contains("bytes", true) == true
 
                     destFile.parentFile?.mkdirs()
-                    FileOutputStream(destFile, isResumeSupported).use { fos ->
+                    BufferedOutputStream(
+                        FileOutputStream(destFile, isResumeSupported),
+                        SINGLE_BUFFER_BYTES
+                    ).use { bos ->
                         val input = body.byteStream()
-                        val buffer = ByteArray(SINGLE_BUFFER_BYTES)
-                        var downloaded = startByteOffset
-                        var lastReportMs = SystemClock.elapsedRealtime()
-                        var bytesAtLastReport = downloaded
+                        val buffer = ByteArray(CHUNK_BUFFER_BYTES)
+                        val downloadedAtomic = AtomicLong(startByteOffset)
+                        val speedTracker = SpeedWindowTracker(initialBytes = startByteOffset).apply {
+                            onStreamConnected()
+                        }
+                        val lastReportMs = AtomicLong(0L)
+                        val reportLock = Any()
 
-                        while (true) {
-                            coroutineContext.ensureActive()
-                            if (isPausedOrCancelled()) {
-                                throw CancellationException("Download paused or cancelled")
-                            }
-
-                            val read = input.read(buffer)
-                            if (read == -1) break
-                            fos.write(buffer, 0, read)
-                            downloaded += read
-
+                        fun emitSingleProgress(force: Boolean = false) {
                             val now = SystemClock.elapsedRealtime()
-                            val elapsedMs = now - lastReportMs
-                            if (elapsedMs >= REPORT_INTERVAL_MS) {
-                                val deltaBytes = downloaded - bytesAtLastReport
-                                val speedBps = if (elapsedMs > 0L) (deltaBytes * 1000L) / elapsedMs else 0L
+                            val prev = lastReportMs.get()
+                            if (!force && now - prev < REPORT_INTERVAL_MS) return
+                            synchronized(reportLock) {
+                                val curMs = SystemClock.elapsedRealtime()
+                                if (!force && curMs - lastReportMs.get() < REPORT_INTERVAL_MS) return
+                                lastReportMs.set(curMs)
+                                val dl = downloadedAtomic.get()
+                                val speedBps = speedTracker.sampleSpeedBps(dl, curMs)
                                 val frac = if (totalStreamBytes > 0L) {
-                                    (downloaded.toFloat() / totalStreamBytes.toFloat()).coerceIn(0f, 1f)
+                                    (dl.toFloat() / totalStreamBytes.toFloat()).coerceIn(0f, 1f)
                                 } else {
                                     0.5f
                                 }
                                 onProgress(
                                     IdmProgressUpdate(
-                                        downloadedBytes = downloaded,
+                                        downloadedBytes = dl,
                                         totalBytes = totalStreamBytes,
                                         speedBytesPerSec = speedBps,
                                         activeConnections = 1,
@@ -801,20 +950,44 @@ class IdmAcceleratedDownloader(
                                         supportsResume = acceptsRangesHeader
                                     )
                                 )
-                                lastReportMs = now
-                                bytesAtLastReport = downloaded
                             }
                         }
-                        fos.flush()
 
-                        if (totalStreamBytes > 0L && downloaded < totalStreamBytes) {
-                            throw IOException("Stream ended early ($downloaded / $totalStreamBytes bytes)")
+                        coroutineScope {
+                            val tickerJob = launch(Dispatchers.Default) {
+                                while (isActive && !isPausedOrCancelled()) {
+                                    delay(REPORT_INTERVAL_MS)
+                                    emitSingleProgress(force = true)
+                                }
+                            }
+                            try {
+                                while (true) {
+                                    coroutineContext.ensureActive()
+                                    if (isPausedOrCancelled()) {
+                                        throw CancellationException("Download paused or cancelled")
+                                    }
+
+                                    val read = input.read(buffer)
+                                    if (read == -1) break
+                                    downloadedAtomic.addAndGet(read.toLong())
+                                    emitSingleProgress(force = false)
+                                    bos.write(buffer, 0, read)
+                                }
+                                bos.flush()
+                            } finally {
+                                tickerJob.cancel()
+                            }
+                        }
+
+                        val finalDownloaded = downloadedAtomic.get()
+                        if (totalStreamBytes > 0L && finalDownloaded < totalStreamBytes) {
+                            throw IOException("Stream ended early ($finalDownloaded / $totalStreamBytes bytes)")
                         }
 
                         onProgress(
                             IdmProgressUpdate(
-                                downloadedBytes = downloaded,
-                                totalBytes = if (totalStreamBytes > 0L) totalStreamBytes else downloaded,
+                                downloadedBytes = finalDownloaded,
+                                totalBytes = if (totalStreamBytes > 0L) totalStreamBytes else finalDownloaded,
                                 speedBytesPerSec = 0L,
                                 activeConnections = 1,
                                 segmentProgress = listOf(1.0f),
@@ -823,7 +996,7 @@ class IdmAcceleratedDownloader(
                         )
 
                         return SingleStreamResult.Bytes(
-                            count = downloaded,
+                            count = finalDownloaded,
                             contentType = contentType,
                             resolvedUrl = resolvedUrl,
                             supportsResume = acceptsRangesHeader
@@ -859,6 +1032,7 @@ class IdmAcceleratedDownloader(
     /**
      * Downloads HLS segments concurrently using up to [concurrency] HTTP workers, decrypts AES-128
      * segments in parallel, and writes all segments in strict sequential order into [tempRawFile].
+     * Counts network bytes in real time as each segment streams in so speed is continuously accurate.
      */
     suspend fun downloadHlsSegmentsParallel(
         segments: List<HlsSegmentSpec>,
@@ -871,70 +1045,91 @@ class IdmAcceleratedDownloader(
         if (segments.isEmpty()) return 0L
         val workers = concurrency.coerceIn(1, 8).coerceAtMost(segments.size)
         val keyCache = ConcurrentHashMap<String, ByteArray>()
-        val windowSize = (workers * 3).coerceAtLeast(workers)
-        val totalDownloaded = AtomicLong(0L)
+        val windowSize = (workers * 2).coerceAtLeast(workers)
+        val liveNetworkBytes = AtomicLong(0L)
         val completedSegments = AtomicLong(0L)
-        var lastReportMs = SystemClock.elapsedRealtime()
-        var bytesAtLastReport = 0L
+        val speedTracker = SpeedWindowTracker(initialBytes = 0L)
+        val lastReportMs = AtomicLong(0L)
+        val reportLock = Any()
+
+        fun emitHlsProgress(force: Boolean = false) {
+            val now = SystemClock.elapsedRealtime()
+            if (!force && now - lastReportMs.get() < REPORT_INTERVAL_MS) return
+            synchronized(reportLock) {
+                val curMs = SystemClock.elapsedRealtime()
+                if (!force && curMs - lastReportMs.get() < REPORT_INTERVAL_MS) return
+                lastReportMs.set(curMs)
+                val curTotal = liveNetworkBytes.get()
+                val speedBps = speedTracker.sampleSpeedBps(curTotal, curMs)
+                val doneSegs = completedSegments.get()
+                val segFrac = (doneSegs.toFloat() / segments.size.toFloat()).coerceIn(0f, 1f)
+                val estTotal = if (segFrac > 0.04f) (curTotal / segFrac).toLong() else -1L
+                onProgress(
+                    IdmProgressUpdate(
+                        downloadedBytes = curTotal,
+                        totalBytes = estTotal,
+                        speedBytesPerSec = speedBps,
+                        activeConnections = workers,
+                        segmentProgress = List(workers) { segFrac },
+                        supportsResume = false
+                    )
+                )
+            }
+        }
 
         tempRawFile.parentFile?.mkdirs()
         BufferedOutputStream(FileOutputStream(tempRawFile, false), SINGLE_BUFFER_BYTES).use { out ->
-            val semaphore = Semaphore(workers)
-            var windowStart = 0
-            while (windowStart < segments.size) {
-                coroutineContext.ensureActive()
-                if (isPausedOrCancelled()) throw CancellationException("Download paused or cancelled")
-
-                val windowEnd = minOf(windowStart + windowSize, segments.size)
-                val chunkBytes = coroutineScope {
-                    (windowStart until windowEnd).map { segIdx ->
-                        async(Dispatchers.IO) {
-                            semaphore.withPermit {
-                                if (isPausedOrCancelled()) throw CancellationException("Download paused or cancelled")
-                                val data = fetchAndDecryptHlsSegment(
-                                    seg = segments[segIdx],
-                                    keyCache = keyCache,
-                                    requestHeadersProvider = requestHeadersProvider
-                                )
-                                totalDownloaded.addAndGet(data.size.toLong())
-                                completedSegments.incrementAndGet()
-                                data
-                            }
-                        }
-                    }.awaitAll()
-                }
-
-                for (bytes in chunkBytes) {
-                    if (bytes.isNotEmpty()) {
-                        out.write(bytes)
+            coroutineScope {
+                val tickerJob = launch(Dispatchers.Default) {
+                    while (isActive && !isPausedOrCancelled()) {
+                        delay(REPORT_INTERVAL_MS)
+                        emitHlsProgress(force = true)
                     }
                 }
+                try {
+                    val semaphore = Semaphore(workers)
+                    var windowStart = 0
+                    while (windowStart < segments.size) {
+                        coroutineContext.ensureActive()
+                        if (isPausedOrCancelled()) throw CancellationException("Download paused or cancelled")
 
-                val now = SystemClock.elapsedRealtime()
-                val elapsedMs = now - lastReportMs
-                if (elapsedMs >= REPORT_INTERVAL_MS || windowEnd == segments.size) {
-                    val curTotal = totalDownloaded.get()
-                    val delta = (curTotal - bytesAtLastReport).coerceAtLeast(0L)
-                    val speedBps = if (elapsedMs > 0L) (delta * 1000L) / elapsedMs else 0L
-                    val segFrac = (completedSegments.get().toFloat() / segments.size.toFloat()).coerceIn(0f, 1f)
-                    val estTotal = if (segFrac > 0.05f) (curTotal / segFrac).toLong() else -1L
-                    onProgress(
-                        IdmProgressUpdate(
-                            downloadedBytes = curTotal,
-                            totalBytes = estTotal,
-                            speedBytesPerSec = speedBps,
-                            activeConnections = workers,
-                            segmentProgress = List(workers) { segFrac },
-                            supportsResume = false
-                        )
-                    )
-                    lastReportMs = now
-                    bytesAtLastReport = curTotal
+                        val windowEnd = minOf(windowStart + windowSize, segments.size)
+                        val chunkBytes = coroutineScope {
+                            (windowStart until windowEnd).map { segIdx ->
+                                async(Dispatchers.IO) {
+                                    semaphore.withPermit {
+                                        if (isPausedOrCancelled()) throw CancellationException("Download paused or cancelled")
+                                        val data = fetchAndDecryptHlsSegment(
+                                            seg = segments[segIdx],
+                                            keyCache = keyCache,
+                                            requestHeadersProvider = requestHeadersProvider,
+                                            onBytesRead = { n ->
+                                                liveNetworkBytes.addAndGet(n.toLong())
+                                                emitHlsProgress(force = false)
+                                            }
+                                        )
+                                        completedSegments.incrementAndGet()
+                                        emitHlsProgress(force = false)
+                                        data
+                                    }
+                                }
+                            }.awaitAll()
+                        }
+
+                        for (bytes in chunkBytes) {
+                            if (bytes.isNotEmpty()) {
+                                out.write(bytes)
+                            }
+                        }
+
+                        emitHlsProgress(force = true)
+                        windowStart = windowEnd
+                    }
+                    out.flush()
+                } finally {
+                    tickerJob.cancel()
                 }
-
-                windowStart = windowEnd
             }
-            out.flush()
         }
         return tempRawFile.length()
     }
@@ -942,11 +1137,13 @@ class IdmAcceleratedDownloader(
     private fun fetchAndDecryptHlsSegment(
         seg: HlsSegmentSpec,
         keyCache: ConcurrentHashMap<String, ByteArray>,
-        requestHeadersProvider: (String) -> Map<String, String>
+        requestHeadersProvider: (String) -> Map<String, String>,
+        onBytesRead: ((Int) -> Unit)? = null
     ): ByteArray {
         val headers = requestHeadersProvider(seg.url)
         var lastError: Exception? = null
         for (attempt in 0..2) {
+            var bytesCountedThisAttempt = 0
             try {
                 val segReqBuilder = Request.Builder()
                     .url(seg.url)
@@ -976,7 +1173,19 @@ class IdmAcceleratedDownloader(
                     val body = segResp.body ?: return@use ByteArray(0)
                     val isServerFull200OnByteRange = segResp.code == 200 &&
                         seg.byteRangeStart >= 0L && seg.byteRangeLength > 0L
-                    val all = body.bytes()
+
+                    val initialCap = body.contentLength().takeIf { it in 1..(16 * 1024 * 1024) }?.toInt() ?: (64 * 1024)
+                    val baos = ByteArrayOutputStream(initialCap)
+                    val buf = ByteArray(32 * 1024)
+                    val stream = body.byteStream()
+                    while (true) {
+                        val r = stream.read(buf)
+                        if (r == -1) break
+                        baos.write(buf, 0, r)
+                        bytesCountedThisAttempt += r
+                        onBytesRead?.invoke(r)
+                    }
+                    val all = baos.toByteArray()
                     if (isServerFull200OnByteRange) {
                         val from = seg.byteRangeStart.toInt().coerceIn(0, all.size)
                         val to = (seg.byteRangeStart + seg.byteRangeLength).toInt().coerceIn(from, all.size)
@@ -1021,6 +1230,9 @@ class IdmAcceleratedDownloader(
             } catch (ee: ExtractorException) {
                 throw ee
             } catch (e: Exception) {
+                if (bytesCountedThisAttempt > 0) {
+                    onBytesRead?.invoke(-bytesCountedThisAttempt)
+                }
                 lastError = e
                 if (attempt >= 2) throw e
                 try { Thread.sleep(250L * (attempt + 1)) } catch (_: InterruptedException) {}

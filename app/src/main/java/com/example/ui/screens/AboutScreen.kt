@@ -24,6 +24,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.BuildConfig
 import com.example.R
 import com.example.data.repository.KernelRepository
 
@@ -88,7 +89,7 @@ fun AboutScreen(repository: KernelRepository) {
                         modifier = Modifier.padding(horizontal = 8.dp)
                     ) {
                         Text(
-                            text = "Version 3.0 (Dragon Release)",
+                            text = "Version ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) • Dragon Release",
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary
