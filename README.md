@@ -8,4 +8,7 @@
 
 ⚡ Download From Every Social Media & Websites 
 
+⚡ Advanced Browser With ::
+DNS, Extension, YT Background Video Playback Support, Proxy, Media Grabber.
+
 
