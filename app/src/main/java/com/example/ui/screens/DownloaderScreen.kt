@@ -16,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.core.content.ContextCompat
 import androidx.compose.animation.expandVertically
@@ -34,6 +35,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -41,6 +44,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -59,6 +63,7 @@ import com.example.data.model.*
 import com.example.data.repository.KernelRepository
 import com.example.ui.components.StartBatchDownloadPopupDialog
 import com.example.ui.components.StartDownloadPopupDialog
+import com.example.ui.components.YouTubePlaylistCard
 import com.example.ui.components.hasStoragePermissionsForDownload
 import com.example.ui.components.openAppStoragePermissionSettings
 import com.example.ui.components.requiredStoragePermissionsForDownload
@@ -76,7 +81,8 @@ import java.util.Locale
 @Composable
 fun DownloaderScreen(
     repository: KernelRepository,
-    onOpenBrowser: () -> Unit = {}
+    onOpenBrowser: () -> Unit = {},
+    onOpenBrowserWithUrl: (String) -> Unit = { onOpenBrowser() }
 ) {
     val context = LocalContext.current
     val haptics = LocalDragonHaptics.current
@@ -94,6 +100,8 @@ fun DownloaderScreen(
     var isFetching by remember { mutableStateOf(false) }
     var fetchStage by remember { mutableStateOf(DownloadStateStage.VALIDATING_URL) }
     var mediaInfo by remember { mutableStateOf<MediaInfo?>(null) }
+    var playlistInfo by remember { mutableStateOf<YouTubePlaylistInfo?>(null) }
+    var playlistProgressLabel by remember { mutableStateOf<String?>(null) }
     var fetchErrorType by remember { mutableStateOf<DownloaderErrorType?>(null) }
     var fetchErrorMessage by remember { mutableStateOf<String?>(null) }
 
@@ -101,6 +109,8 @@ fun DownloaderScreen(
     var selectedFormatIndex by remember { mutableStateOf(0) }
     var qualityDropdownExpanded by remember { mutableStateOf(false) }
     var managerFilter by remember { mutableStateOf("ALL") } // ALL, DOWNLOADING, PROCESSING, COMPLETED, PAUSED, FAILED
+    var expandedActiveTaskIds by rememberSaveable { mutableStateOf(setOf<String>()) }
+    var isActiveDownloadsSectionExpanded by rememberSaveable { mutableStateOf(true) }
     var expandedDownloadedTaskIds by rememberSaveable { mutableStateOf(setOf<String>()) }
     var isDownloadedSectionExpanded by rememberSaveable { mutableStateOf(true) }
     val activeBatchSession by downloadManager.activeBatchSessionFlow.collectAsState()
@@ -150,12 +160,46 @@ fun DownloaderScreen(
         }
     }
 
+    val triggerPlaylistFetch: (String) -> Unit = { targetUrl ->
+        if (targetUrl.isBlank()) {
+            fetchErrorType = DownloaderErrorType.INVALID_URL
+            fetchErrorMessage = "Please enter or paste a valid YouTube playlist link."
+        } else {
+            isFetching = true
+            fetchStage = DownloadStateStage.FETCHING_METADATA
+            playlistProgressLabel = "Loading YouTube playlist..."
+            fetchErrorType = null
+            fetchErrorMessage = null
+            mediaInfo = null
+            playlistInfo = null
+            downloadManager.fetchYouTubePlaylistInfo(
+                url = targetUrl,
+                onProgress = { progressText -> playlistProgressLabel = progressText },
+                onResult = { plInfo, errType, errMsg ->
+                    isFetching = false
+                    playlistProgressLabel = null
+                    if (plInfo != null) {
+                        playlistInfo = plInfo
+                    } else {
+                        playlistInfo = null
+                        fetchErrorType = errType ?: DownloaderErrorType.UNSUPPORTED_MEDIA
+                        fetchErrorMessage = errMsg ?: "Unable to fetch YouTube playlist."
+                    }
+                }
+            )
+        }
+    }
+
     val triggerFetch: (String) -> Unit = { targetUrl ->
         if (targetUrl.isBlank()) {
             fetchErrorType = DownloaderErrorType.INVALID_URL
             fetchErrorMessage = "Please enter or paste a valid media link."
+        } else if (isDirectYouTubePlaylistUrl(targetUrl)) {
+            triggerPlaylistFetch(targetUrl)
         } else {
             isFetching = true
+            playlistProgressLabel = null
+            playlistInfo = null
             fetchErrorType = null
             fetchErrorMessage = null
             downloadManager.fetchMediaInfo(
@@ -256,23 +300,36 @@ fun DownloaderScreen(
     ) {
         // 1. Hero Header Card
         item(key = "downloader_hero_header") {
+            val isFlatMinimal = themeConfig.soothingTheme.isFlatMinimal
+            val heroRadius = themeConfig.cornerRadiusDp.coerceIn(8, 24).dp
+            val iconBoxRadius = if (isFlatMinimal) 8.dp else 14.dp
             Card(
-                shape = RoundedCornerShape(22.dp),
+                shape = RoundedCornerShape(heroRadius),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.32f)),
+                border = BorderStroke(
+                    width = 1.dp,
+                    color = if (isFlatMinimal) MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.85f)
+                    else MaterialTheme.colorScheme.primary.copy(alpha = 0.32f)
+                ),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(
-                            Brush.horizontalGradient(
-                                listOf(
-                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.16f),
-                                    NeonCyan.copy(alpha = 0.08f),
-                                    Color.Transparent
+                        .then(
+                            if (isFlatMinimal) {
+                                Modifier.background(MaterialTheme.colorScheme.surface)
+                            } else {
+                                Modifier.background(
+                                    Brush.horizontalGradient(
+                                        listOf(
+                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                                            MaterialTheme.colorScheme.secondary.copy(alpha = 0.06f),
+                                            Color.Transparent
+                                        )
+                                    )
                                 )
-                            )
+                            }
                         )
                         .padding(16.dp)
                 ) {
@@ -290,16 +347,24 @@ fun DownloaderScreen(
                                 Box(
                                     modifier = Modifier
                                         .size(44.dp)
-                                        .clip(RoundedCornerShape(14.dp))
-                                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.18f))
-                                        .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.45f), RoundedCornerShape(14.dp)),
+                                        .clip(RoundedCornerShape(iconBoxRadius))
+                                        .background(
+                                            if (isFlatMinimal) MaterialTheme.colorScheme.surfaceContainerHigh
+                                            else MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+                                        )
+                                        .border(
+                                            width = 1.dp,
+                                            color = if (isFlatMinimal) MaterialTheme.colorScheme.outlineVariant
+                                            else MaterialTheme.colorScheme.primary.copy(alpha = 0.35f),
+                                            shape = RoundedCornerShape(iconBoxRadius)
+                                        ),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.CloudDownload,
                                         contentDescription = "Downloader",
                                         tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(24.dp)
+                                        modifier = Modifier.size(22.dp)
                                     )
                                 }
                                 Column {
@@ -358,108 +423,6 @@ fun DownloaderScreen(
                                         tint = if (customBackendUrl.isNotBlank()) SuccessGreen else MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
-                            }
-                        }
-
-                        // Private / Restricted Unlock Status Bar
-                        Surface(
-                            shape = RoundedCornerShape(10.dp),
-                            color = SuccessGreen.copy(alpha = 0.12f),
-                            border = BorderStroke(1.dp, SuccessGreen.copy(alpha = 0.4f)),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    haptics.tap()
-                                    showPrivateAuthDialog = true
-                                }
-                                .testTag("restricted_access_banner")
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.LockOpen,
-                                        contentDescription = null,
-                                        tint = SuccessGreen,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                    Text(
-                                        text = if (restrictedBypassEnabled)
-                                            "Private & Restricted Content Resolver: ACTIVE (Embed + Session Cookies)"
-                                        else
-                                            "Private & Restricted Resolver: Tap to configure login or cookies",
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                }
-                                Text(
-                                    text = "Configure",
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = NeonCyan
-                                )
-                            }
-                        }
-
-                        // Save Location & Storage Permission Status Bar
-                        Surface(
-                            shape = RoundedCornerShape(10.dp),
-                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    haptics.tap()
-                                    downloadManager.ensureDragonToolDirectories()
-                                    val nowGranted = hasStoragePermissionsForDownload(context)
-                                    hasStoragePermissions = nowGranted
-                                    if (!nowGranted && requiredPermissions.isNotEmpty()) {
-                                        if (didPromptPermissionsOnce) {
-                                            openAppStoragePermissionSettings(context)
-                                        } else {
-                                            permissionLauncher.launch(requiredPermissions)
-                                        }
-                                    }
-                                }
-                                .testTag("storage_permission_banner")
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.FolderSpecial,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                    Text(
-                                        text = "Save Path: Download/DDM/Videos, Audio & Files",
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                }
-                                Text(
-                                    text = if (hasStoragePermissions) "Permitted" else "Grant Access",
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = if (hasStoragePermissions) SuccessGreen else WarningOrange
-                                )
                             }
                         }
 
@@ -583,6 +546,7 @@ fun DownloaderScreen(
                             listOf(
                                 MediaPlatform.YOUTUBE,
                                 MediaPlatform.YOUTUBE_SHORTS,
+                                MediaPlatform.TELEGRAM,
                                 MediaPlatform.TIKTOK,
                                 MediaPlatform.INSTAGRAM,
                                 MediaPlatform.FACEBOOK,
@@ -664,14 +628,14 @@ fun DownloaderScreen(
                 Surface(
                     modifier = Modifier
                         .weight(1f)
-                        .clip(RoundedCornerShape(11.dp))
+                        .clip(RoundedCornerShape(if (themeConfig.soothingTheme.isFlatMinimal) 7.dp else 11.dp))
                         .clickable {
                             haptics.tabSelect()
                             isBatchMode = false
                         }
                         .testTag("mode_single_tab"),
                     color = if (!isBatchMode) MaterialTheme.colorScheme.primary else Color.Transparent,
-                    shape = RoundedCornerShape(11.dp)
+                    shape = RoundedCornerShape(if (themeConfig.soothingTheme.isFlatMinimal) 7.dp else 11.dp)
                 ) {
                     Row(
                         modifier = Modifier.padding(vertical = 10.dp),
@@ -681,7 +645,7 @@ fun DownloaderScreen(
                         Icon(
                             imageVector = Icons.Default.Link,
                             contentDescription = null,
-                            tint = if (!isBatchMode) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                            tint = if (!isBatchMode) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
@@ -689,7 +653,7 @@ fun DownloaderScreen(
                             text = "Single Link",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold,
-                            color = if (!isBatchMode) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
+                            color = if (!isBatchMode) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
@@ -697,14 +661,14 @@ fun DownloaderScreen(
                 Surface(
                     modifier = Modifier
                         .weight(1f)
-                        .clip(RoundedCornerShape(11.dp))
+                        .clip(RoundedCornerShape(if (themeConfig.soothingTheme.isFlatMinimal) 7.dp else 11.dp))
                         .clickable {
                             haptics.tabSelect()
                             isBatchMode = true
                         }
                         .testTag("mode_batch_tab"),
-                    color = if (isBatchMode) NeonCyan.copy(alpha = 0.85f) else Color.Transparent,
-                    shape = RoundedCornerShape(11.dp)
+                    color = if (isBatchMode) MaterialTheme.colorScheme.secondary else Color.Transparent,
+                    shape = RoundedCornerShape(if (themeConfig.soothingTheme.isFlatMinimal) 7.dp else 11.dp)
                 ) {
                     Row(
                         modifier = Modifier.padding(vertical = 10.dp),
@@ -714,15 +678,15 @@ fun DownloaderScreen(
                         Icon(
                             imageVector = Icons.Default.DynamicFeed,
                             contentDescription = null,
-                            tint = if (isBatchMode) Color.Black else MaterialTheme.colorScheme.onSurfaceVariant,
+                            tint = if (isBatchMode) MaterialTheme.colorScheme.onSecondary else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
                             text = "Batch Download",
                             fontSize = 12.sp,
-                            fontWeight = FontWeight.Black,
-                            color = if (isBatchMode) Color.Black else MaterialTheme.colorScheme.onSurfaceVariant
+                            fontWeight = FontWeight.Bold,
+                            color = if (isBatchMode) MaterialTheme.colorScheme.onSecondary else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         if (activeBatchSession != null && !activeBatchSession!!.isFinished) {
                             Spacer(modifier = Modifier.width(6.dp))
@@ -730,7 +694,7 @@ fun DownloaderScreen(
                                 modifier = Modifier
                                     .size(8.dp)
                                     .clip(CircleShape)
-                                    .background(if (isBatchMode) Color.Black else NeonCyan)
+                                    .background(if (isBatchMode) MaterialTheme.colorScheme.onSecondary else MaterialTheme.colorScheme.primary)
                             )
                         }
                     }
@@ -741,12 +705,17 @@ fun DownloaderScreen(
         if (!isBatchMode) {
             // 2. URL Input & Extraction Card
             item(key = "url_input_card") {
+                val isFlatMinimal = themeConfig.soothingTheme.isFlatMinimal
                 Card(
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.24f)),
-                modifier = Modifier.fillMaxWidth()
-            ) {
+                    shape = RoundedCornerShape(themeConfig.cornerRadiusDp.coerceIn(8, 24).dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(
+                        width = 1.dp,
+                        color = if (isFlatMinimal) MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.85f)
+                        else MaterialTheme.colorScheme.outline.copy(alpha = 0.24f)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
                 Column(
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -787,7 +756,7 @@ fun DownloaderScreen(
                                         text = "Detected: ${detectedPlatform.displayName}",
                                         fontSize = 10.sp,
                                         fontWeight = FontWeight.Bold,
-                                        color = Color.White
+                                        color = MaterialTheme.colorScheme.onSurface
                                     )
                                 }
                             }
@@ -803,7 +772,7 @@ fun DownloaderScreen(
                         },
                         placeholder = {
                             Text(
-                                text = "Paste any website, YouTube, Patreon, or file link (.zip, .apk, .pdf, .iso, .mp4)...",
+                                text = "Paste YouTube video/playlist, Telegram, Patreon, or file link...",
                                 fontSize = 12.sp
                             )
                         },
@@ -865,7 +834,7 @@ fun DownloaderScreen(
                         }
                     )
 
-                    // Error Banner with Retry button
+                    // Error Banner with Retry & Telegram Web action
                     AnimatedVisibility(visible = fetchErrorMessage != null) {
                         Surface(
                             shape = RoundedCornerShape(12.dp),
@@ -873,38 +842,72 @@ fun DownloaderScreen(
                             border = BorderStroke(1.dp, DangerRed.copy(alpha = 0.5f)),
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Row(
+                            Column(
                                 modifier = Modifier.padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.ErrorOutline,
-                                    contentDescription = null,
-                                    tint = DangerRed,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = fetchErrorType?.title ?: "Extraction Error",
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = DangerRed
-                                    )
-                                    Text(
-                                        text = fetchErrorMessage ?: "",
-                                        fontSize = 11.sp,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                }
-                                TextButton(
-                                    onClick = {
-                                        haptics.tap()
-                                        triggerFetch(urlInput)
-                                    },
-                                    modifier = Modifier.testTag("retry_fetch_button")
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
-                                    Text("Retry", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                    Icon(
+                                        imageVector = Icons.Default.ErrorOutline,
+                                        contentDescription = null,
+                                        tint = DangerRed,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = fetchErrorType?.title ?: "Extraction Error",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = DangerRed
+                                        )
+                                        Text(
+                                            text = fetchErrorMessage ?: "",
+                                            fontSize = 11.sp,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
+                                    TextButton(
+                                        onClick = {
+                                            haptics.tap()
+                                            triggerFetch(urlInput)
+                                        },
+                                        modifier = Modifier.testTag("retry_fetch_button")
+                                    ) {
+                                        Text("Retry", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                    }
+                                }
+
+                                if (detectedPlatform == MediaPlatform.TELEGRAM) {
+                                    FilledTonalButton(
+                                        onClick = {
+                                            haptics.tap()
+                                            onOpenBrowserWithUrl(buildTelegramWebUrl(urlInput))
+                                        },
+                                        shape = RoundedCornerShape(10.dp),
+                                        colors = ButtonDefaults.filledTonalButtonColors(
+                                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                                        ),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .heightIn(min = 48.dp)
+                                            .testTag("open_telegram_web_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Filled.Send,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "Open in Telegram Web",
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1000,7 +1003,44 @@ fun DownloaderScreen(
                         }
                     }
 
-                    // Fetch Media Button
+                    val isDirectPlaylist = remember(urlInput) { isDirectYouTubePlaylistUrl(urlInput) }
+                    val hasPlaylistInWatchUrl = remember(urlInput) {
+                        hasYouTubePlaylistParam(urlInput) && !isDirectYouTubePlaylistUrl(urlInput)
+                    }
+
+                    // Quick CTA when a YouTube watch link also belongs to a playlist (&list=...)
+                    AnimatedVisibility(visible = hasPlaylistInWatchUrl) {
+                        FilledTonalButton(
+                            onClick = {
+                                haptics.confirm()
+                                triggerPlaylistFetch(urlInput)
+                            },
+                            enabled = !isFetching,
+                            shape = RoundedCornerShape(if (isFlatMinimal) 9.dp else 12.dp),
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .testTag("fetch_watch_playlist_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.PlaylistPlay,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Load Entire YouTube Playlist",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 13.sp
+                            )
+                        }
+                    }
+
+                    // Fetch Media / Playlist Button
                     Button(
                         onClick = {
                             haptics.confirm()
@@ -1011,35 +1051,65 @@ fun DownloaderScreen(
                             .fillMaxWidth()
                             .height(50.dp)
                             .testTag("fetch_media_button"),
-                        shape = RoundedCornerShape(14.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                        shape = RoundedCornerShape(if (isFlatMinimal) 9.dp else 14.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary
+                        )
                     ) {
                         if (isFetching) {
                             CircularProgressIndicator(
                                 modifier = Modifier.size(18.dp),
-                                color = Color.White,
+                                color = MaterialTheme.colorScheme.onPrimary,
                                 strokeWidth = 2.dp
                             )
                             Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                text = "${fetchStage.displayLabel}...",
+                                text = playlistProgressLabel ?: "${fetchStage.displayLabel}...",
                                 fontWeight = FontWeight.Bold,
-                                fontSize = 13.sp
+                                fontSize = 13.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         } else {
                             Icon(
-                                imageVector = Icons.Default.TravelExplore,
+                                imageVector = if (isDirectPlaylist) Icons.AutoMirrored.Filled.PlaylistPlay
+                                else Icons.Default.TravelExplore,
                                 contentDescription = null,
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Fetch Files & Media",
+                                text = if (isDirectPlaylist) "Fetch Full Playlist" else "Fetch Files & Media",
                                 fontWeight = FontWeight.ExtraBold,
                                 fontSize = 14.sp
                             )
                         }
                     }
+                }
+            }
+        }
+
+        // 2.8 Extracted YouTube Playlist Preview & Whole-Playlist Download Card
+        item(key = "youtube_playlist_preview_section") {
+            AnimatedVisibility(
+                visible = playlistInfo != null,
+                enter = fadeIn() + expandVertically(),
+                exit = fadeOut() + shrinkVertically()
+            ) {
+                playlistInfo?.let { pl ->
+                    YouTubePlaylistCard(
+                        playlist = pl,
+                        isFlatMinimal = themeConfig.soothingTheme.isFlatMinimal,
+                        cornerRadiusDp = themeConfig.cornerRadiusDp,
+                        onDismiss = { playlistInfo = null },
+                        onStartPlaylistDownload = { selectedItems, config ->
+                            downloadManager.ensureDragonToolDirectories()
+                            downloadManager.startPlaylistBatchDownload(pl, selectedItems, config)
+                            playlistInfo = null
+                            isBatchItemsExpanded = true
+                        }
+                    )
                 }
             }
         }
@@ -1977,16 +2047,171 @@ fun DownloaderScreen(
             val activeOrOtherTasks = filteredTasks.filter { it.stage != DownloadStateStage.COMPLETED }
             val completedTasks = filteredTasks.filter { it.stage == DownloadStateStage.COMPLETED }
 
-            items(activeOrOtherTasks, key = { it.id }) { task ->
-                DownloadTaskCard(
-                    task = task,
-                    onPause = { downloadManager.pauseDownload(task.id) },
-                    onResume = { downloadManager.resumeDownload(task.id) },
-                    onCancel = { downloadManager.cancelDownload(task.id) },
-                    onRetry = { downloadManager.retryDownload(task.id) },
-                    onOpen = { downloadManager.openDownloadedFile(context, task) },
-                    onShare = { downloadManager.shareDownloadedFile(context, task) }
-                )
+            if (activeOrOtherTasks.isNotEmpty()) {
+                val isFilteredActiveOnly = managerFilter in setOf("DOWNLOADING", "PROCESSING", "PAUSED", "FAILED")
+                val showActiveItems = isFilteredActiveOnly || isActiveDownloadsSectionExpanded
+                val allActiveExpanded = activeOrOtherTasks.all { it.id in expandedActiveTaskIds }
+                val runningCount = activeOrOtherTasks.count { it.stage.isActive }
+                val combinedSpeedBytes = activeOrOtherTasks
+                    .filter { it.stage.isActive }
+                    .sumOf { it.speedBytesPerSec }
+
+                item(key = "active_downloads_section_header") {
+                    val activeHeaderAccent = when {
+                        runningCount > 0 -> MaterialTheme.colorScheme.primary
+                        activeOrOtherTasks.all { it.stage == DownloadStateStage.PAUSED } -> WarningOrange
+                        activeOrOtherTasks.all { it.stage == DownloadStateStage.FAILED } -> DangerRed
+                        else -> NeonCyan
+                    }
+                    val sectionChevronRotation by animateFloatAsState(
+                        targetValue = if (showActiveItems) 180f else 0f,
+                        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+                        label = "active_section_chevron"
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = activeHeaderAccent.copy(alpha = 0.10f),
+                        border = BorderStroke(1.dp, activeHeaderAccent.copy(alpha = 0.30f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = !isFilteredActiveOnly) {
+                                haptics.tap()
+                                isActiveDownloadsSectionExpanded = !isActiveDownloadsSectionExpanded
+                            }
+                            .testTag("active_downloads_section_header")
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Downloading,
+                                    contentDescription = "Active Downloads",
+                                    tint = activeHeaderAccent,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Column {
+                                    Text(
+                                        text = "IN PROGRESS (${activeOrOtherTasks.size})",
+                                        fontSize = 11.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        color = activeHeaderAccent,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    val speedSummary = if (combinedSpeedBytes > 0L) {
+                                        "${formatBytes(combinedSpeedBytes)}/s"
+                                    } else null
+                                    val modeHint = when {
+                                        !showActiveItems -> "Collapsed • Tap to expand"
+                                        allActiveExpanded -> "Expanded • Tap card to compact"
+                                        else -> "Compact • Tap card to expand"
+                                    }
+                                    Text(
+                                        text = listOfNotNull(speedSummary, modeHint).joinToString(" • "),
+                                        fontSize = 9.5.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                if (showActiveItems) {
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+                                        border = BorderStroke(
+                                            0.8.dp,
+                                            MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+                                        ),
+                                        modifier = Modifier
+                                            .clickable {
+                                                haptics.tap()
+                                                expandedActiveTaskIds = if (allActiveExpanded) {
+                                                    expandedActiveTaskIds - activeOrOtherTasks.map { it.id }.toSet()
+                                                } else {
+                                                    expandedActiveTaskIds + activeOrOtherTasks.map { it.id }
+                                                }
+                                            }
+                                            .testTag("btn_toggle_expand_all_active")
+                                    ) {
+                                        Text(
+                                            text = if (allActiveExpanded) "Compact All" else "Expand All",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = activeHeaderAccent,
+                                            maxLines = 1,
+                                            softWrap = false,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                        )
+                                    }
+                                }
+
+                                if (!isFilteredActiveOnly) {
+                                    IconButton(
+                                        onClick = {
+                                            haptics.tap()
+                                            isActiveDownloadsSectionExpanded = !isActiveDownloadsSectionExpanded
+                                        },
+                                        modifier = Modifier
+                                            .size(28.dp)
+                                            .testTag("btn_toggle_active_section")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.ExpandMore,
+                                            contentDescription = if (isActiveDownloadsSectionExpanded) "Collapse Downloading List" else "Expand Downloading List",
+                                            tint = activeHeaderAccent,
+                                            modifier = Modifier
+                                                .size(18.dp)
+                                                .rotate(sectionChevronRotation)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (showActiveItems) {
+                    items(activeOrOtherTasks, key = { it.id }) { task ->
+                        val isExpanded = task.id in expandedActiveTaskIds
+                        DownloadTaskCard(
+                            task = task,
+                            isExpanded = isExpanded,
+                            onToggleExpand = {
+                                haptics.tap()
+                                expandedActiveTaskIds = if (isExpanded) {
+                                    expandedActiveTaskIds - task.id
+                                } else {
+                                    expandedActiveTaskIds + task.id
+                                }
+                            },
+                            onPause = { downloadManager.pauseDownload(task.id) },
+                            onResume = { downloadManager.resumeDownload(task.id) },
+                            onCancel = {
+                                expandedActiveTaskIds = expandedActiveTaskIds - task.id
+                                downloadManager.cancelDownload(task.id)
+                            },
+                            onRetry = { downloadManager.retryDownload(task.id) },
+                            onOpen = { downloadManager.openDownloadedFile(context, task) },
+                            onShare = { downloadManager.shareDownloadedFile(context, task) }
+                        )
+                    }
+                }
             }
 
             if (completedTasks.isNotEmpty()) {
@@ -2138,7 +2363,7 @@ fun DownloaderScreen(
 @Composable
 private fun DownloadTaskCard(
     task: DownloaderTask,
-    isExpanded: Boolean = true,
+    isExpanded: Boolean = false,
     onToggleExpand: (() -> Unit)? = null,
     onPause: () -> Unit,
     onResume: () -> Unit,
@@ -2148,7 +2373,7 @@ private fun DownloadTaskCard(
     onShare: () -> Unit
 ) {
     val haptics = LocalDragonHaptics.current
-    val isCompactCompleted = task.stage == DownloadStateStage.COMPLETED && !isExpanded && onToggleExpand != null
+    val showExpandedDetails = isExpanded || onToggleExpand == null
     val statusColor = when (task.stage) {
         DownloadStateStage.COMPLETED -> SuccessGreen
         DownloadStateStage.FAILED -> DangerRed
@@ -2158,32 +2383,49 @@ private fun DownloadTaskCard(
         DownloadStateStage.VALIDATING_OUTPUT -> NeonCyan
         else -> MaterialTheme.colorScheme.primary
     }
+    val chevronRotation by animateFloatAsState(
+        targetValue = if (showExpandedDetails) 180f else 0f,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "download_card_chevron_${task.id}"
+    )
 
     Card(
-        shape = RoundedCornerShape(if (isCompactCompleted) 12.dp else 18.dp),
+        shape = RoundedCornerShape(if (showExpandedDetails) 16.dp else 13.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         border = BorderStroke(
-            width = if (isCompactCompleted) 0.8.dp else 1.dp,
-            color = statusColor.copy(alpha = if (isCompactCompleted) 0.25f else 0.35f)
+            width = if (showExpandedDetails) 1.dp else 0.85.dp,
+            color = statusColor.copy(alpha = if (showExpandedDetails) 0.42f else 0.28f)
         ),
         modifier = Modifier
             .fillMaxWidth()
             .animateContentSize(animationSpec = spring(stiffness = Spring.StiffnessMediumLow))
             .testTag("download_task_card_${task.id}")
     ) {
-        if (isCompactCompleted) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 11.dp, vertical = 9.dp),
+            verticalArrangement = Arrangement.spacedBy(7.dp)
+        ) {
+            // 1. Compact Header Row (always visible; tap to expand/collapse)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onToggleExpand?.invoke() }
-                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                    .then(
+                        if (onToggleExpand != null) {
+                            Modifier.clickable { onToggleExpand() }
+                        } else {
+                            Modifier
+                        }
+                    ),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                // Compact Thumbnail
                 Box(
                     modifier = Modifier
-                        .size(38.dp)
-                        .clip(RoundedCornerShape(8.dp))
+                        .size(if (showExpandedDetails) 48.dp else 40.dp)
+                        .clip(RoundedCornerShape(9.dp))
                         .background(MaterialTheme.colorScheme.surfaceVariant),
                     contentAlignment = Alignment.Center
                 ) {
@@ -2208,6 +2450,7 @@ private fun DownloadTaskCard(
                     }
                 }
 
+                // Title + Single-Line Live Summary
                 Column(
                     modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(2.dp)
@@ -2216,474 +2459,436 @@ private fun DownloadTaskCard(
                         text = task.filename,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
-                        maxLines = 1,
+                        maxLines = if (showExpandedDetails) 2 else 1,
                         overflow = TextOverflow.Ellipsis,
                         color = MaterialTheme.colorScheme.onSurface
                     )
-                    val compactMeta = buildList {
-                        add(task.totalSizeFormatted)
-                        add(task.qualityLabel)
-                        add(task.platform.displayName)
-                        if (task.batchSessionId != null) add("BATCH")
-                    }.joinToString(" • ")
+                    val compactMeta = when (task.stage) {
+                        DownloadStateStage.COMPLETED -> buildList {
+                            add(task.totalSizeFormatted)
+                            add(task.qualityLabel)
+                            add(task.platform.displayName)
+                            if (task.batchSessionId != null) add("BATCH")
+                        }.joinToString(" • ")
+
+                        DownloadStateStage.PAUSED -> buildList {
+                            add("Paused")
+                            add("${task.downloadedSizeFormatted}/${task.totalSizeFormatted}")
+                            add(task.platform.displayName)
+                        }.joinToString(" • ")
+
+                        DownloadStateStage.FAILED -> buildList {
+                            add(task.errorType?.title ?: "Failed")
+                            task.errorMessage?.takeIf { it.isNotBlank() }?.let { add(it) }
+                        }.joinToString(" • ")
+
+                        DownloadStateStage.MERGING_STREAMS,
+                        DownloadStateStage.CONVERTING_MEDIA,
+                        DownloadStateStage.VALIDATING_OUTPUT -> "${task.stage.displayLabel} • ${task.platform.displayName}"
+
+                        else -> buildList {
+                            add(task.speedFormatted)
+                            add("${task.downloadedSizeFormatted}/${task.totalSizeFormatted}")
+                            if (task.etaFormatted != "--" && task.etaFormatted.isNotBlank()) {
+                                add("ETA ${task.etaFormatted}")
+                            }
+                        }.joinToString(" • ")
+                    }
                     Text(
                         text = compactMeta,
                         fontSize = 10.sp,
+                        fontFamily = if (task.stage.isActive || task.stage == DownloadStateStage.PAUSED) {
+                            FontFamily.Monospace
+                        } else {
+                            FontFamily.Default
+                        },
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-
-                IconButton(
-                    onClick = {
-                        haptics.tap()
-                        onOpen()
-                    },
-                    modifier = Modifier
-                        .size(36.dp)
-                        .testTag("compact_open_file_button_${task.id}")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PlayCircle,
-                        contentDescription = "Open File",
-                        tint = SuccessGreen,
-                        modifier = Modifier.size(20.dp)
-                    )
-                }
-
-                IconButton(
-                    onClick = { onToggleExpand?.invoke() },
-                    modifier = Modifier
-                        .size(32.dp)
-                        .testTag("toggle_expand_download_${task.id}")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.ExpandMore,
-                        contentDescription = "Expand download details",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(18.dp)
-                    )
-                }
-            }
-        } else {
-            Column(
-                modifier = Modifier.padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .then(
-                            if (task.stage == DownloadStateStage.COMPLETED && onToggleExpand != null) {
-                                Modifier.clickable { onToggleExpand() }
-                            } else {
-                                Modifier
-                            }
-                        ),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // Thumbnail or Audio Artwork
-                    Box(
-                        modifier = Modifier
-                            .size(76.dp, 56.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        if (task.thumbnailUrl.isNotBlank()) {
-                            AsyncImage(
-                                model = task.thumbnailUrl,
-                                contentDescription = task.filename,
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize()
-                            )
+                        color = if (task.stage == DownloadStateStage.FAILED) {
+                            DangerRed
                         } else {
-                            Icon(
-                                imageVector = when {
-                                    task.isGenericFile -> Icons.Default.InsertDriveFile
-                                    task.isAudioOnly -> Icons.Default.AudioFile
-                                    else -> Icons.Default.VideoFile
-                                },
-                                contentDescription = null,
-                                tint = statusColor,
-                                modifier = Modifier.size(28.dp)
-                            )
+                            MaterialTheme.colorScheme.onSurfaceVariant
                         }
-                    }
+                    )
+                }
 
-                    Column(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(3.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = task.filename,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.ExtraBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                modifier = Modifier.weight(1f)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Surface(
-                                shape = RoundedCornerShape(6.dp),
-                                color = statusColor.copy(alpha = 0.16f)
-                            ) {
-                                Text(
-                                    text = task.stage.displayLabel.uppercase(Locale.US),
-                                    fontSize = 9.sp,
-                                    fontWeight = FontWeight.Black,
-                                    color = statusColor,
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                )
-                            }
-                            if (task.stage == DownloadStateStage.COMPLETED && onToggleExpand != null) {
-                                Spacer(modifier = Modifier.width(2.dp))
+                // Compact Quick Action + Expand/Collapse Chevron
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    when (task.stage) {
+                        DownloadStateStage.DOWNLOADING_VIDEO,
+                        DownloadStateStage.DOWNLOADING_AUDIO,
+                        DownloadStateStage.DOWNLOADING_FILE -> {
+                            if (task.supportsPauseResume) {
                                 IconButton(
-                                    onClick = onToggleExpand,
+                                    onClick = {
+                                        haptics.tap()
+                                        onPause()
+                                    },
                                     modifier = Modifier
-                                        .size(26.dp)
-                                        .testTag("toggle_expand_download_${task.id}")
+                                        .size(36.dp)
+                                        .testTag("compact_pause_button_${task.id}")
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.ExpandLess,
-                                        contentDescription = "Collapse download details",
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.size(18.dp)
+                                        imageVector = Icons.Default.Pause,
+                                        contentDescription = "Pause Download",
+                                        tint = statusColor,
+                                        modifier = Modifier.size(19.dp)
                                     )
                                 }
                             }
                         }
 
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        DownloadStateStage.PAUSED -> {
+                            IconButton(
+                                onClick = {
+                                    haptics.confirm()
+                                    onResume()
+                                },
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .testTag("compact_resume_button_${task.id}")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.PlayArrow,
+                                    contentDescription = "Resume Download",
+                                    tint = SuccessGreen,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+
+                        DownloadStateStage.FAILED -> {
+                            IconButton(
+                                onClick = {
+                                    haptics.confirm()
+                                    onRetry()
+                                },
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .testTag("compact_retry_button_${task.id}")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Retry Download",
+                                    tint = NeonCyan,
+                                    modifier = Modifier.size(19.dp)
+                                )
+                            }
+                        }
+
+                        DownloadStateStage.COMPLETED -> {
+                            IconButton(
+                                onClick = {
+                                    haptics.tap()
+                                    onOpen()
+                                },
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .testTag("compact_open_file_button_${task.id}")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.PlayCircle,
+                                    contentDescription = "Open File",
+                                    tint = SuccessGreen,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+
+                        else -> {}
+                    }
+
+                    if (onToggleExpand != null) {
+                        IconButton(
+                            onClick = { onToggleExpand() },
+                            modifier = Modifier
+                                .size(34.dp)
+                                .testTag("toggle_expand_download_${task.id}")
                         ) {
-                            Text(
-                                text = "${task.platform.displayName} • ${task.qualityLabel}",
-                                fontSize = 11.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            if (task.activeConnections > 1) {
-                                Surface(
-                                    shape = RoundedCornerShape(4.dp),
-                                    color = SuccessGreen.copy(alpha = 0.16f),
-                                    border = BorderStroke(1.dp, SuccessGreen.copy(alpha = 0.5f))
-                                ) {
-                                    Text(
-                                        text = "DDM ${task.activeConnections}x",
-                                        fontSize = 8.sp,
-                                        fontWeight = FontWeight.ExtraBold,
-                                        color = SuccessGreen,
-                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                                    )
-                                }
-                            }
-                            if (task.batchSessionId != null) {
-                                Surface(
-                                    shape = RoundedCornerShape(4.dp),
-                                    color = NeonCyan.copy(alpha = 0.16f),
-                                    border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.5f))
-                                ) {
-                                    Text(
-                                        text = "BATCH",
-                                        fontSize = 8.sp,
-                                        fontWeight = FontWeight.ExtraBold,
-                                        color = NeonCyan,
-                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                                    )
-                                }
-                            }
-                            if (task.isSmartRetrying || task.retryCount > 0) {
-                                val retryColor = if (task.isSmartRetrying) WarningOrange else SuccessGreen
-                                Surface(
-                                    shape = RoundedCornerShape(4.dp),
-                                    color = retryColor.copy(alpha = 0.16f),
-                                    border = BorderStroke(1.dp, retryColor.copy(alpha = 0.55f))
-                                ) {
-                                    Text(
-                                        text = if (task.isSmartRetrying)
-                                            "SMART RETRY ${task.retryCount}/${task.maxRetries}"
-                                        else
-                                            "SMART RETRY #${task.retryCount}",
-                                        fontSize = 8.sp,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontWeight = FontWeight.ExtraBold,
-                                        color = retryColor,
-                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-                                    )
-                                }
-                            }
-                        }
-
-                        // Size & Speed / Verified Details
-                        val targetSaveFolder = com.example.data.downloader.DragonDownloadManager.displayFolderForTask(task)
-                        Text(
-                            text = targetSaveFolder,
-                            fontSize = 9.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        if (!task.retryStatusText.isNullOrBlank()) {
-                            Text(
-                                text = "🛡 ${task.retryStatusText}",
-                                fontSize = 9.5.sp,
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = FontWeight.SemiBold,
-                                color = if (task.isSmartRetrying) WarningOrange else NeonCyan,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        if (task.stage == DownloadStateStage.COMPLETED) {
-                            val verifiedMeta = listOfNotNull(
-                                task.totalSizeFormatted,
-                                task.verifiedResolution,
-                                task.verifiedCodec,
-                                task.verifiedDuration
-                            ).joinToString(" • ")
-                            Text(
-                                text = "Verified: $verifiedMeta",
-                                fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace,
-                                color = SuccessGreen
-                            )
-                        } else {
-                            Text(
-                                text = "${task.downloadedSizeFormatted} / ${task.totalSizeFormatted}  •  ETA: ${task.etaFormatted}",
-                                fontSize = 10.sp,
-                                fontFamily = FontFamily.Monospace,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            Icon(
+                                imageVector = Icons.Default.ExpandMore,
+                                contentDescription = if (showExpandedDetails) "Collapse download details" else "Expand download details",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier
+                                    .size(19.dp)
+                                    .rotate(chevronRotation)
                             )
                         }
                     }
                 }
+            }
 
-            // Progress Bar for Active / Paused Tasks
+            // 2. Slim Inline Progress Strip (always visible for active / paused tasks)
             if (task.stage.isActive || task.stage == DownloadStateStage.PAUSED) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = task.speedFormatted,
-                            fontSize = 10.sp,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold,
-                            color = statusColor
-                        )
-                        Text(
-                            text = if (task.progress >= 0f) "${(task.progress * 100).toInt()}%" else "Streaming...",
-                            fontSize = 10.sp,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     if (task.progress >= 0f) {
                         LinearProgressIndicator(
                             progress = { task.progress.coerceIn(0f, 1f) },
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .height(6.dp)
+                                .weight(1f)
+                                .height(5.dp)
                                 .clip(RoundedCornerShape(3.dp)),
-                            color = statusColor
+                            color = statusColor,
+                            trackColor = MaterialTheme.colorScheme.surfaceVariant
                         )
                     } else {
                         LinearProgressIndicator(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .height(6.dp)
+                                .weight(1f)
+                                .height(5.dp)
                                 .clip(RoundedCornerShape(3.dp)),
-                            color = statusColor
+                            color = statusColor,
+                            trackColor = MaterialTheme.colorScheme.surfaceVariant
                         )
                     }
 
-                    // Live DDM Multi-Segment Chunk Bar
-                    if (task.segmentProgress.size > 1) {
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                    Text(
+                        text = if (task.progress >= 0f) "${(task.progress * 100).toInt()}%" else "...",
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = statusColor,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+
+                    if (task.activeConnections > 1 && task.stage.isActive) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = SuccessGreen.copy(alpha = 0.16f),
+                            border = BorderStroke(0.8.dp, SuccessGreen.copy(alpha = 0.45f))
                         ) {
                             Text(
-                                text = "DDM ${task.segmentProgress.size}-Segment Parallel Stream",
-                                fontSize = 9.sp,
+                                text = "${task.activeConnections}x",
+                                fontSize = 8.5.sp,
                                 fontFamily = FontFamily.Monospace,
-                                fontWeight = FontWeight.Bold,
-                                color = NeonCyan
-                            )
-                            Text(
-                                text = "${task.segmentProgress.count { it >= 0.999f }}/${task.segmentProgress.size} chunks",
-                                fontSize = 9.sp,
-                                fontFamily = FontFamily.Monospace,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                fontWeight = FontWeight.ExtraBold,
+                                color = SuccessGreen,
+                                maxLines = 1,
+                                softWrap = false,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
                             )
                         }
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 2.dp),
-                            horizontalArrangement = Arrangement.spacedBy(2.dp)
-                        ) {
-                            task.segmentProgress.forEach { segFrac ->
-                                val clamped = segFrac.coerceIn(0f, 1f)
-                                Box(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(5.dp)
-                                        .clip(RoundedCornerShape(2.dp))
-                                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                                ) {
+                    }
+                }
+            }
+
+            // 3. Smoothly Expandable Telemetry, Segment Stream & Full Action Controls
+            AnimatedVisibility(
+                visible = showExpandedDetails,
+                enter = expandVertically(animationSpec = spring(stiffness = Spring.StiffnessMediumLow)) + fadeIn(),
+                exit = shrinkVertically(animationSpec = spring(stiffness = Spring.StiffnessMediumLow)) + fadeOut()
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
+                        thickness = 0.8.dp
+                    )
+
+                    if (task.isSmartRetrying && !task.retryStatusText.isNullOrBlank()) {
+                        Text(
+                            text = task.retryStatusText,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = WarningOrange,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    // Live DDM Multi-Segment Chunk Bar (active / paused tasks)
+                    if ((task.stage.isActive || task.stage == DownloadStateStage.PAUSED) && task.segmentProgress.size > 1) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "DDM ${task.segmentProgress.size}-Segment Parallel Stream",
+                                    fontSize = 9.5.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    color = NeonCyan
+                                )
+                                Text(
+                                    text = "${task.segmentProgress.count { it >= 0.999f }}/${task.segmentProgress.size} chunks",
+                                    fontSize = 9.5.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                task.segmentProgress.forEach { segFrac ->
+                                    val clamped = segFrac.coerceIn(0f, 1f)
                                     Box(
                                         modifier = Modifier
-                                            .fillMaxHeight()
-                                            .fillMaxWidth(clamped)
-                                            .background(if (clamped >= 0.999f) SuccessGreen else NeonCyan)
-                                    )
+                                            .weight(1f)
+                                            .height(5.dp)
+                                            .clip(RoundedCornerShape(2.dp))
+                                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxHeight()
+                                                .fillMaxWidth(clamped)
+                                                .background(if (clamped >= 0.999f) SuccessGreen else NeonCyan)
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }
 
-            // Error details if failed
-            if (task.stage == DownloadStateStage.FAILED && !task.errorMessage.isNullOrBlank()) {
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = DangerRed.copy(alpha = 0.12f),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = "${task.errorType?.title ?: "Error"}: ${task.errorMessage}",
-                        fontSize = 10.sp,
-                        color = DangerRed,
-                        modifier = Modifier.padding(8.dp)
-                    )
-                }
-            }
+                    // Error details if failed
+                    if (task.stage == DownloadStateStage.FAILED && !task.errorMessage.isNullOrBlank()) {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = DangerRed.copy(alpha = 0.12f),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "${task.errorType?.title ?: "Error"}: ${task.errorMessage}",
+                                fontSize = 10.sp,
+                                color = DangerRed,
+                                modifier = Modifier.padding(8.dp)
+                            )
+                        }
+                    }
 
-            // Action Buttons Row
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                when (task.stage) {
-                    DownloadStateStage.DOWNLOADING_VIDEO,
-                    DownloadStateStage.DOWNLOADING_AUDIO,
-                    DownloadStateStage.DOWNLOADING_FILE -> {
-                        if (task.supportsPauseResume) {
-                            OutlinedButton(
-                                onClick = {
-                                    haptics.tap()
-                                    onPause()
-                                },
-                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                                modifier = Modifier.height(34.dp)
-                            ) {
-                                Icon(Icons.Default.Pause, contentDescription = "Pause", modifier = Modifier.size(15.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Pause", fontSize = 11.sp)
+                    // Full Action Buttons Row
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        when (task.stage) {
+                            DownloadStateStage.DOWNLOADING_VIDEO,
+                            DownloadStateStage.DOWNLOADING_AUDIO,
+                            DownloadStateStage.DOWNLOADING_FILE -> {
+                                if (task.supportsPauseResume) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            haptics.tap()
+                                            onPause()
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                        modifier = Modifier
+                                            .height(34.dp)
+                                            .testTag("pause_download_button_${task.id}")
+                                    ) {
+                                        Icon(Icons.Default.Pause, contentDescription = "Pause", modifier = Modifier.size(15.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Pause", fontSize = 11.sp)
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                }
                             }
-                            Spacer(modifier = Modifier.width(8.dp))
-                        }
-                    }
-                    DownloadStateStage.PAUSED -> {
-                        FilledTonalButton(
-                            onClick = {
-                                haptics.confirm()
-                                onResume()
-                            },
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                            modifier = Modifier.height(34.dp)
-                        ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = "Resume", modifier = Modifier.size(15.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Resume", fontSize = 11.sp)
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                    }
-                    DownloadStateStage.FAILED -> {
-                        FilledTonalButton(
-                            onClick = {
-                                haptics.confirm()
-                                onRetry()
-                            },
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                            modifier = Modifier.height(34.dp)
-                        ) {
-                            Icon(Icons.Default.Refresh, contentDescription = "Smart Retry", modifier = Modifier.size(15.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Smart Retry", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                    }
-                    DownloadStateStage.COMPLETED -> {
-                        FilledTonalButton(
-                            onClick = {
-                                haptics.tap()
-                                onOpen()
-                            },
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                            modifier = Modifier
-                                .height(34.dp)
-                                .testTag("open_file_button_${task.id}")
-                        ) {
-                            Icon(Icons.Default.PlayCircle, contentDescription = "Open File", modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Open File", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                        OutlinedButton(
-                            onClick = {
-                                haptics.tap()
-                                onShare()
-                            },
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                            modifier = Modifier
-                                .height(34.dp)
-                                .testTag("share_file_button_${task.id}")
-                        ) {
-                            Icon(Icons.Default.Share, contentDescription = "Share File", modifier = Modifier.size(15.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Share", fontSize = 11.sp)
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                    }
-                    else -> {}
-                }
 
-                IconButton(
-                    onClick = {
-                        haptics.warning()
-                        onCancel()
-                    },
-                    modifier = Modifier.size(34.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Close,
-                        contentDescription = "Cancel or Remove",
-                        tint = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.size(18.dp)
-                    )
+                            DownloadStateStage.PAUSED -> {
+                                FilledTonalButton(
+                                    onClick = {
+                                        haptics.confirm()
+                                        onResume()
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                    modifier = Modifier
+                                        .height(34.dp)
+                                        .testTag("resume_download_button_${task.id}")
+                                ) {
+                                    Icon(Icons.Default.PlayArrow, contentDescription = "Resume", modifier = Modifier.size(15.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Resume", fontSize = 11.sp)
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                            }
+
+                            DownloadStateStage.FAILED -> {
+                                FilledTonalButton(
+                                    onClick = {
+                                        haptics.confirm()
+                                        onRetry()
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                    modifier = Modifier
+                                        .height(34.dp)
+                                        .testTag("retry_download_button_${task.id}")
+                                ) {
+                                    Icon(Icons.Default.Refresh, contentDescription = "Smart Retry", modifier = Modifier.size(15.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Smart Retry", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                            }
+
+                            DownloadStateStage.COMPLETED -> {
+                                FilledTonalButton(
+                                    onClick = {
+                                        haptics.tap()
+                                        onOpen()
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                    modifier = Modifier
+                                        .height(34.dp)
+                                        .testTag("open_file_button_${task.id}")
+                                ) {
+                                    Icon(Icons.Default.PlayCircle, contentDescription = "Open File", modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Open File", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                OutlinedButton(
+                                    onClick = {
+                                        haptics.tap()
+                                        onShare()
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                    modifier = Modifier
+                                        .height(34.dp)
+                                        .testTag("share_file_button_${task.id}")
+                                ) {
+                                    Icon(Icons.Default.Share, contentDescription = "Share File", modifier = Modifier.size(15.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Share", fontSize = 11.sp)
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                            }
+
+                            else -> {}
+                        }
+
+                        IconButton(
+                            onClick = {
+                                haptics.warning()
+                                onCancel()
+                            },
+                            modifier = Modifier
+                                .size(34.dp)
+                                .testTag("cancel_download_button_${task.id}")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Cancel or Remove",
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
                 }
             }
-        }
         }
     }
 }
@@ -2822,6 +3027,7 @@ private fun PrivateAccessSessionDialog(
                     Triple("X (Twitter)", "https://x.com/i/flow/login", MediaPlatform.TWITTER),
                     Triple("Reddit", "https://www.reddit.com/login/", MediaPlatform.REDDIT),
                     Triple("Patreon", "https://www.patreon.com/login", MediaPlatform.PATREON),
+                    Triple("Telegram Web", "https://web.telegram.org/", MediaPlatform.TELEGRAM),
                     Triple("Bilibili.tv", "https://www.bilibili.tv/", MediaPlatform.BILIBILI),
                     Triple("Pawchive", "https://pawchive.pw/", MediaPlatform.PAWCHIVE)
                 )
@@ -3037,6 +3243,7 @@ private fun platformIcon(platform: MediaPlatform): ImageVector {
         MediaPlatform.PINTEREST -> Icons.Default.PushPin
         MediaPlatform.VIMEO -> Icons.Default.Hd
         MediaPlatform.PATREON -> Icons.Default.WorkspacePremium
+        MediaPlatform.TELEGRAM -> Icons.Default.Send
         MediaPlatform.BILIBILI -> Icons.Default.LiveTv
         MediaPlatform.PAWCHIVE -> Icons.Default.VideoLibrary
         MediaPlatform.DIRECT -> Icons.Default.FileDownload
@@ -3116,11 +3323,13 @@ fun ActiveBatchSessionCard(
                     }
                     Column {
                         Text(
-                            text = "BATCH DOWNLOAD SESSION",
-                            fontSize = 11.sp,
+                            text = session.playlistTitle?.takeIf { it.isNotBlank() } ?: "BATCH DOWNLOAD SESSION",
+                            fontSize = 11.5.sp,
                             fontWeight = FontWeight.Black,
-                            fontFamily = FontFamily.Monospace,
-                            letterSpacing = 0.8.sp,
+                            fontFamily = if (session.playlistTitle.isNullOrBlank()) FontFamily.Monospace else FontFamily.Default,
+                            letterSpacing = if (session.playlistTitle.isNullOrBlank()) 0.8.sp else 0.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
@@ -3799,3 +4008,31 @@ https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlaze
         }
     }
 }
+
+private fun buildTelegramWebUrl(rawUrl: String): String {
+    val trimmed = rawUrl.trim()
+    if (trimmed.contains("web.telegram.org", ignoreCase = true)) {
+        return if (trimmed.startsWith("http", ignoreCase = true)) trimmed else "https://$trimmed"
+    }
+    val privateMatch = Regex(
+        """(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)""",
+        RegexOption.IGNORE_CASE
+    ).find(trimmed)
+    if (privateMatch != null) {
+        val chatId = privateMatch.groupValues[1]
+        return "https://web.telegram.org/k/#-$chatId"
+    }
+    val publicMatch = Regex(
+        """(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,})""",
+        RegexOption.IGNORE_CASE
+    ).find(trimmed)
+    if (publicMatch != null) {
+        val channel = publicMatch.groupValues[1]
+        val reserved = setOf("s", "c", "iv", "share", "joinchat", "addstickers", "proxy", "socks", "bg", "addtheme", "setlanguage")
+        if (channel.lowercase(Locale.US) !in reserved) {
+            return "https://web.telegram.org/k/#@$channel"
+        }
+    }
+    return "https://web.telegram.org/k/"
+}
+

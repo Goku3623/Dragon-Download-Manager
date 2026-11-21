@@ -28,13 +28,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bolt
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.DownloadForOffline
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -372,69 +370,6 @@ fun StartDownloadPopupDialog(
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
-                        }
-                    }
-                }
-
-                // Storage Permission Status Card
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = if (hasPermission) SuccessGreen.copy(alpha = 0.10f) else WarningOrange.copy(alpha = 0.12f),
-                    border = BorderStroke(
-                        1.dp,
-                        if (hasPermission) SuccessGreen.copy(alpha = 0.45f) else WarningOrange.copy(alpha = 0.55f)
-                    ),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(
-                                imageVector = if (hasPermission) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
-                                contentDescription = "Storage Permission",
-                                tint = if (hasPermission) SuccessGreen else WarningOrange,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Column {
-                                Text(
-                                    text = if (hasPermission) "Storage Permission Granted" else "Storage Permission Needed",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                                Text(
-                                    text = if (hasPermission) "Ready to write to $targetDisplayPath" else "Grant storage access to save files in $targetDisplayPath",
-                                    fontSize = 9.5.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-
-                        if (!hasPermission && requiredPerms.isNotEmpty()) {
-                            TextButton(
-                                onClick = {
-                                    haptics.tap()
-                                    if (didAskOnce) {
-                                        openAppStoragePermissionSettings(context)
-                                    } else {
-                                        permissionLauncher.launch(requiredPerms)
-                                    }
-                                }
-                            ) {
-                                Text(
-                                    text = if (didAskOnce) "Settings" else "Allow",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    color = WarningOrange
-                                )
-                            }
                         }
                     }
                 }

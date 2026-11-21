@@ -467,6 +467,39 @@ class DragonDownloadManager(
         }
     }
 
+    fun fetchYouTubePlaylistInfo(
+        url: String,
+        onProgress: (String) -> Unit,
+        onResult: (YouTubePlaylistInfo?, DownloaderErrorType?, String?) -> Unit
+    ) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                withContext(Dispatchers.Main) { onProgress("Loading YouTube playlist...") }
+                val playlist = extractionEngine.extractYouTubePlaylist(url) { count ->
+                    scope.launch(Dispatchers.Main) {
+                        onProgress("Loading playlist ($count videos found)...")
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    onResult(playlist, null, null)
+                }
+            } catch (e: ExtractorException) {
+                withContext(Dispatchers.Main) {
+                    onResult(null, e.errorType, e.message)
+                }
+            } catch (e: Exception) {
+                val errType = if (e is java.net.UnknownHostException || e is java.net.SocketTimeoutException) {
+                    DownloaderErrorType.NETWORK_FAILURE
+                } else {
+                    DownloaderErrorType.UNSUPPORTED_MEDIA
+                }
+                withContext(Dispatchers.Main) {
+                    onResult(null, errType, e.message ?: "Failed to fetch YouTube playlist.")
+                }
+            }
+        }
+    }
+
     companion object {
         const val DRAGON_TOOL_ROOT_FOLDER = "DDM"
         const val DRAGON_TOOL_DISPLAY_PATH = "Download/DDM"
@@ -2923,6 +2956,43 @@ class DragonDownloadManager(
     // BATCH DOWNLOAD ENGINE IMPLEMENTATION
     // =========================================================================
 
+    fun startPlaylistBatchDownload(
+        playlist: YouTubePlaylistInfo,
+        selectedItems: List<YouTubePlaylistItem>,
+        config: BatchDownloadConfig
+    ): String {
+        val itemsToDownload = selectedItems.ifEmpty { playlist.items }
+        if (itemsToDownload.isEmpty()) {
+            onFeedback("No playlist videos selected to download.")
+            return ""
+        }
+        val sessionId = "batch_" + UUID.randomUUID().toString().take(8)
+        val initialItems = itemsToDownload.mapIndexed { idx, item ->
+            BatchDownloadItemStatus(
+                index = idx,
+                url = item.watchUrl,
+                platform = MediaPlatform.YOUTUBE,
+                title = item.title,
+                thumbnailUrl = item.thumbnailUrl,
+                state = BatchItemState.QUEUED
+            )
+        }
+        val session = BatchSession(
+            id = sessionId,
+            totalCount = initialItems.size,
+            queuedCount = initialItems.size,
+            config = config,
+            items = initialItems,
+            isRunning = true,
+            playlistTitle = playlist.title
+        )
+        _activeBatchSessionFlow.value = session
+        syncBackgroundDownloadService()
+        onFeedback("Playlist download started: ${initialItems.size} videos from \"${playlist.title}\"")
+        launchBatchExecution(sessionId, initialItems, config)
+        return sessionId
+    }
+
     fun startBatchDownload(urls: List<String>, config: BatchDownloadConfig): String {
         val validUrls = urls.map { it.trim() }.filter {
             it.startsWith("http://", ignoreCase = true) ||
@@ -2933,7 +3003,108 @@ class DragonDownloadManager(
             onFeedback("No valid HTTP/HTTPS or Magnet URLs found for batch download.")
             return ""
         }
+
+        val hasPlaylistUrls = validUrls.any { isDirectYouTubePlaylistUrl(it) }
         val sessionId = "batch_" + UUID.randomUUID().toString().take(8)
+
+        if (hasPlaylistUrls) {
+            // Expand YouTube playlist URLs asynchronously into individual video URLs before running batch workers
+            activeBatchJob?.cancel()
+            val placeholderSession = BatchSession(
+                id = sessionId,
+                totalCount = validUrls.size,
+                queuedCount = validUrls.size,
+                config = config,
+                items = validUrls.mapIndexed { idx, u ->
+                    BatchDownloadItemStatus(
+                        index = idx,
+                        url = u,
+                        platform = MediaPlatform.detectFromUrl(u),
+                        title = if (isDirectYouTubePlaylistUrl(u)) "Expanding YouTube Playlist..." else "Item #${idx + 1}",
+                        state = if (isDirectYouTubePlaylistUrl(u)) BatchItemState.FETCHING else BatchItemState.QUEUED
+                    )
+                },
+                isRunning = true,
+                playlistTitle = "Expanding YouTube Playlist..."
+            )
+            _activeBatchSessionFlow.value = placeholderSession
+            syncBackgroundDownloadService()
+            onFeedback("Expanding YouTube playlist link(s) for batch download...")
+
+            activeBatchJob = scope.launch(Dispatchers.IO) {
+                val expandedItems = mutableListOf<BatchDownloadItemStatus>()
+                var resolvedPlaylistTitle: String? = null
+                val seenUrls = HashSet<String>()
+
+                for (rawUrl in validUrls) {
+                    if (isDirectYouTubePlaylistUrl(rawUrl)) {
+                        try {
+                            val pl = extractionEngine.extractYouTubePlaylist(rawUrl)
+                            if (resolvedPlaylistTitle == null) resolvedPlaylistTitle = pl.title
+                            pl.items.forEach { plItem ->
+                                if (seenUrls.add(plItem.watchUrl)) {
+                                    expandedItems.add(
+                                        BatchDownloadItemStatus(
+                                            index = expandedItems.size,
+                                            url = plItem.watchUrl,
+                                            platform = MediaPlatform.YOUTUBE,
+                                            title = plItem.title,
+                                            thumbnailUrl = plItem.thumbnailUrl,
+                                            state = BatchItemState.QUEUED
+                                        )
+                                    )
+                                }
+                            }
+                        } catch (e: Exception) {
+                            expandedItems.add(
+                                BatchDownloadItemStatus(
+                                    index = expandedItems.size,
+                                    url = rawUrl,
+                                    platform = MediaPlatform.YOUTUBE,
+                                    title = "Playlist Expansion Failed",
+                                    state = BatchItemState.FAILED,
+                                    errorMessage = e.message ?: "Failed to load playlist"
+                                )
+                            )
+                        }
+                    } else if (seenUrls.add(rawUrl)) {
+                        expandedItems.add(
+                            BatchDownloadItemStatus(
+                                index = expandedItems.size,
+                                url = rawUrl,
+                                platform = MediaPlatform.detectFromUrl(rawUrl),
+                                title = "Item #${expandedItems.size + 1}",
+                                state = BatchItemState.QUEUED
+                            )
+                        )
+                    }
+                }
+
+                val failedInitially = expandedItems.count { it.state == BatchItemState.FAILED }
+                val runnableItems = expandedItems.filter { it.state != BatchItemState.FAILED }
+                val readySession = BatchSession(
+                    id = sessionId,
+                    totalCount = expandedItems.size,
+                    failedCount = failedInitially,
+                    queuedCount = runnableItems.size,
+                    config = config,
+                    items = expandedItems,
+                    isRunning = runnableItems.isNotEmpty(),
+                    isFinished = runnableItems.isEmpty(),
+                    playlistTitle = resolvedPlaylistTitle
+                )
+                _activeBatchSessionFlow.value = readySession
+                syncBackgroundDownloadService()
+                if (runnableItems.isNotEmpty()) {
+                    onFeedback("Batch download started: ${runnableItems.size} items queued (${config.downloadMode.displayName})")
+                    launchBatchExecution(sessionId, runnableItems, config)
+                } else {
+                    onFeedback("Could not load any playable videos from the playlist link.")
+                }
+            }
+            return sessionId
+        }
+
         val initialItems = validUrls.mapIndexed { idx, u ->
             BatchDownloadItemStatus(
                 index = idx,
@@ -2948,7 +3119,8 @@ class DragonDownloadManager(
             totalCount = validUrls.size,
             queuedCount = validUrls.size,
             config = config,
-            items = initialItems
+            items = initialItems,
+            isRunning = true
         )
         _activeBatchSessionFlow.value = session
         syncBackgroundDownloadService()
@@ -3088,9 +3260,16 @@ class DragonDownloadManager(
         return if (config.downloadMode.isAudioOnly) {
             val audioList = info.audioFormats
             if (audioList.isNotEmpty()) {
-                audioList.minByOrNull {
+                val containerPreferred = when (config.downloadMode) {
+                    BatchDownloadMode.AUDIO_MP3 -> audioList.filter { it.container.equals("mp3", ignoreCase = true) }
+                    BatchDownloadMode.AUDIO_M4A -> audioList.filter {
+                        it.container.equals("m4a", ignoreCase = true) || it.container.equals("aac", ignoreCase = true)
+                    }
+                    else -> emptyList()
+                }.ifEmpty { audioList }
+                containerPreferred.minByOrNull {
                     kotlin.math.abs(it.bitrateKbps - config.preferredAudioBitrateKbps)
-                } ?: audioList.first()
+                } ?: containerPreferred.first()
             } else {
                 val vid = info.videoFormats.firstOrNull() ?: info.allFormats.firstOrNull()
                 vid?.copy(
@@ -3101,7 +3280,14 @@ class DragonDownloadManager(
         } else {
             val videoList = info.videoFormats
             if (videoList.isNotEmpty()) {
-                val exactOrLower = videoList.filter { it.resolutionHeight <= config.preferredResolutionHeight }
+                val targetHeight = when (config.downloadMode) {
+                    BatchDownloadMode.VIDEO_1080P -> 1080
+                    BatchDownloadMode.VIDEO_720P -> 720
+                    BatchDownloadMode.VIDEO_480P -> 480
+                    BatchDownloadMode.BEST_VIDEO, BatchDownloadMode.ORIGINAL_BEST -> Int.MAX_VALUE
+                    else -> config.preferredResolutionHeight
+                }
+                val exactOrLower = videoList.filter { it.resolutionHeight <= targetHeight }
                 if (exactOrLower.isNotEmpty()) {
                     exactOrLower.maxByOrNull { it.resolutionHeight } ?: exactOrLower.first()
                 } else {

@@ -22,9 +22,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.NotificationsActive
-import androidx.compose.material.icons.filled.NotificationsPaused
-import androidx.compose.material.icons.filled.Public
+import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -34,23 +32,25 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.example.data.repository.KernelRepository
+import com.example.ui.components.ThemePickerSheet
 import com.example.ui.haptics.LocalDragonHaptics
 import com.example.ui.screens.BrowserScreen
 import com.example.ui.screens.DownloaderScreen
 import com.example.ui.theme.DragonKernelTheme
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.SuccessGreen
-import com.example.ui.theme.WarningOrange
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -94,6 +94,14 @@ class MainActivity : ComponentActivity() {
             val themeConfig by repository.themeConfigFlow.collectAsState()
             val downloaderNavTrigger by openDownloaderSignal.collectAsState()
             val browserNavTrigger by openBrowserSignal.collectAsState()
+
+            val isLightTheme = themeConfig.soothingTheme.isLight
+            val view = LocalView.current
+            SideEffect {
+                val controller = WindowCompat.getInsetsController(window, view)
+                controller.isAppearanceLightStatusBars = isLightTheme
+                controller.isAppearanceLightNavigationBars = isLightTheme
+            }
 
             DragonKernelTheme(
                 accentIndex = accentIndex,
@@ -263,6 +271,7 @@ fun DragonDownloadManagerMainScreen(
     val themeConfig by repository.themeConfigFlow.collectAsState()
     val haptics = LocalDragonHaptics.current
     val snackbarHostState = remember { SnackbarHostState() }
+    var showThemePickerSheet by remember { mutableStateOf(false) }
 
     LaunchedEffect(feedbackMessage) {
         feedbackMessage?.let { msg ->
@@ -282,14 +291,9 @@ fun DragonDownloadManagerMainScreen(
             topBar = {
                 DragonDownloaderTopBar(
                     repository = repository,
-                    isMaterial3Bar = themeConfig.surfaceMode == com.example.data.model.SurfaceThemeMode.MATERIAL_3,
-                    onToggleNotifPanel = {
-                        haptics.confirm()
-                        repository.downloadManager.showNotificationPanel()
-                    },
-                    onBrowserClick = {
+                    onOpenThemeStudio = {
                         haptics.tap()
-                        isBrowserOpen = true
+                        showThemePickerSheet = true
                     }
                 )
             }
@@ -301,7 +305,12 @@ fun DragonDownloadManagerMainScreen(
             ) {
                 DownloaderScreen(
                     repository = repository,
-                    onOpenBrowser = { isBrowserOpen = true }
+                    onOpenBrowser = { isBrowserOpen = true },
+                    onOpenBrowserWithUrl = { targetUrl ->
+                        com.example.data.browser.BrowserPipController.isExplicitBrowserClose = false
+                        repository.browserRepository.openNewTab(initialUrl = targetUrl)
+                        isBrowserOpen = true
+                    }
                 )
             }
         }
@@ -319,30 +328,42 @@ fun DragonDownloadManagerMainScreen(
                 }
             )
         }
+
+        if (showThemePickerSheet) {
+            ThemePickerSheet(
+                themeConfig = themeConfig,
+                onSelectTheme = { selected ->
+                    repository.setSoothingAppTheme(selected)
+                },
+                onToggleDynamicWallpaper = { enabled ->
+                    repository.toggleDynamicColor(enabled)
+                },
+                onSelectCornerRadius = { radius ->
+                    repository.setCornerRadiusDp(radius)
+                },
+                onDismiss = { showThemePickerSheet = false }
+            )
+        }
     }
 }
 
 @Composable
 private fun DragonDownloaderTopBar(
     repository: KernelRepository,
-    isMaterial3Bar: Boolean,
-    onToggleNotifPanel: () -> Unit,
-    onBrowserClick: () -> Unit
+    onOpenThemeStudio: () -> Unit
 ) {
     val downloadManager = remember { repository.downloadManager }
     val tasks by downloadManager.tasksFlow.collectAsState()
-    val isNotifVisible by downloadManager.notificationController.isPanelVisibleFlow.collectAsState()
+    val themeConfig by repository.themeConfigFlow.collectAsState()
+    val isFlatMinimal = themeConfig.soothingTheme.isFlatMinimal
     val activeCount = tasks.count { it.stage.isActive || it.isSmartRetrying }
-    val totalActiveSpeedBps = tasks.filter { it.stage.isActive && !it.isSmartRetrying }.sumOf { it.speedBytesPerSec }
     val primaryColor = MaterialTheme.colorScheme.primary
+    val pillRadius = if (isFlatMinimal) 8.dp else 14.dp
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(
-                if (isMaterial3Bar) MaterialTheme.colorScheme.surfaceContainer
-                else MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
-            )
+            .background(if (isFlatMinimal) MaterialTheme.colorScheme.background else MaterialTheme.colorScheme.surfaceContainer)
             .windowInsetsPadding(WindowInsets.statusBars)
     ) {
         Row(
@@ -352,7 +373,10 @@ private fun DragonDownloaderTopBar(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
                 val context = LocalContext.current
                 AsyncImage(
                     model = remember(context) {
@@ -366,123 +390,97 @@ private fun DragonDownloaderTopBar(
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .size(28.dp)
-                        .clip(CircleShape)
-                        .border(1.dp, primaryColor.copy(alpha = 0.6f), CircleShape)
+                        .clip(if (isFlatMinimal) RoundedCornerShape(7.dp) else CircleShape)
+                        .border(
+                            width = 1.dp,
+                            color = if (isFlatMinimal) MaterialTheme.colorScheme.outlineVariant else primaryColor.copy(alpha = 0.55f),
+                            shape = if (isFlatMinimal) RoundedCornerShape(7.dp) else CircleShape
+                        )
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Box(
                     modifier = Modifier
-                        .size(8.dp)
+                        .size(7.dp)
                         .clip(CircleShape)
-                        .background(if (activeCount > 0) NeonCyan else SuccessGreen)
+                        .background(
+                            if (activeCount > 0) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.secondary
+                        )
                 )
                 Spacer(modifier = Modifier.width(7.dp))
                 Text(
                     text = "DRAGON DOWNLOAD MANAGER",
                     fontSize = 13.sp,
-                    fontWeight = if (isMaterial3Bar) FontWeight.Bold else FontWeight.Black,
-                    letterSpacing = if (isMaterial3Bar) 0.4.sp else 1.sp,
-                    color = if (isMaterial3Bar) MaterialTheme.colorScheme.onSurface else primaryColor
+                    fontWeight = if (isFlatMinimal) FontWeight.SemiBold else FontWeight.Bold,
+                    letterSpacing = 0.4.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = MaterialTheme.colorScheme.onSurface
                 )
             }
 
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                // Download Notification Panel Status / Pin Pill
-                val notifColor = if (isNotifVisible) SuccessGreen else WarningOrange
-                val pillLabel = when {
-                    activeCount > 0 && totalActiveSpeedBps > 0L ->
-                        "$activeCount DL • ${com.example.data.model.formatBytes(totalActiveSpeedBps)}/s"
-                    activeCount > 0 -> "$activeCount DL"
-                    else -> "NOTIF"
-                }
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(if (isMaterial3Bar) 12.dp else 8.dp))
-                        .background(notifColor.copy(alpha = 0.14f))
-                        .border(
-                            width = 1.dp,
-                            color = notifColor.copy(alpha = 0.45f),
-                            shape = RoundedCornerShape(if (isMaterial3Bar) 12.dp else 8.dp)
-                        )
-                        .clickable(onClick = onToggleNotifPanel)
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                        .testTag("hud_notif_panel_button")
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        Icon(
-                            imageVector = if (isNotifVisible) Icons.Default.NotificationsActive else Icons.Default.NotificationsPaused,
-                            contentDescription = "Download Notification Panel",
-                            tint = notifColor,
-                            modifier = Modifier.size(12.dp)
-                        )
-                        Text(
-                            text = pillLabel,
-                            fontSize = 10.sp,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = notifColor
-                        )
-                    }
-                }
+            Spacer(modifier = Modifier.width(8.dp))
 
-                // Built-in Browser & Media Grabber Pill
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(if (isMaterial3Bar) 12.dp else 8.dp))
-                        .background(
-                            if (isMaterial3Bar) MaterialTheme.colorScheme.primaryContainer
-                            else NeonCyan.copy(alpha = 0.14f)
-                        )
-                        .border(
-                            width = if (isMaterial3Bar) 0.8.dp else 1.dp,
-                            color = if (isMaterial3Bar) MaterialTheme.colorScheme.outlineVariant else NeonCyan.copy(alpha = 0.45f),
-                            shape = RoundedCornerShape(if (isMaterial3Bar) 12.dp else 8.dp)
-                        )
-                        .clickable(onClick = onBrowserClick)
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                        .testTag("hud_browser_button")
+            // Theme Studio Section Trigger Pill
+            Surface(
+                shape = RoundedCornerShape(pillRadius),
+                color = if (isFlatMinimal) MaterialTheme.colorScheme.surfaceContainerHigh
+                else MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.78f),
+                border = androidx.compose.foundation.BorderStroke(
+                    width = if (isFlatMinimal) 1.dp else 0.9.dp,
+                    color = if (isFlatMinimal) MaterialTheme.colorScheme.outlineVariant
+                    else primaryColor.copy(alpha = 0.35f)
+                ),
+                modifier = Modifier
+                    .clip(RoundedCornerShape(pillRadius))
+                    .clickable(onClick = onOpenThemeStudio)
+                    .testTag("hud_theme_button")
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Public,
-                            contentDescription = "Open Dragon Browser",
-                            tint = if (isMaterial3Bar) MaterialTheme.colorScheme.onPrimaryContainer else NeonCyan,
-                            modifier = Modifier.size(12.dp)
-                        )
-                        Text(
-                            text = "WEB",
-                            fontSize = 10.sp,
-                            fontFamily = if (isMaterial3Bar) FontFamily.SansSerif else FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold,
-                            color = if (isMaterial3Bar) MaterialTheme.colorScheme.onPrimaryContainer else NeonCyan
-                        )
-                    }
+                    Icon(
+                        imageVector = Icons.Default.Palette,
+                        contentDescription = "Customize UI Theme",
+                        tint = if (isFlatMinimal) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Text(
+                        text = "Theme",
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (isFlatMinimal) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onPrimaryContainer,
+                        maxLines = 1,
+                        softWrap = false
+                    )
                 }
             }
         }
 
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(1.dp)
-                .background(
-                    Brush.horizontalGradient(
-                        listOf(
-                            primaryColor.copy(alpha = 0.45f),
-                            MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
-                            Color.Transparent
+        if (isFlatMinimal) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.75f))
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(
+                        Brush.horizontalGradient(
+                            listOf(
+                                primaryColor.copy(alpha = 0.35f),
+                                MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
+                                Color.Transparent
+                            )
                         )
                     )
-                )
-        )
+            )
+        }
     }
 }

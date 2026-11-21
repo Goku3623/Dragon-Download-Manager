@@ -1007,7 +1007,184 @@ enum class HapticIntensity(
     CRISP("Crisp", "Punchy gaming-grade physical detents")
 }
 
+enum class SoothingAppTheme(
+    val title: String,
+    val badge: String,
+    val description: String,
+    val isLight: Boolean = false,
+    val isFlatMinimal: Boolean = false,
+    val supportsDynamicColor: Boolean = false,
+    val defaultCornerRadiusDp: Int = 20,
+    val previewBgHex: Long,
+    val previewSurfaceHex: Long,
+    val previewPrimaryHex: Long,
+    val previewSecondaryHex: Long
+) {
+    EXPRESSIVE_MATERIAL_YOU(
+        title = "Expressive Material You",
+        badge = "MATERIAL YOU",
+        description = "Soft expressive tonal surfaces with gentle wallpaper-adaptive color harmony",
+        isLight = false,
+        supportsDynamicColor = true,
+        defaultCornerRadiusDp = 24,
+        previewBgHex = 0xFF16171D,
+        previewSurfaceHex = 0xFF21232C,
+        previewPrimaryHex = 0xFFB4A7E8,
+        previewSecondaryHex = 0xFF8DC9B0
+    ),
+    MATERIAL_3_CALM(
+        title = "Material 3 Calm",
+        badge = "MATERIAL 3",
+        description = "Balanced low-glare M3 slate tones with muted periwinkle & sage accents",
+        isLight = false,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 20,
+        previewBgHex = 0xFF14171D,
+        previewSurfaceHex = 0xFF1E222B,
+        previewPrimaryHex = 0xFF9BBDF9,
+        previewSecondaryHex = 0xFF8CD3AC
+    ),
+    NORDIC_MIST(
+        title = "Nordic Mist",
+        badge = "LOW GLARE",
+        description = "Restful arctic fog slate with muted frost-blue highlights for long sessions",
+        isLight = false,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 18,
+        previewBgHex = 0xFF1E242E,
+        previewSurfaceHex = 0xFF272E3B,
+        previewPrimaryHex = 0xFF88B3C8,
+        previewSecondaryHex = 0xFF8FBCBB
+    ),
+    SAGE_FOREST(
+        title = "Sage Forest",
+        badge = "BOTANICAL",
+        description = "Calm deep eucalyptus tones with soft moss-green accents for relaxed reading",
+        isLight = false,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 20,
+        previewBgHex = 0xFF151B18,
+        previewSurfaceHex = 0xFF1E2622,
+        previewPrimaryHex = 0xFF8FC4A3,
+        previewSecondaryHex = 0xFFA9C6B8
+    ),
+    WARM_SEPIA_DUSK(
+        title = "Warm Sepia Dusk",
+        badge = "NIGHT READ",
+        description = "Cozy low-blue-light espresso & soft sand tones built for zero eye strain",
+        isLight = false,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 20,
+        previewBgHex = 0xFF1B1815,
+        previewSurfaceHex = 0xFF25211D,
+        previewPrimaryHex = 0xFFD9B08C,
+        previewSecondaryHex = 0xFFB5BFA1
+    ),
+    ROSE_LAVENDER_DUSK(
+        title = "Rose & Lavender",
+        badge = "SOFT PASTEL",
+        description = "Muted dusty-rose and soft wisteria on gentle plum-charcoal surfaces",
+        isLight = false,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 22,
+        previewBgHex = 0xFF1A171E,
+        previewSurfaceHex = 0xFF24202A,
+        previewPrimaryHex = 0xFFD6A4B8,
+        previewSecondaryHex = 0xFFB8A9D9
+    ),
+    WARM_ALABASTER_LIGHT(
+        title = "Warm Alabaster",
+        badge = "SOFT LIGHT",
+        description = "Warm paper-tinted daylight UI with zero blinding white glare",
+        isLight = true,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 20,
+        previewBgHex = 0xFFF3F0E8,
+        previewSurfaceHex = 0xFFFAF8F3,
+        previewPrimaryHex = 0xFF4A6B8A,
+        previewSecondaryHex = 0xFF4E7A65
+    ),
+    MATCHA_MIST_LIGHT(
+        title = "Matcha Paper",
+        badge = "SOFT LIGHT",
+        description = "Gentle sage-cream daylight palette with soft botanical contrast",
+        isLight = true,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 22,
+        previewBgHex = 0xFFEFF3ED,
+        previewSurfaceHex = 0xFFF7FAF5,
+        previewPrimaryHex = 0xFF46735C,
+        previewSecondaryHex = 0xFF5B7A8C
+    ),
+    MINIMAL_FLAT_GRAPHITE(
+        title = "Minimal Graphite",
+        badge = "FLAT DARK",
+        description = "Clean matte charcoal flat surfaces with crisp edges and muted steel accent",
+        isLight = false,
+        isFlatMinimal = true,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 10,
+        previewBgHex = 0xFF1A1B1E,
+        previewSurfaceHex = 0xFF222428,
+        previewPrimaryHex = 0xFF8FA8C8,
+        previewSecondaryHex = 0xFF93A89E
+    ),
+    MINIMAL_FLAT_MONO_INK(
+        title = "Mono Ink",
+        badge = "MONOCHROME",
+        description = "Distraction-free flat monochrome graphite with soft silver-ash tones",
+        isLight = false,
+        isFlatMinimal = true,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 8,
+        previewBgHex = 0xFF18181A,
+        previewSurfaceHex = 0xFF212124,
+        previewPrimaryHex = 0xFFC4C7CE,
+        previewSecondaryHex = 0xFF9A9EA8
+    ),
+    MINIMAL_FLAT_SLATE_BLUE(
+        title = "Flat Air Slate",
+        badge = "MINIMAL",
+        description = "Simple flat desaturated slate-blue cards with zero visual noise or gradients",
+        isLight = false,
+        isFlatMinimal = true,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 10,
+        previewBgHex = 0xFF1B1F24,
+        previewSurfaceHex = 0xFF23282F,
+        previewPrimaryHex = 0xFF8BAFC4,
+        previewSecondaryHex = 0xFF8FB5AE
+    ),
+    MINIMAL_FLAT_STONE(
+        title = "Minimal Stone",
+        badge = "FLAT LIGHT",
+        description = "Matte limestone daylight flat UI with crisp hairline borders and calm ink text",
+        isLight = true,
+        isFlatMinimal = true,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 10,
+        previewBgHex = 0xFFEEECE8,
+        previewSurfaceHex = 0xFFF6F5F2,
+        previewPrimaryHex = 0xFF4C5B6B,
+        previewSecondaryHex = 0xFF5D7066
+    ),
+    MINIMAL_FLAT_LINEN(
+        title = "Flat Linen",
+        badge = "SWISS FLAT",
+        description = "Swiss-inspired flat oat-paper surfaces with understated warm clay accents",
+        isLight = true,
+        isFlatMinimal = true,
+        supportsDynamicColor = false,
+        defaultCornerRadiusDp = 8,
+        previewBgHex = 0xFFF2EFEA,
+        previewSurfaceHex = 0xFFF8F6F2,
+        previewPrimaryHex = 0xFF8E6354,
+        previewSecondaryHex = 0xFF5E746C
+    )
+}
+
 data class ThemeCustomizationConfig(
+    val soothingTheme: SoothingAppTheme = SoothingAppTheme.EXPRESSIVE_MATERIAL_YOU,
     val primaryAccentIndex: Int = 10,
     val secondaryAccentIndex: Int = 11,
     val surfaceMode: SurfaceThemeMode = SurfaceThemeMode.MATERIAL_3,
@@ -1019,12 +1196,12 @@ data class ThemeCustomizationConfig(
     val borderGlowIntensity: Float = 0.22f, // 0.15f .. 1.0f
     val headerGlowIntensity: Float = 0.10f, // 0.05f .. 0.50f
     val cornerRadiusDp: Int = 22, // 8, 14, 18, 22, 24
-    val useDynamicColor: Boolean = false,
+    val useDynamicColor: Boolean = true,
     val isLiquidGlassEnabled: Boolean = false,
     val liquidGlassOpacity: Float = 0.28f, // 0.12f .. 0.65f
     val liquidGlassRefraction: Float = 0.85f, // 0.20f .. 1.0f
     val liquidGlassWallpaperTint: String = "Frosted Ice", // Frosted Ice, Glacial Cyan, Polar Aurora, Deep Permafrost, Diamond Frost
-    val activePresetName: String = "Material 3 You",
+    val activePresetName: String = "Expressive Material You",
     val hapticFeedbackEnabled: Boolean = true,
     val hapticIntensity: HapticIntensity = HapticIntensity.BALANCED,
     val savedCustomPalettes: List<CustomColorPalette> = listOf(

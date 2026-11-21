@@ -46,6 +46,7 @@ enum class MediaPlatform(
     PINTEREST("Pinterest", 0xFFE60023, "PIN"),
     VIMEO("Vimeo", 0xFF1AB7EA, "VMO"),
     PATREON("Patreon", 0xFFFF424D, "PTRN"),
+    TELEGRAM("Telegram", 0xFF2AABEE, "TG"),
     BILIBILI("Bilibili.tv", 0xFF00A1D6, "BILI"),
     PAWCHIVE("Pawchive", 0xFFFB7185, "PAW"),
     TORRENT("Torrent / Magnet", 0xFF8B5CF6, "P2P"),
@@ -138,6 +139,7 @@ enum class MediaPlatform(
                     lower.contains("pinterest.") || lower.contains("pin.it") -> PINTEREST
                     lower.contains("vimeo.com") -> VIMEO
                     lower.contains("patreon.com") || lower.contains("patreonusercontent.com") -> PATREON
+                    lower.contains("t.me/") || lower.contains("telegram.me/") || lower.contains("telegram.dog/") || lower.contains("web.telegram.org") || lower.contains("telesco.pe") || lower.contains("api.telegram.org/file/") -> TELEGRAM
                     lower.contains("bilibili.tv") || lower.contains("biliintl.com") || lower.contains("bilibili.com") || lower.contains("b23.tv") -> BILIBILI
                     lower.contains("pawchive.pw") -> PAWCHIVE
                     DIRECT_EXTENSIONS.any { lower.substringBefore("?").endsWith(it) } -> DIRECT
@@ -160,6 +162,7 @@ enum class MediaPlatform(
                 host.contains("pinterest.") || host == "pin.it" -> PINTEREST
                 host == "vimeo.com" || host.endsWith(".vimeo.com") -> VIMEO
                 host == "patreon.com" || host.endsWith(".patreon.com") || host == "patreonusercontent.com" || host.endsWith(".patreonusercontent.com") -> PATREON
+                host == "t.me" || host.endsWith(".t.me") || host == "telegram.me" || host.endsWith(".telegram.me") || host == "telegram.dog" || host.endsWith(".telegram.dog") || host == "web.telegram.org" || host == "telesco.pe" || host.endsWith(".telesco.pe") || host == "api.telegram.org" -> TELEGRAM
                 host == "bilibili.tv" || host.endsWith(".bilibili.tv") || host == "biliintl.com" || host.endsWith(".biliintl.com") || host == "bilibili.com" || host.endsWith(".bilibili.com") || host == "b23.tv" -> BILIBILI
                 host == "pawchive.pw" || host.endsWith(".pawchive.pw") -> PAWCHIVE
                 DIRECT_EXTENSIONS.any { path.endsWith(it) } -> DIRECT
@@ -422,6 +425,53 @@ data class MediaInfo(
         get() = videoFormats + audioFormats + fileFormats
 }
 
+data class YouTubePlaylistItem(
+    val index: Int,
+    val videoId: String,
+    val title: String,
+    val creator: String = "",
+    val durationFormatted: String = "",
+    val thumbnailUrl: String = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg",
+    val watchUrl: String = "https://www.youtube.com/watch?v=$videoId"
+)
+
+data class YouTubePlaylistInfo(
+    val playlistId: String,
+    val sourceUrl: String,
+    val title: String,
+    val creator: String,
+    val thumbnailUrl: String,
+    val items: List<YouTubePlaylistItem>,
+    val totalReportedCount: Int = items.size
+)
+
+fun extractYouTubePlaylistId(rawUrl: String): String? {
+    val trimmed = rawUrl.trim()
+    if (trimmed.isEmpty()) return null
+    val lower = trimmed.lowercase(Locale.US)
+    val isYouTubeHost = lower.contains("youtube.com") ||
+        lower.contains("youtu.be") ||
+        lower.contains("youtube-nocookie.com")
+    if (!isYouTubeHost) return null
+
+    val listParamMatch = Regex("""[?&]list=([a-zA-Z0-9_-]{2,})""").find(trimmed)
+    return listParamMatch?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() }
+}
+
+fun isDirectYouTubePlaylistUrl(rawUrl: String): Boolean {
+    val playlistId = extractYouTubePlaylistId(rawUrl) ?: return false
+    if (playlistId.isBlank()) return false
+    val trimmed = rawUrl.trim()
+    val hasExplicitVideoId = Regex("""[?&]v=([a-zA-Z0-9_-]{11})""").containsMatchIn(trimmed) ||
+        Regex("""youtu\.be/([a-zA-Z0-9_-]{11})""", RegexOption.IGNORE_CASE).containsMatchIn(trimmed) ||
+        Regex("""/(?:shorts|embed|live)/([a-zA-Z0-9_-]{11})""", RegexOption.IGNORE_CASE).containsMatchIn(trimmed)
+    return !hasExplicitVideoId || trimmed.contains("/playlist", ignoreCase = true)
+}
+
+fun hasYouTubePlaylistParam(rawUrl: String): Boolean {
+    return extractYouTubePlaylistId(rawUrl) != null
+}
+
 data class DownloaderTask(
     val id: String,
     val jobId: String = id,
@@ -529,7 +579,8 @@ data class BatchSession(
     val isCancelled: Boolean = false,
     val isFinished: Boolean = false,
     val config: BatchDownloadConfig = BatchDownloadConfig(),
-    val startedAtMs: Long = System.currentTimeMillis()
+    val startedAtMs: Long = System.currentTimeMillis(),
+    val playlistTitle: String? = null
 )
 
 fun extractUrlsFromText(rawText: String): List<String> {

@@ -290,10 +290,10 @@ class BrowserAndDdmTest {
         assertEquals("104.16.132.229", parsed.first[0].hostAddress)
         assertEquals(180L, parsed.second)
 
-        // Verify non-blocking prewarmHostAsync, package name com.android.ddm & App Version 2.1
+        // Verify non-blocking prewarmHostAsync, package name com.android.ddm & App Version 2.3
         dm.warpDns.prewarmHostAsync("www.google.com")
-        assertEquals("2.1", BuildConfig.VERSION_NAME)
-        assertEquals(21, BuildConfig.VERSION_CODE)
+        assertEquals("2.3", BuildConfig.VERSION_NAME)
+        assertEquals(23, BuildConfig.VERSION_CODE)
         assertEquals("com.android.ddm", BuildConfig.APPLICATION_ID)
     }
 

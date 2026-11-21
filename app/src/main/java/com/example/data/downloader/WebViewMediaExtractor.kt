@@ -115,6 +115,7 @@ class WebViewMediaExtractor(private val context: Context) {
             MediaPlatform.PINTEREST -> "https://www.pinterest.com"
             MediaPlatform.VIMEO -> "https://vimeo.com"
             MediaPlatform.PATREON -> "https://www.patreon.com"
+            MediaPlatform.TELEGRAM -> "https://web.telegram.org"
             MediaPlatform.BILIBILI -> "https://www.bilibili.tv"
             MediaPlatform.PAWCHIVE -> "https://pawchive.pw"
             else -> return false
@@ -135,6 +136,8 @@ class WebViewMediaExtractor(private val context: Context) {
                 cookieStr.contains("reddit_session=") || cookieStr.contains("token_v2=")
             MediaPlatform.PATREON ->
                 cookieStr.contains("session_id=")
+            MediaPlatform.TELEGRAM ->
+                cookieStr.contains("stel_") || cookieStr.length > 20
             MediaPlatform.BILIBILI ->
                 cookieStr.contains("SESSDATA=") || cookieStr.contains("bili_jct=") || cookieStr.length > 25
             MediaPlatform.PAWCHIVE ->
@@ -687,6 +690,10 @@ class WebViewMediaExtractor(private val context: Context) {
 
         fun isLikelyDownloadableFileUrl(lowerUrl: String): Boolean {
             val path = lowerUrl.substringBefore("?").substringBefore("#")
+            val isImage = path.endsWith(".jpg") || path.endsWith(".jpeg") || path.endsWith(".png") || path.endsWith(".webp") || path.endsWith(".gif")
+            if (!isImage && (lowerUrl.contains("telesco.pe/file/") || lowerUrl.contains("api.telegram.org/file/"))) {
+                return true
+            }
             return MediaPlatform.ARCHIVE_EXTENSIONS.any { path.endsWith(it) } ||
                 MediaPlatform.INSTALLER_EXTENSIONS.any { path.endsWith(it) } ||
                 MediaPlatform.DISK_IMAGE_AND_BIN_EXTENSIONS.any { path.endsWith(it) } ||

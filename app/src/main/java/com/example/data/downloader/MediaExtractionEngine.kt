@@ -107,6 +107,10 @@ class MediaExtractionEngine(
         // 3. Check if the URL points directly to a binary video/audio/file stream
         val directProbeHeaders = when (platform) {
             MediaPlatform.PATREON -> buildCookieHeaders(resolvedUrl, mapOf("Referer" to "https://www.patreon.com/"))
+            MediaPlatform.TELEGRAM -> buildCookieHeaders(
+                resolvedUrl,
+                mapOf("Referer" to "https://t.me/")
+            )
             MediaPlatform.BILIBILI -> buildCookieHeaders(
                 resolvedUrl,
                 mapOf(
@@ -140,7 +144,7 @@ class MediaExtractionEngine(
                     canonicalUrl = probe.finalUrl,
                     probe = probe,
                     platformOverride = when (platform) {
-                        MediaPlatform.PATREON, MediaPlatform.BILIBILI, MediaPlatform.PAWCHIVE -> platform
+                        MediaPlatform.PATREON, MediaPlatform.TELEGRAM, MediaPlatform.BILIBILI, MediaPlatform.PAWCHIVE -> platform
                         else -> MediaPlatform.DIRECT
                     }
                 )
@@ -161,6 +165,8 @@ class MediaExtractionEngine(
                 extractVimeoMedia(normalizedUrl, resolvedUrl)
             MediaPlatform.PATREON ->
                 extractPatreonMedia(normalizedUrl, resolvedUrl)
+            MediaPlatform.TELEGRAM ->
+                extractTelegramMedia(normalizedUrl, resolvedUrl)
             MediaPlatform.BILIBILI ->
                 extractBilibiliMedia(normalizedUrl, resolvedUrl)
             MediaPlatform.PAWCHIVE ->
@@ -494,9 +500,11 @@ class MediaExtractionEngine(
         probe: StreamProbeResult,
         platformOverride: MediaPlatform = MediaPlatform.DIRECT
     ): MediaInfo {
-        val baseHeaders = if (platformOverride == MediaPlatform.PATREON) {
-            mapOf("Referer" to "https://www.patreon.com/")
-        } else emptyMap()
+        val baseHeaders = when (platformOverride) {
+            MediaPlatform.PATREON -> mapOf("Referer" to "https://www.patreon.com/")
+            MediaPlatform.TELEGRAM -> mapOf("Referer" to "https://t.me/")
+            else -> emptyMap()
+        }
         val authHeaders = buildCookieHeaders(canonicalUrl, baseHeaders)
         val lowerMime = probe.contentType.lowercase(Locale.US)
         val urlPath = try {
@@ -1673,6 +1681,464 @@ class MediaExtractionEngine(
         for (p in patterns) {
             val m = Pattern.compile(p).matcher(url)
             if (m.find()) return m.group(1)
+        }
+        return null
+    }
+
+    // =========================================================================
+    // 2B. YOUTUBE WHOLE-PLAYLIST EXTRACTOR (InnerTube Browse + Continuation + Mix + HTML + Atom RSS)
+    // =========================================================================
+    fun extractYouTubePlaylist(
+        rawUrl: String,
+        onProgress: (Int) -> Unit = {}
+    ): YouTubePlaylistInfo {
+        val trimmedRaw = rawUrl.trim()
+        val normalizedUrl = if (!trimmedRaw.startsWith("http://", true) && !trimmedRaw.startsWith("https://", true)) {
+            "https://$trimmedRaw"
+        } else {
+            trimmedRaw
+        }
+        val resolvedUrl = resolveRedirectsIfNeeded(normalizedUrl)
+        val playlistId = extractYouTubePlaylistId(resolvedUrl)
+            ?: extractYouTubePlaylistId(normalizedUrl)
+            ?: throw ExtractorException(
+                DownloaderErrorType.INVALID_URL,
+                "Could not find a valid YouTube playlist ID (list=...) in this link."
+            )
+
+        val seedVideoId = extractYouTubeVideoId(resolvedUrl) ?: extractYouTubeVideoId(normalizedUrl)
+        val canonicalPlaylistUrl = "https://www.youtube.com/playlist?list=$playlistId"
+        val ytCookies = webViewExtractor?.getCookiesForUrl(canonicalPlaylistUrl)
+
+        val collected = LinkedHashMap<String, YouTubePlaylistItem>()
+        val meta = mutableMapOf<String, String>()
+        val seenTokens = HashSet<String>()
+        val pendingTokens = ArrayDeque<String>()
+
+        fun ytText(node: Any?): String {
+            if (node == null) return ""
+            if (node is String) return node.trim()
+            if (node is JSONObject) {
+                val simple = node.optString("simpleText", "").trim()
+                if (simple.isNotBlank()) return simple
+                val content = node.optString("content", "").trim()
+                if (content.isNotBlank()) return content
+                val runs = node.optJSONArray("runs")
+                if (runs != null) {
+                    val sb = StringBuilder()
+                    for (i in 0 until runs.length()) {
+                        val r = runs.optJSONObject(i)
+                        val t = r?.optString("text", "") ?: ""
+                        sb.append(t)
+                    }
+                    val joined = sb.toString().trim()
+                    if (joined.isNotBlank()) return joined
+                }
+            }
+            return ""
+        }
+
+        fun pickBestThumb(thumbnailsObj: JSONObject?, videoId: String? = null): String {
+            val arr = thumbnailsObj?.optJSONArray("thumbnails")
+            if (arr != null && arr.length() > 0) {
+                var bestUrl = ""
+                var bestWidth = -1
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val u = item.optString("url", "").trim()
+                    val w = item.optInt("width", 0)
+                    if (u.isNotBlank() && w >= bestWidth) {
+                        bestWidth = w
+                        bestUrl = if (u.startsWith("//")) "https:$u" else u
+                    }
+                }
+                if (bestUrl.isNotBlank()) return bestUrl
+            }
+            return if (!videoId.isNullOrBlank()) "https://i.ytimg.com/vi/$videoId/hqdefault.jpg" else ""
+        }
+
+        fun addPlaylistEntry(
+            videoId: String,
+            title: String,
+            creator: String,
+            durationText: String,
+            thumbUrl: String
+        ) {
+            val cleanId = videoId.trim()
+            if (cleanId.length != 11 || collected.containsKey(cleanId)) return
+            val cleanTitle = decodeHtmlEntities(title).trim()
+            val lowerTitle = cleanTitle.lowercase(Locale.US)
+            if ((lowerTitle == "[deleted video]" || lowerTitle == "[private video]" || lowerTitle == "deleted video" || lowerTitle == "private video") &&
+                durationText.isBlank() && creator.isBlank()
+            ) {
+                return
+            }
+            val finalTitle = cleanTitle.ifBlank { "YouTube Video ($cleanId)" }
+            val finalThumb = thumbUrl.ifBlank { "https://i.ytimg.com/vi/$cleanId/hqdefault.jpg" }
+            collected[cleanId] = YouTubePlaylistItem(
+                index = collected.size,
+                videoId = cleanId,
+                title = finalTitle,
+                creator = decodeHtmlEntities(creator).trim(),
+                durationFormatted = durationText.trim(),
+                thumbnailUrl = finalThumb,
+                watchUrl = "https://www.youtube.com/watch?v=$cleanId"
+            )
+            if (meta["thumbnail"].isNullOrBlank()) {
+                meta["thumbnail"] = finalThumb
+            }
+        }
+
+        fun walkJson(node: Any?) {
+            when (node) {
+                is JSONObject -> {
+                    // Metadata extraction
+                    node.optJSONObject("playlistMetadataRenderer")?.let { pmr ->
+                        val t = pmr.optString("title", "").trim()
+                        if (t.isNotBlank() && meta["title"].isNullOrBlank()) meta["title"] = t
+                    }
+                    node.optJSONObject("playlistHeaderRenderer")?.let { phr ->
+                        val t = ytText(phr.opt("title"))
+                        if (t.isNotBlank()) meta["title"] = t
+                        val owner = ytText(phr.opt("ownerText"))
+                        if (owner.isNotBlank()) meta["creator"] = owner
+                        val heroThumb = phr.optJSONObject("playlistHeaderBanner")
+                            ?.optJSONObject("heroPlaylistThumbnailRenderer")
+                            ?.optJSONObject("thumbnail")
+                        val best = pickBestThumb(heroThumb)
+                        if (best.isNotBlank()) meta["thumbnail"] = best
+                    }
+                    node.optJSONObject("pageHeaderRenderer")?.let { phr ->
+                        val t = phr.optString("pageTitle", "").trim()
+                        if (t.isNotBlank() && meta["title"].isNullOrBlank()) meta["title"] = t
+                    }
+                    node.optJSONObject("microformatDataRenderer")?.let { mdr ->
+                        val t = mdr.optString("title", "").trim()
+                        if (t.isNotBlank() && meta["title"].isNullOrBlank()) meta["title"] = t
+                        val best = pickBestThumb(mdr.optJSONObject("thumbnail"))
+                        if (best.isNotBlank() && meta["thumbnail"].isNullOrBlank()) meta["thumbnail"] = best
+                    }
+
+                    // Standard YouTube playlist video renderer
+                    node.optJSONObject("playlistVideoRenderer")?.let { pvr ->
+                        val vid = pvr.optString("videoId", "")
+                        val title = ytText(pvr.opt("title"))
+                        val creator = ytText(pvr.opt("shortBylineText"))
+                        val dur = ytText(pvr.opt("lengthText"))
+                        val thumb = pickBestThumb(pvr.optJSONObject("thumbnail"), vid)
+                        addPlaylistEntry(vid, title, creator, dur, thumb)
+                    }
+
+                    // Watch-page / Mix panel video renderer
+                    node.optJSONObject("playlistPanelVideoRenderer")?.let { ppvr ->
+                        val vid = ppvr.optString("videoId", "")
+                        val title = ytText(ppvr.opt("title"))
+                        val creator = ytText(ppvr.opt("shortBylineText")).ifBlank { ytText(ppvr.opt("longBylineText")) }
+                        val dur = ytText(ppvr.opt("lengthText"))
+                        val thumb = pickBestThumb(ppvr.optJSONObject("thumbnail"), vid)
+                        addPlaylistEntry(vid, title, creator, dur, thumb)
+                    }
+
+                    // YouTube Music playlist/album item renderer
+                    node.optJSONObject("musicResponsiveListItemRenderer")?.let { mrl ->
+                        val vid = mrl.optJSONObject("playlistItemData")?.optString("videoId", "")
+                            ?: mrl.optJSONObject("overlay")
+                                ?.optJSONObject("musicItemThumbnailOverlayRenderer")
+                                ?.optJSONObject("content")
+                                ?.optJSONObject("musicPlayButtonRenderer")
+                                ?.optJSONObject("playNavigationEndpoint")
+                                ?.optJSONObject("watchEndpoint")
+                                ?.optString("videoId", "")
+                            ?: ""
+                        if (vid.length == 11) {
+                            val flex = mrl.optJSONArray("flexColumns")
+                            val title = flex?.optJSONObject(0)
+                                ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+                                ?.let { ytText(it.opt("text")) } ?: ""
+                            val creator = flex?.optJSONObject(1)
+                                ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
+                                ?.let { ytText(it.opt("text")) } ?: ""
+                            val fixed = mrl.optJSONArray("fixedColumns")
+                            val dur = fixed?.optJSONObject(0)
+                                ?.optJSONObject("musicResponsiveListItemFixedColumnRenderer")
+                                ?.let { ytText(it.opt("text")) } ?: ""
+                            val thumbObj = mrl.optJSONObject("thumbnail")
+                                ?.optJSONObject("musicThumbnailRenderer")
+                                ?.optJSONObject("thumbnail")
+                            addPlaylistEntry(vid, title, creator, dur, pickBestThumb(thumbObj, vid))
+                        }
+                    }
+
+                    // Continuation tokens for playlists with >100 items
+                    node.optJSONObject("continuationItemRenderer")?.let { cir ->
+                        val token = cir.optJSONObject("continuationEndpoint")
+                            ?.optJSONObject("continuationCommand")
+                            ?.optString("token", "")
+                            ?.trim()
+                            .orEmpty()
+                        if (token.isNotBlank() && seenTokens.add(token)) {
+                            pendingTokens.addLast(token)
+                        }
+                    }
+                    node.optJSONObject("nextContinuationData")?.let { ncd ->
+                        val token = ncd.optString("continuation", "").trim()
+                        if (token.isNotBlank() && seenTokens.add(token)) {
+                            pendingTokens.addLast(token)
+                        }
+                    }
+
+                    val keys = node.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        if (key == "playlistVideoRenderer" ||
+                            key == "playlistPanelVideoRenderer" ||
+                            key == "musicResponsiveListItemRenderer"
+                        ) continue
+                        walkJson(node.opt(key))
+                    }
+                }
+                is JSONArray -> {
+                    for (i in 0 until node.length()) {
+                        walkJson(node.opt(i))
+                    }
+                }
+            }
+        }
+
+        fun buildWebContextJson(isMusic: Boolean = false): JSONObject {
+            return JSONObject().apply {
+                put("client", JSONObject().apply {
+                    put("clientName", if (isMusic) "WEB_REMIX" else "WEB")
+                    put("clientVersion", if (isMusic) "1.20250212.01.00" else "2.20250214.00.00")
+                    put("hl", "en")
+                    put("gl", "US")
+                })
+            }
+        }
+
+        fun callInnerTubeEndpoint(
+            endpoint: String,
+            payload: JSONObject,
+            isMusic: Boolean = false
+        ): JSONObject? {
+            val host = if (isMusic) "https://music.youtube.com" else "https://www.youtube.com"
+            val reqBuilder = Request.Builder()
+                .url("$host/youtubei/v1/$endpoint?prettyPrint=false")
+                .post(payload.toString().toRequestBody("application/json".toMediaType()))
+                .header("User-Agent", DESKTOP_USER_AGENT)
+                .header("Accept", "application/json")
+                .header("Origin", host)
+                .header("Referer", "$host/playlist?list=$playlistId")
+                .header("X-YouTube-Client-Name", if (isMusic) "67" else "1")
+                .header("X-YouTube-Client-Version", if (isMusic) "1.20250212.01.00" else "2.20250214.00.00")
+            if (!ytCookies.isNullOrBlank()) {
+                reqBuilder.header("Cookie", ytCookies)
+            }
+            return try {
+                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return null
+                    val body = resp.body?.string() ?: return null
+                    JSONObject(body)
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        fun drainContinuations(isMusic: Boolean = false) {
+            var pages = 0
+            while (pendingTokens.isNotEmpty() && pages < 30 && collected.size < 3000) {
+                val token = pendingTokens.removeFirst()
+                pages++
+                val contPayload = JSONObject().apply {
+                    put("continuation", token)
+                    put("context", buildWebContextJson(isMusic))
+                }
+                val contJson = callInnerTubeEndpoint("browse", contPayload, isMusic) ?: break
+                val beforeCount = collected.size
+                walkJson(contJson)
+                if (collected.size > beforeCount) {
+                    onProgress(collected.size)
+                }
+            }
+        }
+
+        val isYouTubeMusic = resolvedUrl.contains("music.youtube.com", ignoreCase = true) ||
+            playlistId.startsWith("OLAK5uy_", ignoreCase = true)
+
+        // LAYER 1: InnerTube /youtubei/v1/browse (with full pagination for >100-video playlists)
+        val browseId = if (playlistId.startsWith("VL", ignoreCase = true)) playlistId else "VL$playlistId"
+        val primaryBrowse = callInnerTubeEndpoint(
+            endpoint = "browse",
+            payload = JSONObject().apply {
+                put("browseId", browseId)
+                put("context", buildWebContextJson(isMusic = false))
+            },
+            isMusic = false
+        )
+        if (primaryBrowse != null) {
+            walkJson(primaryBrowse)
+            if (collected.isNotEmpty()) onProgress(collected.size)
+            drainContinuations(isMusic = false)
+        }
+
+        // LAYER 1A: If YouTube Music URL / album playlist and WEB browse returned empty, try WEB_REMIX
+        if (collected.isEmpty() && isYouTubeMusic) {
+            val musicBrowse = callInnerTubeEndpoint(
+                endpoint = "browse",
+                payload = JSONObject().apply {
+                    put("browseId", browseId)
+                    put("context", buildWebContextJson(isMusic = true))
+                },
+                isMusic = true
+            )
+            if (musicBrowse != null) {
+                walkJson(musicBrowse)
+                if (collected.isNotEmpty()) onProgress(collected.size)
+                drainContinuations(isMusic = true)
+            }
+        }
+
+        // LAYER 1B: Mix / Radio playlists (RD...) or watch+list fallback via /youtubei/v1/next
+        if (collected.isEmpty() && (playlistId.startsWith("RD", ignoreCase = true) || !seedVideoId.isNullOrBlank())) {
+            val nextPayload = JSONObject().apply {
+                put("playlistId", playlistId)
+                if (!seedVideoId.isNullOrBlank()) put("videoId", seedVideoId)
+                put("context", buildWebContextJson(isMusic = false))
+            }
+            val nextJson = callInnerTubeEndpoint("next", nextPayload, isMusic = false)
+            if (nextJson != null) {
+                walkJson(nextJson)
+                if (collected.isNotEmpty()) onProgress(collected.size)
+            }
+        }
+
+        // LAYER 2: Public playlist HTML page ytInitialData fallback (+ continuation drain)
+        if (collected.isEmpty()) {
+            try {
+                val cookieCombined = listOfNotNull(
+                    ytCookies?.takeIf { it.isNotBlank() },
+                    "CONSENT=YES+cb.20230531-04-p0.en+FX+908"
+                ).joinToString("; ")
+                val htmlReq = Request.Builder()
+                    .url("$canonicalPlaylistUrl&hl=en")
+                    .header("User-Agent", DESKTOP_USER_AGENT)
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("Cookie", cookieCombined)
+                    .build()
+                httpClient.newCall(htmlReq).execute().use { resp ->
+                    val html = resp.body?.string() ?: ""
+                    val initJsonStr = extractEmbeddedJsonObject(html, "var ytInitialData =")
+                        ?: extractEmbeddedJsonObject(html, "window[\"ytInitialData\"] =")
+                        ?: extractEmbeddedJsonObject(html, "ytInitialData =")
+                    if (!initJsonStr.isNullOrBlank()) {
+                        val initJson = JSONObject(initJsonStr)
+                        walkJson(initJson)
+                        if (collected.isNotEmpty()) onProgress(collected.size)
+                        drainContinuations(isMusic = false)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // LAYER 3: Public YouTube Atom RSS XML feed fallback
+        if (collected.isEmpty()) {
+            try {
+                val rssReq = Request.Builder()
+                    .url("https://www.youtube.com/feeds/videos.xml?playlist_id=$playlistId")
+                    .header("User-Agent", DESKTOP_USER_AGENT)
+                    .build()
+                httpClient.newCall(rssReq).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val xml = resp.body?.string() ?: ""
+                        if (meta["title"].isNullOrBlank()) {
+                            Regex("""<title>(.*?)</title>""", RegexOption.DOT_MATCHES_ALL)
+                                .find(xml)?.groupValues?.getOrNull(1)?.let { t ->
+                                    meta["title"] = decodeHtmlEntities(t).trim()
+                                }
+                        }
+                        if (meta["creator"].isNullOrBlank()) {
+                            Regex("""<author>\s*<name>(.*?)</name>""", RegexOption.DOT_MATCHES_ALL)
+                                .find(xml)?.groupValues?.getOrNull(1)?.let { c ->
+                                    meta["creator"] = decodeHtmlEntities(c).trim()
+                                }
+                        }
+                        Regex("""<entry>(.*?)</entry>""", RegexOption.DOT_MATCHES_ALL)
+                            .findAll(xml)
+                            .forEach { m ->
+                                val entry = m.groupValues[1]
+                                val vid = Regex("""<yt:videoId>([a-zA-Z0-9_-]{11})</yt:videoId>""")
+                                    .find(entry)?.groupValues?.getOrNull(1).orEmpty()
+                                val title = Regex("""<title>(.*?)</title>""", RegexOption.DOT_MATCHES_ALL)
+                                    .find(entry)?.groupValues?.getOrNull(1).orEmpty()
+                                val author = Regex("""<name>(.*?)</name>""", RegexOption.DOT_MATCHES_ALL)
+                                    .find(entry)?.groupValues?.getOrNull(1).orEmpty()
+                                if (vid.length == 11) {
+                                    addPlaylistEntry(vid, title, author, "", "")
+                                }
+                            }
+                        if (collected.isNotEmpty()) onProgress(collected.size)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        if (collected.isEmpty()) {
+            throw ExtractorException(
+                DownloaderErrorType.PRIVATE_OR_RESTRICTED,
+                "Could not load videos from this YouTube playlist. Make sure the playlist is Public or Unlisted (or sign in to YouTube via Private Access for personal playlists)."
+            )
+        }
+
+        val items = collected.values.mapIndexed { idx, item -> item.copy(index = idx) }
+        val finalTitle = meta["title"]?.takeIf { it.isNotBlank() } ?: "YouTube Playlist ($playlistId)"
+        val finalCreator = meta["creator"]?.takeIf { it.isNotBlank() }
+            ?: items.firstOrNull()?.creator?.takeIf { it.isNotBlank() }
+            ?: "YouTube"
+        val finalThumb = meta["thumbnail"]?.takeIf { it.isNotBlank() }
+            ?: items.firstOrNull()?.thumbnailUrl.orEmpty()
+
+        return YouTubePlaylistInfo(
+            playlistId = playlistId,
+            sourceUrl = canonicalPlaylistUrl,
+            title = finalTitle,
+            creator = finalCreator,
+            thumbnailUrl = finalThumb,
+            items = items,
+            totalReportedCount = items.size
+        )
+    }
+
+    private fun extractEmbeddedJsonObject(source: String, marker: String): String? {
+        val markerIdx = source.indexOf(marker)
+        if (markerIdx < 0) return null
+        val startBrace = source.indexOf('{', markerIdx + marker.length)
+        if (startBrace < 0) return null
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (i in startBrace until source.length) {
+            val ch = source[i]
+            if (inString) {
+                if (escaped) {
+                    escaped = false
+                } else if (ch == '\\') {
+                    escaped = true
+                } else if (ch == '"') {
+                    inString = false
+                }
+            } else {
+                when (ch) {
+                    '"' -> inString = true
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) {
+                            return source.substring(startBrace, i + 1)
+                        }
+                    }
+                }
+            }
         }
         return null
     }
@@ -5019,6 +5485,586 @@ class MediaExtractionEngine(
         }
 
         return extractSocialMedia(originalUrl, resolvedUrl, MediaPlatform.FACEBOOK)
+    }
+
+    // =========================================================================
+    // 8B. TELEGRAM POST, MEDIA & FILE DOWNLOAD ADAPTER
+    // =========================================================================
+    private fun extractTelegramMedia(
+        originalUrl: String,
+        resolvedUrl: String
+    ): MediaInfo {
+        val cleanUrl = resolvedUrl.trim()
+        val parsedUri = try {
+            URI(cleanUrl)
+        } catch (_: Exception) {
+            null
+        }
+        val pathSegments = (parsedUri?.path ?: "")
+            .split("/")
+            .filter { it.isNotBlank() }
+
+        val isPrivateChannelPost = pathSegments.size >= 3 && pathSegments[0].equals("c", ignoreCase = true)
+        var channelName: String? = null
+        var messageId: String? = null
+
+        if (!isPrivateChannelPost && pathSegments.size >= 2) {
+            if (pathSegments[0].equals("s", ignoreCase = true) && pathSegments.size >= 3) {
+                channelName = pathSegments[1]
+                messageId = pathSegments[2].filter { it.isDigit() }.ifBlank { null }
+            } else if (!pathSegments[0].equals("joinchat", ignoreCase = true) &&
+                !pathSegments[0].startsWith("+")
+            ) {
+                channelName = pathSegments[0]
+                messageId = pathSegments[1].filter { it.isDigit() }.ifBlank { null }
+            }
+        }
+
+        val candidatePages = LinkedHashSet<String>()
+        if (!channelName.isNullOrBlank() && !messageId.isNullOrBlank()) {
+            candidatePages.add("https://t.me/$channelName/$messageId?embed=1&single=1")
+            candidatePages.add("https://t.me/$channelName/$messageId?embed=1")
+            candidatePages.add("https://t.me/s/$channelName/$messageId")
+        }
+        candidatePages.add(cleanUrl)
+
+        val headersBase = buildCookieHeaders(
+            cleanUrl,
+            mapOf(
+                "Referer" to "https://t.me/",
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language" to "en-US,en;q=0.9"
+            )
+        )
+
+        val videoUrls = LinkedHashSet<String>()
+        val audioUrls = LinkedHashSet<String>()
+        val directCdnCandidates = LinkedHashSet<String>()
+        val externalLinkCandidates = LinkedHashSet<String>()
+        val postPhotoUrls = LinkedHashSet<String>()
+
+        var extractedTitle: String? = null
+        var extractedDocumentName: String? = null
+        var extractedDocumentSize: String? = null
+        var hasDocumentAttachment = false
+        var hasVideoPlayerElement = false
+        var extractedCreator: String? = channelName?.let { "@$it" }
+        var extractedThumb = ""
+        var extractedDurationSec = 0L
+        var sawMediaTooBigNotice = false
+        var sawOpenInTelegramNotice = false
+
+        fun parseDurationLabel(raw: String): Long {
+            val parts = raw.trim().split(":").mapNotNull { it.toLongOrNull() }
+            return when (parts.size) {
+                3 -> parts[0] * 3600L + parts[1] * 60L + parts[2]
+                2 -> parts[0] * 60L + parts[1]
+                1 -> parts[0]
+                else -> 0L
+            }
+        }
+
+        fun normalizeExternalCandidateLink(rawHref: String): String {
+            val trimmed = rawHref.trim()
+            // Convert Google Drive /file/d/<ID>/view share links to direct download URLs
+            val gdriveMatch = Regex(
+                """https?://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)""",
+                RegexOption.IGNORE_CASE
+            ).find(trimmed)
+            if (gdriveMatch != null) {
+                return "https://drive.google.com/uc?export=download&id=${gdriveMatch.groupValues[1]}"
+            }
+            return trimmed
+        }
+
+        fun scanTelegramHtml(pageUrl: String, html: String) {
+            if (html.isBlank()) return
+            if (html.contains("Media is too big", ignoreCase = true) ||
+                html.contains("media_not_supported", ignoreCase = true)
+            ) {
+                sawMediaTooBigNotice = true
+            }
+            if (html.contains("Please open Telegram to view this post", ignoreCase = true)) {
+                sawOpenInTelegramNotice = true
+            }
+
+            // Narrow strictly to the requested message block when reading a /s/ timeline
+            val targetBlock = if (!channelName.isNullOrBlank() && !messageId.isNullOrBlank() && pageUrl.contains("/s/")) {
+                val postKey = "$channelName/$messageId"
+                val idx = html.indexOf("data-post=\"$postKey\"", ignoreCase = true)
+                if (idx >= 0) {
+                    val endIdx = html.indexOf("tgme_widget_message_wrap", idx + 40).takeIf { it > idx }
+                        ?: (idx + 14000).coerceAtMost(html.length)
+                    html.substring(idx, endIdx)
+                } else html
+            } else html
+
+            if (targetBlock.contains("tgme_widget_message_document", ignoreCase = true)) {
+                hasDocumentAttachment = true
+            }
+            if (targetBlock.contains("tgme_widget_message_video_player", ignoreCase = true) ||
+                targetBlock.contains("tgme_widget_message_roundvideo", ignoreCase = true)
+            ) {
+                hasVideoPlayerElement = true
+            }
+
+            // Document filename & size metadata
+            if (extractedDocumentName.isNullOrBlank()) {
+                val docTitleMatch = Regex(
+                    """class="[^"]*tgme_widget_message_document_title[^"]*"[^>]*>(.*?)</""",
+                    setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+                ).find(targetBlock)
+                val cleanDocTitle = docTitleMatch?.groupValues?.getOrNull(1)
+                    ?.replace(Regex("<[^>]+>"), "")
+                    ?.let { decodeHtmlEntities(it).trim() }
+                    ?.takeIf { it.isNotBlank() }
+                if (!cleanDocTitle.isNullOrBlank()) {
+                    extractedDocumentName = cleanDocTitle
+                    hasDocumentAttachment = true
+                }
+            }
+            if (extractedDocumentSize.isNullOrBlank()) {
+                val docExtraMatch = Regex(
+                    """class="[^"]*tgme_widget_message_document_extra[^"]*"[^>]*>(.*?)</""",
+                    setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+                ).find(targetBlock)
+                val cleanDocExtra = docExtraMatch?.groupValues?.getOrNull(1)
+                    ?.replace(Regex("<[^>]+>"), "")
+                    ?.let { decodeHtmlEntities(it).trim() }
+                    ?.takeIf { it.isNotBlank() }
+                if (!cleanDocExtra.isNullOrBlank()) {
+                    extractedDocumentSize = cleanDocExtra
+                }
+            }
+
+            if (extractedCreator.isNullOrBlank() || extractedCreator == "@$channelName") {
+                val ownerMatch = Regex(
+                    """class="[^"]*tgme_widget_message_owner_name[^"]*"[^>]*>(.*?)</""",
+                    setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+                ).find(targetBlock)
+                val owner = ownerMatch?.groupValues?.getOrNull(1)
+                    ?.replace(Regex("<[^>]+>"), "")
+                    ?.let { decodeHtmlEntities(it).trim() }
+                    ?.takeIf { it.isNotBlank() }
+                if (!owner.isNullOrBlank()) extractedCreator = owner
+            }
+
+            if (extractedTitle.isNullOrBlank()) {
+                val msgTextMatch = Regex(
+                    """class="[^"]*tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>""",
+                    setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+                ).find(targetBlock)
+                val msgSnippet = msgTextMatch?.groupValues?.getOrNull(1)
+                    ?.replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), " ")
+                    ?.replace(Regex("<[^>]+>"), "")
+                    ?.let { decodeHtmlEntities(it).replace(Regex("\\s+"), " ").trim() }
+                    ?.take(96)
+                    ?.takeIf { it.isNotBlank() }
+                extractedTitle = extractedDocumentName
+                    ?: msgSnippet
+                    ?: extractMetaContent(html, "og:title")?.let { decodeHtmlEntities(it) }
+                    ?: extractHtmlTitleTag(html)?.let { decodeHtmlEntities(it) }
+            }
+
+            if (extractedDurationSec <= 0L) {
+                val durMatch = Regex(
+                    """class="[^"]*tgme_widget_message_(?:video|voice|roundvideo)_duration[^"]*"[^>]*>([0-9:]+)<""",
+                    RegexOption.IGNORE_CASE
+                ).find(targetBlock)
+                durMatch?.groupValues?.getOrNull(1)?.let {
+                    extractedDurationSec = parseDurationLabel(it)
+                }
+            }
+
+            // 1) Explicit <video>, <source>, and data-video attributes (includes extensionless telesco.pe URLs)
+            Regex(
+                """<(?:video|source)[^>]+(?:src|data-src|data-video)=["']([^"']+)["']""",
+                RegexOption.IGNORE_CASE
+            ).findAll(targetBlock).forEach { m ->
+                val resolved = resolveUrlAgainstBase(pageUrl, decodeHtmlEntities(m.groupValues[1]).trim())
+                if (resolved.startsWith("http", true)) {
+                    videoUrls.add(resolved)
+                }
+            }
+
+            // 2) Explicit <audio> and voice/music player sources
+            Regex(
+                """<audio[^>]+(?:src|data-src|data-audio)=["']([^"']+)["']""",
+                RegexOption.IGNORE_CASE
+            ).findAll(targetBlock).forEach { m ->
+                val resolved = resolveUrlAgainstBase(pageUrl, decodeHtmlEntities(m.groupValues[1]).trim())
+                if (resolved.startsWith("http", true)) {
+                    audioUrls.add(resolved)
+                }
+            }
+
+            // 3) Collect non-avatar/non-thumb cdn*.telesco.pe/file/ URLs to probe their real Content-Type
+            // Strictly exclude channel avatar (user_photo), video/document/link thumbnails, and photo_wrap!
+            Regex("""https?://cdn\d*\.telesco\.pe/file/[^\s"'<>\\)]+""", RegexOption.IGNORE_CASE)
+                .findAll(targetBlock)
+                .forEach { m ->
+                    val cdnUrl = decodeHtmlEntities(m.value).trimEnd(',', ';', '\'', '"')
+                    val startIdx = m.range.first
+                    val surroundingBefore = targetBlock.substring((startIdx - 220).coerceAtLeast(0), startIdx)
+                    val isAvatarOrThumb = surroundingBefore.contains("user_photo", ignoreCase = true) ||
+                        surroundingBefore.contains("author_photo", ignoreCase = true) ||
+                        surroundingBefore.contains("video_thumb", ignoreCase = true) ||
+                        surroundingBefore.contains("document_thumb", ignoreCase = true) ||
+                        surroundingBefore.contains("roundvideo_thumb", ignoreCase = true) ||
+                        surroundingBefore.contains("link_preview_image", ignoreCase = true) ||
+                        surroundingBefore.contains("sticker", ignoreCase = true)
+                    val isPhotoWrap = surroundingBefore.contains("photo_wrap", ignoreCase = true)
+                    val pathLower = cdnUrl.substringBefore("?").lowercase(Locale.US)
+                    val looksLikeStaticImage = pathLower.endsWith(".jpg") ||
+                        pathLower.endsWith(".jpeg") ||
+                        pathLower.endsWith(".png") ||
+                        pathLower.endsWith(".webp")
+
+                    when {
+                        isAvatarOrThumb -> {
+                            // Only use video/document thumb as thumbnail preview — NEVER as a downloadable photo!
+                            if (extractedThumb.isBlank() &&
+                                (surroundingBefore.contains("video_thumb", true) ||
+                                    surroundingBefore.contains("document_thumb", true))
+                            ) {
+                                extractedThumb = cdnUrl
+                            }
+                        }
+                        isPhotoWrap -> {
+                            if (extractedThumb.isBlank()) extractedThumb = cdnUrl
+                            postPhotoUrls.add(cdnUrl)
+                        }
+                        !looksLikeStaticImage -> {
+                            // Extensionless or binary telesco.pe URL — probe real MIME via HEAD/GET!
+                            directCdnCandidates.add(cdnUrl)
+                        }
+                    }
+                }
+
+            // 4) Genuine post photos ONLY from tgme_widget_message_photo_wrap
+            Regex(
+                """tgme_widget_message_photo_wrap[^>]*style=["'][^"']*background-image:\s*url\(['"]?([^'")]+)['"]?\)""",
+                RegexOption.IGNORE_CASE
+            ).findAll(targetBlock).forEach { m ->
+                val resolved = resolveUrlAgainstBase(pageUrl, decodeHtmlEntities(m.groupValues[1]))
+                if (resolved.startsWith("http", true)) {
+                    if (extractedThumb.isBlank()) extractedThumb = resolved
+                    postPhotoUrls.add(resolved)
+                }
+            }
+
+            // 5) Video / document thumbnail for UI preview only
+            if (extractedThumb.isBlank()) {
+                Regex(
+                    """tgme_widget_message_(?:video|document|roundvideo)_thumb[^>]*style=["'][^"']*background-image:\s*url\(['"]?([^'")]+)['"]?\)""",
+                    RegexOption.IGNORE_CASE
+                ).find(targetBlock)?.groupValues?.getOrNull(1)?.let { raw ->
+                    val resolved = resolveUrlAgainstBase(pageUrl, decodeHtmlEntities(raw))
+                    if (resolved.startsWith("http", true)) extractedThumb = resolved
+                }
+            }
+
+            // 6) Inline keyboard buttons & post links (channels often share direct file/bot download links here!)
+            Regex("""<a[^>]+href=["'](https?://[^"']+)["']""", RegexOption.IGNORE_CASE)
+                .findAll(targetBlock)
+                .forEach { m ->
+                    val rawHref = decodeHtmlEntities(m.groupValues[1]).trim()
+                    val href = normalizeExternalCandidateLink(rawHref)
+                    val hostLower = try {
+                        (URI(href).host ?: "").lowercase(Locale.US)
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    // Skip Telegram navigation/self links unless they are direct Telegram file/CDN URLs
+                    val isTelegramNavLink = (hostLower == "t.me" || hostLower.endsWith(".t.me") ||
+                        hostLower == "telegram.me" || hostLower == "telegram.dog" ||
+                        hostLower == "telegram.org" || hostLower == "www.telegram.org") &&
+                        !href.contains("/file/", ignoreCase = true)
+                    if (!isTelegramNavLink && hostLower.isNotBlank()) {
+                        externalLinkCandidates.add(href)
+                    }
+                }
+        }
+
+        // 1. Fetch candidate Telegram embed & web preview pages
+        for (pageUrl in candidatePages) {
+            try {
+                val reqBuilder = Request.Builder()
+                    .url(pageUrl)
+                    .header("User-Agent", DESKTOP_USER_AGENT)
+                headersBase.forEach { (k, v) -> reqBuilder.header(k, v) }
+                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    val html = resp.body?.string() ?: ""
+                    scanTelegramHtml(pageUrl, html)
+                }
+                if (videoUrls.isNotEmpty() || audioUrls.isNotEmpty() || directCdnCandidates.isNotEmpty()) {
+                    break
+                }
+            } catch (_: Exception) {}
+        }
+
+        val mediaHeaders = buildCookieHeaders(cleanUrl, mapOf("Referer" to "https://t.me/"))
+        val videoFormats = mutableListOf<MediaFormatOption>()
+        val audioFormats = mutableListOf<MediaFormatOption>()
+        val fileFormats = mutableListOf<MediaFormatOption>()
+        val addedStreamUrls = HashSet<String>()
+
+        fun classifyAndAddProbedUrl(
+            rawUrl: String,
+            probe: StreamProbeResult?,
+            preferredHeaders: Map<String, String>,
+            idPrefix: String,
+            index: Int,
+            forceAsMediaIfUnknown: Boolean
+        ) {
+            val finalUrl = probe?.finalUrl ?: rawUrl
+            if (!addedStreamUrls.add(finalUrl)) return
+
+            val rawMime = probe?.contentType?.substringBefore(";")?.trim()?.lowercase(Locale.US).orEmpty()
+            val isHtml = rawMime.contains("text/html") || rawMime.contains("xhtml")
+            if (isHtml) return
+
+            val urlPathLower = finalUrl.substringBefore("?").lowercase(Locale.US)
+            val dispName = probe?.filenameFromHeader?.trim().orEmpty()
+            val dispLower = dispName.lowercase(Locale.US)
+            val isVideo = rawMime.startsWith("video/") ||
+                MediaPlatform.VIDEO_EXTENSIONS.any { urlPathLower.endsWith(it) || dispLower.endsWith(it) }
+            val isAudio = rawMime.startsWith("audio/") ||
+                MediaPlatform.AUDIO_EXTENSIONS.any { urlPathLower.endsWith(it) || dispLower.endsWith(it) }
+            val isImage = rawMime.startsWith("image/")
+            val isBinaryOrFile = isBinaryMediaMime(rawMime, finalUrl, probe?.filenameFromHeader) ||
+                dispName.isNotBlank() ||
+                MediaPlatform.hasDirectFileExtension(finalUrl)
+
+            when {
+                isVideo -> {
+                    val mime = rawMime.takeIf { it.startsWith("video/") } ?: "video/mp4"
+                    val ext = dispName.substringAfterLast(".", "").lowercase(Locale.US)
+                        .takeIf { it.isNotBlank() && it.length <= 6 }
+                        ?: mimeToExtension(mime).ifBlank { "mp4" }
+                    val cl = probe?.contentLength ?: -1L
+                    val label = dispName.ifBlank {
+                        extractedDocumentName?.takeIf { videoFormats.isEmpty() }
+                            ?: "Telegram Video (${ext.uppercase(Locale.US)})"
+                    }
+                    videoFormats.add(
+                        MediaFormatOption(
+                            id = "${idPrefix}_v_$index",
+                            qualityLabel = label,
+                            resolutionHeight = 720,
+                            container = ext,
+                            mimeType = mime,
+                            videoCodec = "H.264",
+                            audioCodec = "AAC",
+                            contentLengthBytes = cl,
+                            isEstimatedSize = cl <= 0L,
+                            isAudioOnly = false,
+                            needsMerging = false,
+                            isOriginalBest = videoFormats.isEmpty(),
+                            streamUrl = finalUrl,
+                            requestHeaders = preferredHeaders,
+                            formatCategory = "Video"
+                        )
+                    )
+                }
+                isAudio -> {
+                    val mime = rawMime.takeIf { it.startsWith("audio/") }
+                        ?: if (urlPathLower.endsWith(".ogg") || urlPathLower.endsWith(".oga")) "audio/ogg" else "audio/mpeg"
+                    val ext = dispName.substringAfterLast(".", "").lowercase(Locale.US)
+                        .takeIf { it.isNotBlank() && it.length <= 6 }
+                        ?: mimeToExtension(mime).ifBlank { "mp3" }
+                    val cl = probe?.contentLength ?: -1L
+                    val label = dispName.ifBlank {
+                        extractedDocumentName?.takeIf { audioFormats.isEmpty() }
+                            ?: "Telegram Audio (${ext.uppercase(Locale.US)})"
+                    }
+                    audioFormats.add(
+                        MediaFormatOption(
+                            id = "${idPrefix}_a_$index",
+                            qualityLabel = label,
+                            container = ext,
+                            mimeType = mime,
+                            audioCodec = ext.uppercase(Locale.US),
+                            bitrateKbps = 192,
+                            bitrateLabel = "192 kbps",
+                            contentLengthBytes = cl,
+                            isEstimatedSize = cl <= 0L,
+                            isAudioOnly = true,
+                            needsMerging = false,
+                            isOriginalBest = audioFormats.isEmpty(),
+                            streamUrl = finalUrl,
+                            requestHeaders = preferredHeaders,
+                            formatCategory = "Audio"
+                        )
+                    )
+                }
+                !isImage && (isBinaryOrFile || forceAsMediaIfUnknown) -> {
+                    val opt = buildFileFormatOption(
+                        fileUrl = finalUrl,
+                        probe = probe,
+                        headers = preferredHeaders,
+                        id = "${idPrefix}_f_$index",
+                        isFirst = fileFormats.isEmpty()
+                    )
+                    if (opt != null) {
+                        val titledOpt = if (fileFormats.isEmpty() && dispName.isBlank() && !extractedDocumentName.isNullOrBlank()) {
+                            val docExt = extractedDocumentName!!.substringAfterLast(".", "").lowercase(Locale.US)
+                                .takeIf { it.isNotBlank() && it.length <= 10 } ?: opt.container
+                            val docMime = extensionToMimeType(docExt)
+                            opt.copy(
+                                qualityLabel = extractedDocumentName!!,
+                                container = docExt,
+                                mimeType = if (opt.mimeType == "application/octet-stream") docMime else opt.mimeType,
+                                formatCategory = classifyFileCategory(docExt, docMime),
+                                fileCategoryLabel = classifyFileCategory(docExt, docMime)
+                            )
+                        } else opt
+                        fileFormats.add(titledOpt)
+                    }
+                }
+            }
+        }
+
+        // 2. Probe explicit video, audio, and extensionless Telegram CDN streams
+        videoUrls.take(6).forEachIndexed { idx, vUrl ->
+            val vProbe = probeStreamHeaders(vUrl, mediaHeaders)
+            classifyAndAddProbedUrl(vUrl, vProbe, mediaHeaders, "tg_vid", idx, forceAsMediaIfUnknown = true)
+        }
+        audioUrls.take(6).forEachIndexed { idx, aUrl ->
+            val aProbe = probeStreamHeaders(aUrl, mediaHeaders)
+            classifyAndAddProbedUrl(aUrl, aProbe, mediaHeaders, "tg_aud", idx, forceAsMediaIfUnknown = true)
+        }
+        directCdnCandidates.take(6).forEachIndexed { idx, cdnUrl ->
+            val cProbe = probeStreamHeaders(cdnUrl, mediaHeaders)
+            classifyAndAddProbedUrl(cdnUrl, cProbe, mediaHeaders, "tg_cdn", idx, forceAsMediaIfUnknown = false)
+        }
+
+        // 3. Probe inline-button and post-caption external links (direct files, mirrors, bot download links)
+        val sortedExternalLinks = externalLinkCandidates.sortedByDescending { link ->
+            val lower = link.lowercase(Locale.US)
+            when {
+                MediaPlatform.hasDirectFileExtension(link) -> 3
+                lower.contains("/dl/") || lower.contains("/download") || lower.contains("export=download") ||
+                    lower.contains("/stream/") || lower.contains("telesco.pe") || lower.contains("api.telegram.org/file/") -> 2
+                else -> 1
+            }
+        }
+        sortedExternalLinks.take(6).forEachIndexed { idx, extUrl ->
+            val extHeaders = buildCookieHeaders(extUrl)
+            val extProbe = probeStreamHeaders(extUrl, extHeaders)
+            if (extProbe != null) {
+                classifyAndAddProbedUrl(extUrl, extProbe, extHeaders, "tg_ext", idx, forceAsMediaIfUnknown = false)
+            }
+        }
+
+        val finalTitle = (extractedDocumentName ?: extractedTitle)
+            ?.replace(Regex("""^Telegram:\s*Contact\s*@?""", RegexOption.IGNORE_CASE), "")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: listOfNotNull("Telegram", channelName, messageId).joinToString("_")
+
+        // 4. If no video/audio/file found yet, try Cobalt for public Telegram video posts
+        if (videoFormats.isEmpty() && audioFormats.isEmpty() && fileFormats.isEmpty() && hasVideoPlayerElement) {
+            val cobaltInfo = tryExtractViaCobaltInstances(
+                targetUrl = cleanUrl,
+                originalUrl = originalUrl,
+                platform = MediaPlatform.TELEGRAM,
+                fallbackTitle = finalTitle,
+                fallbackCreator = extractedCreator ?: "Telegram",
+                fallbackThumb = extractedThumb
+            )
+            if (cobaltInfo != null) return cobaltInfo
+        }
+
+        // 5. If no video/audio/file found yet, try WebView DOM & Network Sniffer fallback
+        if (videoFormats.isEmpty() && audioFormats.isEmpty() && fileFormats.isEmpty() && webViewExtractor != null) {
+            val sniffUrl = candidatePages.firstOrNull() ?: cleanUrl
+            try {
+                val wvMedia = runBlocking {
+                    webViewExtractor.extractViaWebView(sniffUrl, 10000L)
+                }
+                if (wvMedia != null && (wvMedia.videoUrls.isNotEmpty() || wvMedia.audioUrls.isNotEmpty() || wvMedia.fileUrls.isNotEmpty())) {
+                    val built = buildMediaInfoFromWebViewResult(
+                        wvMedia = wvMedia,
+                        originalUrl = originalUrl,
+                        canonicalUrl = cleanUrl,
+                        platform = MediaPlatform.TELEGRAM,
+                        fallbackTitle = finalTitle,
+                        fallbackCreator = extractedCreator ?: "Telegram",
+                        fallbackThumb = extractedThumb
+                    )
+                    if (built != null) return built
+                }
+            } catch (_: Exception) {}
+        }
+
+        // 6. Only include genuine tgme_widget_message_photo_wrap photos when the post is NOT a missing document or >20MB video!
+        val hasPrimaryMediaOrFiles = videoFormats.isNotEmpty() || audioFormats.isNotEmpty() || fileFormats.isNotEmpty()
+        val isUnresolvedDocumentOrLargeMedia = !hasPrimaryMediaOrFiles && (hasDocumentAttachment || sawMediaTooBigNotice)
+        if (postPhotoUrls.isNotEmpty() && !isUnresolvedDocumentOrLargeMedia) {
+            postPhotoUrls.take(6).forEachIndexed { idx, pUrl ->
+                val pProbe = probeStreamHeaders(pUrl, mediaHeaders)
+                val finalUrl = pProbe?.finalUrl ?: pUrl
+                val mime = pProbe?.contentType?.substringBefore(";")?.trim()
+                    ?.takeIf { it.startsWith("image/", true) }
+                    ?: "image/jpeg"
+                val ext = mimeToExtension(mime.lowercase(Locale.US)).ifBlank { "jpg" }
+                val cl = pProbe?.contentLength ?: -1L
+                fileFormats.add(
+                    MediaFormatOption(
+                        id = "tg_photo_$idx",
+                        qualityLabel = if (postPhotoUrls.size > 1) "Telegram Photo #${idx + 1} (${ext.uppercase(Locale.US)})" else "Telegram Photo (${ext.uppercase(Locale.US)})",
+                        container = ext,
+                        mimeType = mime,
+                        contentLengthBytes = cl,
+                        isEstimatedSize = cl <= 0L,
+                        isAudioOnly = false,
+                        isOriginalBest = fileFormats.isEmpty() && idx == 0,
+                        streamUrl = finalUrl,
+                        requestHeaders = mediaHeaders,
+                        formatCategory = "Photo",
+                        isGenericFile = true,
+                        fileCategoryLabel = "Photo"
+                    )
+                )
+            }
+        }
+
+        if (videoFormats.isNotEmpty() || audioFormats.isNotEmpty() || fileFormats.isNotEmpty()) {
+            return MediaInfo(
+                originalUrl = originalUrl,
+                canonicalUrl = cleanUrl,
+                title = finalTitle,
+                creator = extractedCreator ?: "Telegram",
+                durationSeconds = extractedDurationSec,
+                durationFormatted = if (extractedDurationSec > 0L) formatDurationSeconds(extractedDurationSec) else "Telegram File",
+                thumbnailUrl = extractedThumb,
+                platform = MediaPlatform.TELEGRAM,
+                videoFormats = videoFormats,
+                audioFormats = audioFormats,
+                fileFormats = fileFormats,
+                extractorSource = "Telegram Native Post & File Extractor"
+            )
+        }
+
+        val docDescriptor = listOfNotNull(
+            extractedDocumentName?.let { "\"$it\"" },
+            extractedDocumentSize?.let { "($it)" }
+        ).joinToString(" ")
+
+        val diagnosticReason = when {
+            hasDocumentAttachment ->
+                "Telegram file detected${if (docDescriptor.isNotBlank()) ": $docDescriptor" else ""}. Telegram stores channel documents on encrypted MTProto servers and does not provide direct public t.me HTTP links — tap \"Open in Telegram Web\" below to download it directly into Dragon Download Manager."
+            isPrivateChannelPost ->
+                "This is a private Telegram channel link (t.me/c/...). Tap \"Open in Telegram Web\" below to sign in and download the file directly through Dragon Browser."
+            sawMediaTooBigNotice ->
+                "Telegram's public preview hides direct URLs for media over 20 MB${if (docDescriptor.isNotBlank()) " ($docDescriptor)" else ""}. Tap \"Open in Telegram Web\" below to download it directly into Dragon Download Manager."
+            sawOpenInTelegramNotice ->
+                "Telegram requires an active Telegram Web session to access this post. Tap \"Open in Telegram Web\" below to download the file."
+            else ->
+                "No direct downloadable file was exposed on this Telegram page. Tap \"Open in Telegram Web\" below to download channel files via Telegram Web, or paste a direct Telegram file/CDN link."
+        }
+        throw ExtractorException(DownloaderErrorType.UNSUPPORTED_MEDIA, diagnosticReason)
     }
 
     // =========================================================================

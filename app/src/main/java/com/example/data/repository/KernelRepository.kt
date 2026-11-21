@@ -242,6 +242,10 @@ class KernelRepository private constructor(@Volatile private var context: Contex
                 return defaultM3
             }
 
+            val soothingThemeName = prefs.getString("soothing_theme", SoothingAppTheme.EXPRESSIVE_MATERIAL_YOU.name)
+            val soothingTheme = SoothingAppTheme.entries.find { it.name == soothingThemeName }
+                ?: SoothingAppTheme.EXPRESSIVE_MATERIAL_YOU
+
             val styleName = prefs.getString("notif_style", NotificationPanelStyle.MATERIAL_3_UI.name)
             val notifStyle = NotificationPanelStyle.entries.find { it.name == styleName } ?: NotificationPanelStyle.MATERIAL_3_UI
 
@@ -257,17 +261,18 @@ class KernelRepository private constructor(@Volatile private var context: Contex
             val borderGlow = prefs.getFloat("border_glow", 0.22f)
             val headerGlow = prefs.getFloat("header_glow", 0.10f)
             val cornerRadius = prefs.getInt("corner_radius_dp", 22)
-            val dynamicColor = prefs.getBoolean("use_dynamic_color", false)
+            val dynamicColor = prefs.getBoolean("use_dynamic_color", true)
             val liquidGlass = prefs.getBoolean("is_liquid_glass", false)
             val lgOpacity = prefs.getFloat("liquid_glass_opacity", 0.28f)
             val lgRefraction = prefs.getFloat("liquid_glass_refraction", 0.85f)
             val lgTint = prefs.getString("liquid_glass_tint", "Frosted Ice") ?: "Frosted Ice"
-            val presetName = prefs.getString("active_preset_name", "Material 3 You") ?: "Material 3 You"
+            val presetName = prefs.getString("active_preset_name", soothingTheme.title) ?: soothingTheme.title
             val hapticEnabled = prefs.getBoolean("haptic_feedback_enabled", true)
             val hapticIntensityName = prefs.getString("haptic_intensity", HapticIntensity.BALANCED.name)
             val hapticIntensity = HapticIntensity.entries.find { it.name == hapticIntensityName } ?: HapticIntensity.BALANCED
 
             ThemeCustomizationConfig(
+                soothingTheme = soothingTheme,
                 primaryAccentIndex = primaryAccent,
                 secondaryAccentIndex = secondaryAccent,
                 surfaceMode = surfaceMode,
@@ -298,6 +303,7 @@ class KernelRepository private constructor(@Volatile private var context: Contex
             val prefs = context.getSharedPreferences("dragon_theme_style_prefs", Context.MODE_PRIVATE)
             prefs.edit()
                 .putInt("theme_schema_version", 2)
+                .putString("soothing_theme", config.soothingTheme.name)
                 .putString("notif_style", config.notificationPanelStyle.name)
                 .putInt("primary_accent_index", config.primaryAccentIndex)
                 .putInt("secondary_accent_index", config.secondaryAccentIndex)
@@ -7076,6 +7082,22 @@ class KernelRepository private constructor(@Volatile private var context: Contex
                 activePresetName = if (enabled) "Material You Dynamic" else "Custom Tuned"
             )
         }
+    }
+
+    fun setSoothingAppTheme(theme: SoothingAppTheme) {
+        _isAmoledBlackFlow.value = false
+        updateThemeConfig {
+            it.copy(
+                soothingTheme = theme,
+                surfaceMode = SurfaceThemeMode.MATERIAL_3,
+                isLiquidGlassEnabled = false,
+                useCustomPrimaryColor = false,
+                useDynamicColor = if (theme.supportsDynamicColor) it.useDynamicColor else false,
+                cornerRadiusDp = theme.defaultCornerRadiusDp,
+                activePresetName = theme.title
+            )
+        }
+        _lastActionFeedbackFlow.value = "Theme: ${theme.title}"
     }
 
     fun setNotificationPanelStyle(style: com.example.data.model.NotificationPanelStyle) {
