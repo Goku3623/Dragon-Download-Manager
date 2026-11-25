@@ -11,6 +11,8 @@
 ⚡ _Advanced Browser With ::
 DNS, Extension, YT Background Video Playback , Proxy, Media Grabber._
 
+⚡ _File Manager_
+
 
 <img width="1220" height="2605" alt="Screenshot_20261121-225830_Dragon Download Manager" src="https://github.com/user-attachments/assets/57796ce4-f273-4eea-a794-acfa6d6b8d13" />
 <img width="1220" height="2608" alt="Screenshot_20261121-225853_Dragon Download Manager" src="https://github.com/user-attachments/assets/48c25efc-27f7-4066-9024-6c75497226e5" />
