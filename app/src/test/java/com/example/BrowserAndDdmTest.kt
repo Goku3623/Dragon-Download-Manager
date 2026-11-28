@@ -290,10 +290,10 @@ class BrowserAndDdmTest {
         assertEquals("104.16.132.229", parsed.first[0].hostAddress)
         assertEquals(180L, parsed.second)
 
-        // Verify non-blocking prewarmHostAsync, package name com.android.ddm & App Version 2.3
+        // Verify non-blocking prewarmHostAsync, package name com.android.ddm & App Version 4.0
         dm.warpDns.prewarmHostAsync("www.google.com")
-        assertEquals("2.3", BuildConfig.VERSION_NAME)
-        assertEquals(23, BuildConfig.VERSION_CODE)
+        assertEquals("4.0", BuildConfig.VERSION_NAME)
+        assertEquals(40, BuildConfig.VERSION_CODE)
         assertEquals("com.android.ddm", BuildConfig.APPLICATION_ID)
     }
 
@@ -1584,6 +1584,78 @@ class BrowserAndDdmTest {
         assertTrue(reloaded.mediaGrabberEnabledFlow.value)
         reloaded.recordGrabbedMedia(reloaded.getActiveTab().id, videoHit)
         assertEquals(1, reloaded.grabbedMediaByTabFlow.value[reloaded.getActiveTab().id]?.size)
+    }
+
+    @Test
+    fun `streaming link grabber and file grabber toggles operate and persist independently`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val repo = com.example.data.browser.BrowserStateRepository(context)
+        val tab = repo.getActiveTab()
+
+        val hlsStream = com.example.data.browser.GrabbedMediaCandidate(
+            url = "https://stream.example.com/live/master.m3u8",
+            title = "Live Stream Master",
+            kind = com.example.data.browser.GrabbedMediaKind.VIDEO,
+            containerExt = "m3u8",
+            sourceLabel = "stream.example.com",
+            mimeType = "application/vnd.apple.mpegurl"
+        )
+        val archiveFile = com.example.data.browser.GrabbedMediaCandidate(
+            url = "https://files.example.com/release_v2.zip",
+            title = "release_v2.zip",
+            kind = com.example.data.browser.GrabbedMediaKind.FILE,
+            containerExt = "zip",
+            sourceLabel = "files.example.com",
+            mimeType = "application/zip"
+        )
+        val audioFile = com.example.data.browser.GrabbedMediaCandidate(
+            url = "https://cdn.example.com/podcast.mp3",
+            title = "podcast.mp3",
+            kind = com.example.data.browser.GrabbedMediaKind.AUDIO,
+            containerExt = "mp3",
+            sourceLabel = "cdn.example.com",
+            mimeType = "audio/mpeg"
+        )
+
+        // 1. Streaming Link Grabber ON, File Grabber OFF -> only video streaming links grabbed
+        repo.clearGrabbedMediaForTab(tab.id)
+        repo.setStreamingLinkGrabberEnabled(true)
+        repo.setFileGrabberEnabled(false)
+        assertTrue(repo.streamingLinkGrabberEnabledFlow.value)
+        assertFalse(repo.fileGrabberEnabledFlow.value)
+        assertTrue(repo.mediaGrabberEnabledFlow.value)
+
+        repo.recordGrabbedMedia(tab.id, hlsStream)
+        repo.recordGrabbedMedia(tab.id, archiveFile)
+        repo.recordGrabbedMedia(tab.id, audioFile)
+        val streamOnlyItems = repo.grabbedMediaByTabFlow.value[tab.id].orEmpty()
+        assertEquals(1, streamOnlyItems.size)
+        assertEquals(hlsStream.url, streamOnlyItems.first().url)
+
+        // 2. Streaming Link Grabber OFF, File Grabber ON -> pure stream manifests pruned & blocked, files grabbed
+        repo.setStreamingLinkGrabberEnabled(false)
+        repo.setFileGrabberEnabled(true)
+        assertFalse(repo.streamingLinkGrabberEnabledFlow.value)
+        assertTrue(repo.fileGrabberEnabledFlow.value)
+        assertTrue(repo.mediaGrabberEnabledFlow.value)
+        assertTrue(repo.grabbedMediaByTabFlow.value[tab.id].isNullOrEmpty())
+
+        repo.recordGrabbedMedia(tab.id, hlsStream)
+        repo.recordGrabbedMedia(tab.id, archiveFile)
+        repo.recordGrabbedMedia(tab.id, audioFile)
+        val fileOnlyItems = repo.grabbedMediaByTabFlow.value[tab.id].orEmpty()
+        assertEquals(2, fileOnlyItems.size)
+        assertTrue(fileOnlyItems.any { it.url == archiveFile.url })
+        assertTrue(fileOnlyItems.any { it.url == audioFile.url })
+
+        // 3. Independent states persist across repository reload
+        val reloaded = com.example.data.browser.BrowserStateRepository(context)
+        assertFalse(reloaded.streamingLinkGrabberEnabledFlow.value)
+        assertTrue(reloaded.fileGrabberEnabledFlow.value)
+
+        // Restore both to true
+        reloaded.setStreamingLinkGrabberEnabled(true)
+        reloaded.setFileGrabberEnabled(true)
     }
 
     @Test
@@ -3237,6 +3309,399 @@ class BrowserAndDdmTest {
         assertFalse(com.example.data.downloader.CloudflareWarpDns.isKnownAdOrTrackerDomain("track.ups.com"))
         assertTrue(com.example.data.downloader.CloudflareWarpDns.isKnownAdOrTrackerDomain("doubleclick.net"))
         assertTrue(com.example.data.downloader.CloudflareWarpDns.isKnownAdOrTrackerDomain("adservice.google.com"))
+    }
+
+    @Test
+    fun `package summary downgrade detection and cancelled or failed install notifications report accurate status`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        org.robolectric.Shadows.shadowOf(app).grantPermissions(android.Manifest.permission.POST_NOTIFICATIONS)
+        val notifManager = app.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val shadowNotifManager = org.robolectric.Shadows.shadowOf(notifManager)
+
+        // 1. ApkPackageSummary classifies Install, Update, Downgrade & Signed vs Unsigned accurately
+        val freshInstallSummary = com.example.data.downloader.ApkPackageInstaller.ApkPackageSummary(
+            taskId = "t_install",
+            formatBadge = "APK",
+            isSplitBundle = false,
+            packageName = "com.demo.app",
+            appLabel = "Demo App",
+            versionName = "1.0.0",
+            versionCode = 10L,
+            isUnsigned = true,
+            isAlreadyInstalled = false
+        )
+        assertFalse(freshInstallSummary.isDowngrade)
+        assertEquals("Install", freshInstallSummary.shortActionText)
+        assertEquals("Install APK", freshInstallSummary.fullActionText)
+        assertTrue(freshInstallSummary.statusSummary.contains("Unsigned (Auto-Sign Ready)"))
+
+        val updateSummary = freshInstallSummary.copy(
+            taskId = "t_update",
+            formatBadge = "APKS",
+            isSplitBundle = true,
+            versionName = "2.0.0",
+            versionCode = 20L,
+            isUnsigned = false,
+            isAlreadyInstalled = true,
+            installedVersionName = "1.0.0",
+            installedVersionCode = 10L
+        )
+        assertFalse(updateSummary.isDowngrade)
+        assertTrue(updateSummary.isUpdate)
+        assertEquals("Update", updateSummary.shortActionText)
+        assertEquals("Update APKS", updateSummary.fullActionText)
+        assertTrue(updateSummary.statusSummary.contains("Signed"))
+
+        val downgradeSummary = updateSummary.copy(
+            taskId = "t_downgrade",
+            formatBadge = "XAPK",
+            versionName = "1.5.0",
+            versionCode = 15L,
+            installedVersionName = "2.0.0",
+            installedVersionCode = 20L
+        )
+        assertTrue(downgradeSummary.isDowngrade)
+        assertFalse(downgradeSummary.isUpdate)
+        assertEquals("Downgrade", downgradeSummary.shortActionText)
+        assertEquals("Downgrade XAPK", downgradeSummary.fullActionText)
+        assertTrue(downgradeSummary.statusSummary.contains("Downgrade"))
+
+        // 2. Persistent auto-signer certificate bytes can be loaded cleanly
+        val certBytes = com.example.data.downloader.ApkAutoSigner.getSignerCertificateBytes(app)
+        assertTrue("Expected non-empty DER certificate bytes", certBytes.size > 100)
+
+        // 3. Cancelled installation shows CANCELLED badge & 0% progress (NEVER 100%)
+        val receiver = com.example.receiver.ApkInstallerReceiver()
+        val fmTaskCancel = com.example.data.filemanager.DragonFileManagerTaskEngine.allocatePackageInstallTaskId()
+        com.example.data.filemanager.DragonFileManagerTaskEngine.beginPackageInstallTask(
+            context = app,
+            taskId = fmTaskCancel,
+            title = "Staging APK",
+            subtitle = "Preparing demo.apk",
+            currentFileName = "demo.apk",
+            totalBytes = 1024L
+        )
+        receiver.onReceive(
+            app,
+            android.content.Intent(com.example.receiver.ApkInstallerReceiver.ACTION_PACKAGE_INSTALL_STATUS).apply {
+                putExtra(android.content.pm.PackageInstaller.EXTRA_STATUS, android.content.pm.PackageInstaller.STATUS_FAILURE_ABORTED)
+                putExtra(com.example.receiver.ApkInstallerReceiver.EXTRA_TASK_ID, "t_cancel")
+                putExtra(com.example.receiver.ApkInstallerReceiver.EXTRA_FM_TASK_ID, fmTaskCancel)
+                putExtra(com.example.receiver.ApkInstallerReceiver.EXTRA_FILENAME, "demo.apk")
+            }
+        )
+        val cancelNotif = shadowNotifManager.getNotification(
+            com.example.data.filemanager.DragonFileManagerTaskEngine.NOTIFICATION_ID_FILE_MANAGER_TASK
+        )
+        assertTrue(cancelNotif != null)
+        val cancelCollapsed = cancelNotif!!.contentView.apply(app, android.widget.FrameLayout(app))
+        val cancelExpanded = cancelNotif.bigContentView.apply(app, android.widget.FrameLayout(app))
+        assertEquals(0, cancelCollapsed.findViewById<android.widget.ProgressBar>(R.id.pb_dl_collapsed).progress)
+        assertEquals(0, cancelExpanded.findViewById<android.widget.ProgressBar>(R.id.pb_dl_expanded).progress)
+        assertEquals("CANCELLED", cancelExpanded.findViewById<android.widget.TextView>(R.id.tv_dl_hud_badge).text.toString())
+
+        // 4. Failed installation shows FAILED badge & 0% progress (NEVER 100%)
+        val fmTaskFail = com.example.data.filemanager.DragonFileManagerTaskEngine.allocatePackageInstallTaskId()
+        com.example.data.filemanager.DragonFileManagerTaskEngine.beginPackageInstallTask(
+            context = app,
+            taskId = fmTaskFail,
+            title = "Staging APK",
+            subtitle = "Preparing broken.apk",
+            currentFileName = "broken.apk",
+            totalBytes = 1024L
+        )
+        receiver.onReceive(
+            app,
+            android.content.Intent(com.example.receiver.ApkInstallerReceiver.ACTION_PACKAGE_INSTALL_STATUS).apply {
+                putExtra(android.content.pm.PackageInstaller.EXTRA_STATUS, android.content.pm.PackageInstaller.STATUS_FAILURE_STORAGE)
+                putExtra(com.example.receiver.ApkInstallerReceiver.EXTRA_TASK_ID, "t_fail")
+                putExtra(com.example.receiver.ApkInstallerReceiver.EXTRA_FM_TASK_ID, fmTaskFail)
+                putExtra(com.example.receiver.ApkInstallerReceiver.EXTRA_FILENAME, "broken.apk")
+            }
+        )
+        val failNotif = shadowNotifManager.getNotification(
+            com.example.data.filemanager.DragonFileManagerTaskEngine.NOTIFICATION_ID_FILE_MANAGER_TASK
+        )
+        assertTrue(failNotif != null)
+        val failCollapsed = failNotif!!.contentView.apply(app, android.widget.FrameLayout(app))
+        val failExpanded = failNotif.bigContentView.apply(app, android.widget.FrameLayout(app))
+        assertEquals(0, failCollapsed.findViewById<android.widget.ProgressBar>(R.id.pb_dl_collapsed).progress)
+        assertEquals(0, failExpanded.findViewById<android.widget.ProgressBar>(R.id.pb_dl_expanded).progress)
+        assertEquals("FAILED", failExpanded.findViewById<android.widget.TextView>(R.id.tv_dl_hud_badge).text.toString())
+
+        // 5. Completed installation shows 100% progress & checkmark badge
+        val fmTaskDone = com.example.data.filemanager.DragonFileManagerTaskEngine.allocatePackageInstallTaskId()
+        com.example.data.filemanager.DragonFileManagerTaskEngine.beginPackageInstallTask(
+            context = app,
+            taskId = fmTaskDone,
+            title = "Staging APK",
+            subtitle = "Preparing good.apk",
+            currentFileName = "good.apk",
+            totalBytes = 1024L
+        )
+        receiver.onReceive(
+            app,
+            android.content.Intent(com.example.receiver.ApkInstallerReceiver.ACTION_PACKAGE_INSTALL_STATUS).apply {
+                putExtra(android.content.pm.PackageInstaller.EXTRA_STATUS, android.content.pm.PackageInstaller.STATUS_SUCCESS)
+                putExtra(com.example.receiver.ApkInstallerReceiver.EXTRA_TASK_ID, "t_done")
+                putExtra(com.example.receiver.ApkInstallerReceiver.EXTRA_FM_TASK_ID, fmTaskDone)
+                putExtra(com.example.receiver.ApkInstallerReceiver.EXTRA_FILENAME, "good.apk")
+            }
+        )
+        val doneNotif = shadowNotifManager.getNotification(
+            com.example.data.filemanager.DragonFileManagerTaskEngine.NOTIFICATION_ID_FILE_MANAGER_TASK
+        )
+        assertTrue(doneNotif != null)
+        val doneExpanded = doneNotif!!.bigContentView.apply(app, android.widget.FrameLayout(app))
+        assertEquals(100, doneExpanded.findViewById<android.widget.ProgressBar>(R.id.pb_dl_expanded).progress)
+        assertTrue(doneExpanded.findViewById<android.widget.TextView>(R.id.tv_dl_hud_badge).text.toString().contains("100%"))
+    }
+
+    @Test
+    fun `browser open tabs persist across exit and reopen without closing automatically`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        context.getSharedPreferences("dragon_browser_state", Context.MODE_PRIVATE)
+            .edit().clear().commit()
+
+        val repo1 = BrowserStateRepository(context)
+        val firstTabId = repo1.getActiveTab().id
+        repo1.updateTabState(firstTabId) {
+            it.copy(url = "https://kotlinlang.org/docs/", title = "Kotlin Docs", desktopMode = true)
+        }
+        val tab2 = repo1.openNewTab("https://developer.android.com/compose", isIncognito = false)
+        repo1.updateTabState(tab2.id) { it.copy(title = "Compose") }
+        val tab3 = repo1.openNewTab("https://example.org/private", isIncognito = true)
+        repo1.updateTabState(tab3.id) { it.copy(title = "Private Example") }
+        repo1.selectTab(tab2.id)
+        repo1.persistTabsNow()
+
+        val repo2 = BrowserStateRepository(context)
+        assertEquals(3, repo2.tabsFlow.value.size)
+        assertEquals(tab2.id, repo2.activeTabIdFlow.value)
+        assertEquals("https://kotlinlang.org/docs/", repo2.tabsFlow.value[0].url)
+        assertTrue(repo2.tabsFlow.value[0].desktopMode)
+        assertEquals("https://developer.android.com/compose", repo2.tabsFlow.value[1].url)
+        assertEquals("https://example.org/private", repo2.tabsFlow.value[2].url)
+        assertTrue(repo2.tabsFlow.value[2].isIncognito)
+    }
+
+    @Test
+    fun `webViewRendererGuard handles renderer crash cleanly and cache controller preserves chromium dirs`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        com.example.data.browser.WebViewRendererGuard.clearCrashTrackerForTests()
+        com.example.data.browser.BackgroundMediaWebViewStore.stopAndReleaseAll()
+
+        val parent = android.widget.FrameLayout(context)
+        val wv = android.webkit.WebView(context)
+        parent.addView(wv)
+        assertEquals(1, parent.childCount)
+
+        var recoveryCount = 0
+        var lastAutoReload: Boolean? = null
+        val handledFirst = com.example.data.browser.WebViewRendererGuard.handleRenderProcessGone(
+            view = wv,
+            detail = null,
+            trackerKey = "tab_crash_test"
+        ) { shouldAutoReload ->
+            recoveryCount++
+            lastAutoReload = shouldAutoReload
+        }
+        assertTrue(handledFirst)
+        assertEquals(1, recoveryCount)
+        assertEquals(true, lastAutoReload)
+        assertEquals(0, parent.childCount)
+        assertTrue(com.example.data.browser.WebViewRendererGuard.isDestroyed(wv))
+
+        // Second rapid crash within window disables automatic reload loop while still handling cleanly
+        val wv2 = android.webkit.WebView(context)
+        val handledSecond = com.example.data.browser.WebViewRendererGuard.handleRenderProcessGone(
+            view = wv2,
+            detail = null,
+            trackerKey = "tab_crash_test"
+        ) { shouldAutoReload ->
+            recoveryCount++
+            lastAutoReload = shouldAutoReload
+        }
+        assertTrue(handledSecond)
+        assertEquals(2, recoveryCount)
+        assertEquals(false, lastAutoReload)
+
+        // Manual reload resets crash history
+        com.example.data.browser.WebViewRendererGuard.resetCrashHistory("tab_crash_test")
+        assertTrue(
+            com.example.data.browser.WebViewRendererGuard.recordCrashAndShouldAutoReload(
+                "tab_crash_test",
+                didCrash = false
+            )
+        )
+
+        // Smart cache controller must NEVER delete Chromium WebView internal cache/shader/code cache dirs
+        assertTrue(com.example.data.cache.DragonSmartCacheController.isChromiumInternalCacheDir("WebView"))
+        assertTrue(com.example.data.cache.DragonSmartCacheController.isChromiumInternalCacheDir("org.chromium.android_webview"))
+        assertTrue(com.example.data.cache.DragonSmartCacheController.isChromiumInternalCacheDir("ShaderCache"))
+        assertTrue(com.example.data.cache.DragonSmartCacheController.isChromiumInternalCacheDir("GrShaderCache"))
+        assertTrue(com.example.data.cache.DragonSmartCacheController.isChromiumInternalCacheDir("Code Cache"))
+        assertFalse(com.example.data.cache.DragonSmartCacheController.isChromiumInternalCacheDir("apk_installer_staging"))
+
+        val webViewInternalDir = java.io.File(context.cacheDir, "WebView/Default/HTTP Cache").apply { mkdirs() }
+        val liveChromiumIndex = java.io.File(webViewInternalDir, "index").apply {
+            writeBytes(ByteArray(128) { 7 })
+        }
+        val disposableStagingDir = java.io.File(context.cacheDir, "archive_preview_cache").apply { mkdirs() }
+        val stalePreviewFile = java.io.File(disposableStagingDir, "old_preview.bin").apply {
+            writeBytes(ByteArray(2048) { 1 })
+        }
+
+        com.example.data.cache.DragonSmartCacheController.performSmartCacheMaintenanceSync(
+            context = context,
+            tasks = emptyList(),
+            aggressive = true
+        )
+
+        assertTrue("Chromium live WebView cache must remain intact", liveChromiumIndex.exists())
+        assertFalse("Stale app staging preview must be cleaned", stalePreviewFile.exists())
+    }
+
+    @Test
+    fun `private vault encrypts files with password protection and idm downloader preserves chunks across connection step-downs`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vault = com.example.data.filemanager.DragonPrivateVaultManager
+
+        // 1. Setup vault password & verify lock/unlock
+        assertTrue(vault.setupPassword(context, "Dragon#2026", hint = "Mythical creature"))
+        assertTrue(vault.isPasswordConfigured(context))
+        assertEquals("Mythical creature", vault.getPasswordHint(context))
+
+        vault.lockVault(context)
+        assertFalse(vault.isVaultUnlockedFlow.value)
+        assertFalse("Wrong password must be rejected", vault.unlockVault(context, "WrongPass"))
+        assertFalse(vault.isVaultUnlockedFlow.value)
+        assertTrue("Correct password must unlock vault", vault.unlockVault(context, "Dragon#2026"))
+        assertTrue(vault.isVaultUnlockedFlow.value)
+
+        // 2. Move a sensitive file into Private Vault
+        val sourceDir = java.io.File(context.cacheDir, "vault_test_src").apply { mkdirs() }
+        val secretPlaintext = "TOP_SECRET_PRIVATE_VAULT_PAYLOAD_9876543210_DRAGON_DDM"
+        val secretFile = java.io.File(sourceDir, "confidential_notes.txt").apply {
+            writeText(secretPlaintext, Charsets.UTF_8)
+        }
+
+        val entry = vault.moveToVault(context, secretFile)
+        assertTrue("File must move into Private Vault", entry != null)
+        assertFalse("Original unencrypted file must be deleted from public folder", secretFile.exists())
+        assertTrue("Encrypted payload file must exist in vault", entry!!.payloadFile.exists())
+
+        val rawEncryptedBytes = entry.payloadFile.readBytes()
+        val rawEncryptedText = String(rawEncryptedBytes, Charsets.ISO_8859_1)
+        assertTrue("Encrypted payload must start with DVAULT01 header", rawEncryptedText.startsWith("DVAULT01"))
+        assertFalse("Encrypted payload on disk must NOT contain plaintext content", rawEncryptedText.contains("TOP_SECRET_PRIVATE_VAULT_PAYLOAD"))
+
+        // 3. Preview decrypted file while unlocked
+        val previewFile = vault.decryptToPreviewTempFile(context, entry)
+        assertTrue(previewFile != null && previewFile.exists())
+        assertEquals(secretPlaintext, previewFile!!.readText(Charsets.UTF_8))
+
+        // 4. Change vault password in O(1) and verify existing encrypted item is still accessible
+        assertFalse(vault.changePassword(context, "BadOldPass", "NewVault#999"))
+        assertTrue(vault.changePassword(context, "Dragon#2026", "NewVault#999", newHint = "999"))
+        vault.lockVault(context)
+        assertFalse(vault.unlockVault(context, "Dragon#2026"))
+        assertTrue(vault.unlockVault(context, "NewVault#999"))
+
+        // 5. Restore file from Private Vault back to original path
+        val restoreOutcome = vault.restoreFromVault(context, listOf(entry))
+        assertEquals(1, restoreOutcome.restoredCount)
+        assertTrue("Original file must be restored to original path", secretFile.exists())
+        assertEquals(secretPlaintext, secretFile.readText(Charsets.UTF_8))
+        assertFalse("Encrypted vault payload must be removed after restore", entry.payloadFile.exists())
+
+        // 6. Verify IDM chunk count preservation across connection step-down & smart retry headers
+        val chunkWorkDir = java.io.File(context.cacheDir, "idm_meta_test").apply { mkdirs() }
+        val metaFile = java.io.File(chunkWorkDir, "segments.meta")
+        metaFile.writeText(com.example.data.downloader.IdmAcceleratedDownloader.buildSegmentMeta(104857600L, 48, "https://cdn.example.com/file.bin?token=old"))
+
+        // Same file size with refreshed CDN token or stepped-down connection count preserves existing 48 micro-chunks
+        assertEquals(
+            48,
+            com.example.data.downloader.IdmAcceleratedDownloader.parseSavedChunkCountIfCompatible(metaFile, 104857600L)
+        )
+        // Different file size invalidates incompatible chunk metadata
+        assertEquals(
+            null,
+            com.example.data.downloader.IdmAcceleratedDownloader.parseSavedChunkCountIfCompatible(metaFile, 999999L)
+        )
+
+        val reqBuilder = okhttp3.Request.Builder().url("https://cdn.example.com/video/part1.mp4")
+        com.example.data.downloader.IdmAcceleratedDownloader.applySmartRequestHeaders(
+            url = "https://cdn.example.com/video/part1.mp4",
+            headers = emptyMap(),
+            attempt = 2,
+            reqBuilder = reqBuilder
+        )
+        val builtReq = reqBuilder.build()
+        assertEquals("https://cdn.example.com/", builtReq.header("Referer"))
+        assertTrue(!builtReq.header("User-Agent").isNullOrBlank())
+    }
+
+    @Test
+    fun `file manager provides full internal storage access with and without root access`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val bridge = com.example.data.filemanager.AndroidDataObbBridge
+
+        // 1. Verify internal storage root path detection & standard folder discovery without root
+        val extRoot = bridge.getExternalStorageRoot()
+        assertTrue(bridge.isInternalStorageRootPath(extRoot.absolutePath))
+        assertTrue(bridge.isInternalStoragePath(java.io.File(extRoot, "Download").absolutePath))
+        assertTrue(bridge.isAndroidDataOrObbPath(java.io.File(extRoot, "Android/data/com.example").absolutePath))
+
+        // 2. Listing internal storage root without root always surfaces standard folders (Download, DDM, DCIM, Android, etc.)
+        bridge.isRootFileManagerEnabled = false
+        val rootEntries = bridge.listEntriesInDirectory(extRoot, context)
+        val rootNames = rootEntries.map { it.name }.toSet()
+        assertTrue("Internal storage root must include Download", "Download" in rootNames)
+        assertTrue("Internal storage root must include DDM", "DDM" in rootNames)
+        assertTrue("Internal storage root must include DCIM", "DCIM" in rootNames)
+        assertTrue("Internal storage root must include Android", "Android" in rootNames)
+
+        // 3. Listing /storage/emulated/0/Android without root always includes data, obb, and media
+        val androidEntries = bridge.listEntriesInDirectory(bridge.getAndroidDir(), context)
+        val androidNames = androidEntries.map { it.name }.toSet()
+        assertTrue("Android folder must expose data", "data" in androidNames)
+        assertTrue("Android folder must expose obb", "obb" in androidNames)
+        assertTrue("Android folder must expose media", "media" in androidNames)
+
+        // 4. Verify non-root CRUD operations (create folder, create file, write/read streams, copy, rename, delete)
+        val testSandbox = java.io.File(context.cacheDir, "non_root_storage_crud_${System.nanoTime()}")
+        assertTrue(bridge.createDirectory(context, testSandbox))
+        assertTrue(bridge.existsUniversal(context, testSandbox))
+        assertTrue(bridge.isDirectoryUniversal(context, testSandbox))
+
+        val sampleFile = java.io.File(testSandbox, "alpha.txt")
+        assertTrue(bridge.createEmptyFile(context, sampleFile))
+        bridge.openOutputStreamForFile(context, sampleFile, "text/plain")!!.use { out ->
+            out.write("FULL_INTERNAL_STORAGE_ACCESS_OK".toByteArray(Charsets.UTF_8))
+        }
+        val readBack = bridge.openInputStreamForFile(context, sampleFile)!!.use { inp ->
+            inp.readBytes().toString(Charsets.UTF_8)
+        }
+        assertEquals("FULL_INTERNAL_STORAGE_ACCESS_OK", readBack)
+
+        val copiedFile = java.io.File(testSandbox, "alpha_copy.txt")
+        assertTrue(bridge.copyFileOrDirectoryUniversal(context, sampleFile, copiedFile))
+        assertEquals("FULL_INTERNAL_STORAGE_ACCESS_OK", copiedFile.readText(Charsets.UTF_8))
+
+        assertTrue(bridge.renameFileOrDirectory(context, copiedFile, "alpha_renamed.txt"))
+        val renamedFile = java.io.File(testSandbox, "alpha_renamed.txt")
+        assertTrue(bridge.existsUniversal(context, renamedFile))
+
+        assertTrue(bridge.deleteFileOrDirectory(context, testSandbox))
+        assertFalse(testSandbox.exists())
+
+        // 5. Verify All Files Access & SAF DocumentTree intent builders for non-root devices
+        val allFilesIntent = bridge.buildManageAllFilesAccessIntent(context)
+        assertTrue(!allFilesIntent.action.isNullOrBlank())
+        val safIntent = bridge.buildSafDocumentTreeIntent(bridge.getAndroidDataDir())
+        assertEquals(android.content.Intent.ACTION_OPEN_DOCUMENT_TREE, safIntent.action)
     }
 
     private fun readLineIso(inp: java.io.InputStream): String {

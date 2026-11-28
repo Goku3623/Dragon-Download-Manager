@@ -20,6 +20,8 @@ class DragonKernelApp : Application() {
         instance = this
         createNotificationChannels()
         appInitScope.launch {
+            runCatching { com.example.data.filemanager.DragonFileManagerTaskEngine.ensurePreferencesLoaded(this@DragonKernelApp) }
+            runCatching { com.example.data.repository.KernelRepository.getInstance(this@DragonKernelApp) }
             runCatching { DragonDatabase.getInstance(this@DragonKernelApp) }
             try {
                 val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager

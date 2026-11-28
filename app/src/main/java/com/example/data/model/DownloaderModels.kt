@@ -74,8 +74,9 @@ enum class MediaPlatform(
         )
         val DOCUMENT_EXTENSIONS = setOf(
             ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-            ".txt", ".csv", ".rtf", ".odt", ".ods", ".odp", ".md",
-            ".epub", ".mobi", ".azw3", ".json", ".xml", ".html", ".htm"
+            ".txt", ".csv", ".tsv", ".rtf", ".odt", ".ods", ".odp", ".md",
+            ".epub", ".mobi", ".azw3", ".json", ".xml", ".html", ".htm",
+            ".sav", ".ini", ".cfg", ".conf", ".log", ".yaml", ".yml", ".toml", ".properties", ".prop"
         )
         val IMAGE_EXTENSIONS = setOf(
             ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp", ".ico",

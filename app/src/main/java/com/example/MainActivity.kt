@@ -27,6 +27,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -38,6 +41,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
@@ -57,15 +61,94 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
+    companion object {
+        const val ACTION_OPEN_DRAGON_ARCHIVER = "com.example.dragon.ACTION_OPEN_DRAGON_ARCHIVER"
+        const val ACTION_OPEN_DRAGON_BROWSER = "com.example.dragon.ACTION_OPEN_DRAGON_BROWSER"
+        const val ROUTE_DOWNLOADER = "DOWNLOADER"
+        const val ROUTE_BROWSER = "BROWSER"
+        const val ROUTE_FILE_MANAGER = "FILE_MANAGER"
+
+        private val routeSequence = java.util.concurrent.atomic.AtomicInteger(0)
+        private val pendingLaunchRouteFlow = kotlinx.coroutines.flow.MutableStateFlow<Pair<Int, String>?>(null)
+        private val closeEmbeddedBrowserSeqFlow = kotlinx.coroutines.flow.MutableStateFlow(0)
+
+        fun requestLaunchRoute(route: String) {
+            pendingLaunchRouteFlow.value = routeSequence.incrementAndGet() to route
+        }
+
+        fun requestCloseEmbeddedBrowser() {
+            closeEmbeddedBrowserSeqFlow.value = routeSequence.incrementAndGet()
+        }
+    }
+
     private val repository by lazy { KernelRepository.getInstance(applicationContext) }
 
     private val openDownloaderSignal = kotlinx.coroutines.flow.MutableStateFlow(0)
     private val openBrowserSignal = kotlinx.coroutines.flow.MutableStateFlow(0)
+    private val openFileManagerSignal = kotlinx.coroutines.flow.MutableStateFlow(0)
 
     private val pipActionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == com.example.data.browser.BrowserPipController.ACTION_PIP_TOGGLE_PLAY) {
                 com.example.data.browser.BrowserPipController.dispatchTogglePlayPause()
+            }
+        }
+    }
+
+    private fun handleLaunchIntent(incomingIntent: Intent?) {
+        val targetIntent = incomingIntent ?: return
+        val openDownloader = targetIntent.getBooleanExtra(
+            com.example.receiver.DownloadNotificationReceiver.EXTRA_OPEN_DOWNLOADER_TAB,
+            false
+        )
+        val openBrowser = targetIntent.action == ACTION_OPEN_DRAGON_BROWSER ||
+            targetIntent.getBooleanExtra(
+                com.example.service.DragonMediaPlaybackService.EXTRA_OPEN_BROWSER_TAB,
+                false
+            )
+        val openFileManager = targetIntent.action == ACTION_OPEN_DRAGON_ARCHIVER ||
+            targetIntent.getBooleanExtra(
+                com.example.data.filemanager.DragonFileManagerTaskEngine.EXTRA_OPEN_FILE_MANAGER_TAB,
+                false
+            )
+
+        if (targetIntent.action == Intent.ACTION_VIEW) {
+            val viewUri = targetIntent.data
+            val viewMime = targetIntent.type ?: viewUri?.let { contentResolver.getType(it) }
+            if (viewUri != null && com.example.data.audio.DragonAudioPlayerEngine.isAudioMimeOrName(viewMime, viewUri.lastPathSegment)) {
+                com.example.data.audio.DragonAudioPlayerEngine.playUri(applicationContext, viewUri)
+                targetIntent.action = null
+                return
+            }
+        }
+
+        when {
+            openDownloader -> {
+                targetIntent.removeExtra(com.example.receiver.DownloadNotificationReceiver.EXTRA_OPEN_DOWNLOADER_TAB)
+                openDownloaderSignal.value += 1
+                requestLaunchRoute(ROUTE_DOWNLOADER)
+            }
+            openBrowser -> {
+                targetIntent.removeExtra(com.example.service.DragonMediaPlaybackService.EXTRA_OPEN_BROWSER_TAB)
+                targetIntent.getStringExtra(com.example.service.DragonFloatingBrowserService.EXTRA_INITIAL_URL)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { targetUrl ->
+                        repository.browserRepository.openNewTab(initialUrl = targetUrl)
+                        targetIntent.removeExtra(com.example.service.DragonFloatingBrowserService.EXTRA_INITIAL_URL)
+                    }
+                openBrowserSignal.value += 1
+                requestLaunchRoute(ROUTE_BROWSER)
+            }
+            openFileManager -> {
+                targetIntent.removeExtra(com.example.data.filemanager.DragonFileManagerTaskEngine.EXTRA_OPEN_FILE_MANAGER_TAB)
+                targetIntent.getStringExtra(com.example.service.DragonFloatingArchiverService.EXTRA_INITIAL_PATH)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let {
+                        com.example.data.filemanager.DragonFileManagerTaskEngine.savedCurrentDir = java.io.File(it)
+                        targetIntent.removeExtra(com.example.service.DragonFloatingArchiverService.EXTRA_INITIAL_PATH)
+                    }
+                openFileManagerSignal.value += 1
+                requestLaunchRoute(ROUTE_FILE_MANAGER)
             }
         }
     }
@@ -82,11 +165,7 @@ class MainActivity : ComponentActivity() {
                 ContextCompat.RECEIVER_NOT_EXPORTED
             )
         }
-        if (intent?.getBooleanExtra(com.example.receiver.DownloadNotificationReceiver.EXTRA_OPEN_DOWNLOADER_TAB, false) == true) {
-            openDownloaderSignal.value += 1
-        } else if (intent?.getBooleanExtra(com.example.service.DragonMediaPlaybackService.EXTRA_OPEN_BROWSER_TAB, false) == true) {
-            openBrowserSignal.value += 1
-        }
+        handleLaunchIntent(intent)
 
         setContent {
             val accentIndex by repository.accentColorIndexFlow.collectAsState()
@@ -94,6 +173,9 @@ class MainActivity : ComponentActivity() {
             val themeConfig by repository.themeConfigFlow.collectAsState()
             val downloaderNavTrigger by openDownloaderSignal.collectAsState()
             val browserNavTrigger by openBrowserSignal.collectAsState()
+            val fileManagerNavTrigger by openFileManagerSignal.collectAsState()
+            val pendingLaunchRoute by pendingLaunchRouteFlow.collectAsState()
+            val closeEmbeddedBrowserSeq by closeEmbeddedBrowserSeqFlow.collectAsState()
 
             val isLightTheme = themeConfig.soothingTheme.isLight
             val view = LocalView.current
@@ -147,7 +229,15 @@ class MainActivity : ComponentActivity() {
                 DragonDownloadManagerMainScreen(
                     repository = repository,
                     openDownloaderTrigger = downloaderNavTrigger,
-                    openBrowserTrigger = browserNavTrigger
+                    openBrowserTrigger = browserNavTrigger,
+                    openFileManagerTrigger = fileManagerNavTrigger,
+                    pendingLaunchRoute = pendingLaunchRoute,
+                    closeEmbeddedBrowserSeq = closeEmbeddedBrowserSeq,
+                    onConsumeLaunchRoute = { seq ->
+                        if (pendingLaunchRouteFlow.value?.first == seq) {
+                            pendingLaunchRouteFlow.value = null
+                        }
+                    }
                 )
             }
         }
@@ -156,11 +246,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.getBooleanExtra(com.example.receiver.DownloadNotificationReceiver.EXTRA_OPEN_DOWNLOADER_TAB, false)) {
-            openDownloaderSignal.value += 1
-        } else if (intent.getBooleanExtra(com.example.service.DragonMediaPlaybackService.EXTRA_OPEN_BROWSER_TAB, false)) {
-            openBrowserSignal.value += 1
-        }
+        handleLaunchIntent(intent)
     }
 
     override fun onResume() {
@@ -170,22 +256,31 @@ class MainActivity : ComponentActivity() {
             com.example.data.browser.BrowserPipController.onPipModeChanged(isInPictureInPictureMode)
         }
         repository.onMainActivityVisibilityChanged(true)
+        com.example.data.downloader.ApkPackageInstaller.notifyPackageInstallChanged()
+        com.example.data.downloader.ApkPackageInstaller.resumePendingPostUninstallIfReady(this@MainActivity)
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                val dm = repository.downloadManager
-                dm.ensurePersistedTasksLoaded()
-                dm.pruneDeletedCompletedTasks()
-                dm.notificationController.syncTasks(dm.tasksFlow.value, force = false)
+            val dm = repository.downloadManager
+            dm.ensurePersistedTasksLoaded()
+            dm.pruneDeletedCompletedTasks()
+            dm.resumePendingPackageInstallIfReady(this@MainActivity)
+            dm.notificationController.syncTasks(dm.tasksFlow.value, force = false)
+            com.example.data.cache.DragonSmartCacheController.runSmartMaintenanceAsync(
+                context = this@MainActivity.applicationContext,
+                tasks = dm.tasksFlow.value,
+                aggressive = false
+            )
             } catch (_: Exception) {}
         }
     }
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
+        val pipState = com.example.data.browser.BrowserPipController.stateFlow.value
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            com.example.data.browser.BrowserPipController.syncActivityPipParams(this)
+            com.example.data.browser.BrowserPipController.syncActivityPipParams(this, pipState)
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (!isInPictureInPictureMode && com.example.data.browser.BrowserPipController.stateFlow.value.shouldEnterPipOnMinimize) {
+            if (!isInPictureInPictureMode && pipState.shouldEnterPipOnMinimize) {
                 com.example.data.browser.BrowserPipController.enterPipNow(this)
             }
         }
@@ -211,12 +306,34 @@ class MainActivity : ComponentActivity() {
         super.onPause()
         com.example.data.browser.BrowserPipController.onActivityResumedChanged(false)
         repository.onMainActivityVisibilityChanged(false)
+        if (com.example.service.DragonFloatingBrowserService.isFloatingActiveFlow.value) {
+            com.example.service.DragonFloatingBrowserService.keepFloatingMediaAlive()
+        }
     }
 
     override fun onStop() {
         super.onStop()
         com.example.data.browser.BrowserPipController.onActivityResumedChanged(false)
         repository.onMainActivityVisibilityChanged(false)
+        if (com.example.service.DragonFloatingBrowserService.isFloatingActiveFlow.value) {
+            com.example.service.DragonFloatingBrowserService.keepFloatingMediaAlive()
+        }
+        com.example.data.cache.DragonSmartCacheController.runSmartMaintenanceAsync(
+            context = applicationContext,
+            tasks = repository.downloadManager.tasksFlow.value,
+            aggressive = false
+        )
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            com.example.data.cache.DragonSmartCacheController.runSmartMaintenanceAsync(
+                context = applicationContext,
+                tasks = repository.downloadManager.tasksFlow.value,
+                aggressive = level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW
+            )
+        }
     }
 
     override fun onDestroy() {
@@ -238,32 +355,83 @@ class MainActivity : ComponentActivity() {
 fun DragonDownloadManagerMainScreen(
     repository: KernelRepository,
     openDownloaderTrigger: Int = 0,
-    openBrowserTrigger: Int = 0
+    openBrowserTrigger: Int = 0,
+    openFileManagerTrigger: Int = 0,
+    pendingLaunchRoute: Pair<Int, String>? = null,
+    closeEmbeddedBrowserSeq: Int = 0,
+    onConsumeLaunchRoute: (Int) -> Unit = {}
 ) {
+    var isFileManagerOpen by remember {
+        mutableStateOf(
+            pendingLaunchRoute?.second == MainActivity.ROUTE_FILE_MANAGER ||
+                openFileManagerTrigger > 0
+        )
+    }
     var isBrowserOpen by remember {
         mutableStateOf(
-            com.example.data.browser.BackgroundMediaWebViewStore.hasRetainedWebViews() ||
-                com.example.data.browser.BrowserPipController.stateFlow.value.shouldKeepBackgroundMediaAlive
+            when {
+                pendingLaunchRoute?.second == MainActivity.ROUTE_FILE_MANAGER || openFileManagerTrigger > 0 -> false
+                pendingLaunchRoute?.second == MainActivity.ROUTE_BROWSER || openBrowserTrigger > 0 -> true
+                pendingLaunchRoute?.second == MainActivity.ROUTE_DOWNLOADER || openDownloaderTrigger > 0 -> false
+                else -> com.example.data.browser.BackgroundMediaWebViewStore.hasRetainedWebViews() ||
+                    com.example.data.browser.BrowserPipController.stateFlow.value.shouldKeepBackgroundMediaAlive
+            }
         )
     }
 
     LaunchedEffect(isBrowserOpen) {
-        if (isBrowserOpen || !com.example.data.browser.BackgroundMediaWebViewStore.hasRetainedWebViews()) {
-            com.example.data.browser.BrowserPipController.updateBrowserOpen(isBrowserOpen)
+        com.example.data.browser.BrowserPipController.updateBrowserOpen(isBrowserOpen)
+    }
+
+    LaunchedEffect(pendingLaunchRoute) {
+        val event = pendingLaunchRoute ?: return@LaunchedEffect
+        when (event.second) {
+            MainActivity.ROUTE_FILE_MANAGER -> {
+                isBrowserOpen = false
+                isFileManagerOpen = true
+            }
+            MainActivity.ROUTE_BROWSER -> {
+                com.example.data.browser.BrowserPipController.isExplicitBrowserClose = false
+                isFileManagerOpen = false
+                isBrowserOpen = true
+            }
+            MainActivity.ROUTE_DOWNLOADER -> {
+                com.example.data.browser.BrowserPipController.isExplicitBrowserClose =
+                    !repository.downloadManager.hasActiveOrPausedBrowserStreamTasks()
+                isBrowserOpen = false
+                isFileManagerOpen = false
+            }
         }
+        onConsumeLaunchRoute(event.first)
     }
 
     LaunchedEffect(openDownloaderTrigger) {
         if (openDownloaderTrigger > 0) {
-            com.example.data.browser.BrowserPipController.isExplicitBrowserClose = true
+            com.example.data.browser.BrowserPipController.isExplicitBrowserClose =
+                !repository.downloadManager.hasActiveOrPausedBrowserStreamTasks()
             isBrowserOpen = false
+            isFileManagerOpen = false
         }
     }
 
     LaunchedEffect(openBrowserTrigger) {
         if (openBrowserTrigger > 0) {
             com.example.data.browser.BrowserPipController.isExplicitBrowserClose = false
+            isFileManagerOpen = false
             isBrowserOpen = true
+        }
+    }
+
+    LaunchedEffect(openFileManagerTrigger) {
+        if (openFileManagerTrigger > 0) {
+            isBrowserOpen = false
+            isFileManagerOpen = true
+        }
+    }
+
+    LaunchedEffect(closeEmbeddedBrowserSeq) {
+        if (closeEmbeddedBrowserSeq > 0 && isBrowserOpen) {
+            isBrowserOpen = false
         }
     }
 
@@ -283,51 +451,153 @@ fun DragonDownloadManagerMainScreen(
         }
     }
 
+    val retainedWvCount by com.example.data.browser.BackgroundMediaWebViewStore.retainedCountFlow.collectAsState()
+    val downloadTasks by repository.downloadManager.tasksFlow.collectAsState()
+    val hasRetainedBrowserDownload = remember(downloadTasks) {
+        downloadTasks.any { t ->
+            repository.downloadManager.isExternalWebManagedTask(t.id) &&
+                (t.stage.isActive || t.stage == com.example.data.model.DownloadStateStage.PAUSED)
+        }
+    }
+    var keepRetainedHostGrace by remember { mutableStateOf(false) }
+    LaunchedEffect(hasRetainedBrowserDownload) {
+        if (hasRetainedBrowserDownload) {
+            keepRetainedHostGrace = true
+        } else if (keepRetainedHostGrace) {
+            kotlinx.coroutines.delay(2500L)
+            keepRetainedHostGrace = false
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
-        Scaffold(
-            modifier = Modifier.fillMaxSize(),
-            containerColor = MaterialTheme.colorScheme.background,
-            snackbarHost = { SnackbarHost(snackbarHostState) },
-            topBar = {
-                DragonDownloaderTopBar(
-                    repository = repository,
-                    onOpenThemeStudio = {
-                        haptics.tap()
-                        showThemePickerSheet = true
-                    }
-                )
-            }
-        ) { innerPadding ->
-            Box(
+        // Keep retained Telegram/media WebView attached at FULL viewport size behind the opaque Scaffold while
+        // viewing Download Panel so cancel/pause/resume and deferred scroll-back cancellation always have a live attached window
+        if (!isBrowserOpen && retainedWvCount > 0) {
+            AndroidView(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(innerPadding)
-            ) {
-                DownloaderScreen(
-                    repository = repository,
-                    onOpenBrowser = { isBrowserOpen = true },
-                    onOpenBrowserWithUrl = { targetUrl ->
-                        com.example.data.browser.BrowserPipController.isExplicitBrowserClose = false
-                        repository.browserRepository.openNewTab(initialUrl = targetUrl)
-                        isBrowserOpen = true
+                    .alpha(0.01f),
+                factory = { ctx ->
+                    FrameLayout(ctx).apply {
+                        layoutParams = ViewGroup.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                        isClickable = false
+                        isFocusable = false
                     }
-                )
-            }
-        }
-
-        if (isBrowserOpen) {
-            BrowserScreen(
-                repository = repository,
-                onCloseBrowser = {
-                    com.example.data.browser.BrowserPipController.isExplicitBrowserClose = true
-                    isBrowserOpen = false
                 },
-                onOpenDownloadsTab = {
-                    com.example.data.browser.BrowserPipController.isExplicitBrowserClose = true
-                    isBrowserOpen = false
+                update = { container ->
+                    val wv = com.example.data.browser.BackgroundMediaWebViewStore.getPrimaryRetainedWebView()
+                    if (wv != null && wv.parent !== container) {
+                        container.removeAllViews()
+                        runCatching { (wv.parent as? ViewGroup)?.removeView(wv) }
+                        runCatching {
+                            container.addView(
+                                wv,
+                                FrameLayout.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT
+                                )
+                            )
+                            wv.resumeTimers()
+                            wv.onResume()
+                        }
+                    }
+                },
+                onRelease = { container ->
+                    container.removeAllViews()
                 }
             )
         }
+
+        if (!isFileManagerOpen && !isBrowserOpen) {
+            Scaffold(
+                modifier = Modifier.fillMaxSize(),
+                containerColor = MaterialTheme.colorScheme.background,
+                snackbarHost = { SnackbarHost(snackbarHostState) },
+                topBar = {
+                    DragonDownloaderTopBar(
+                        repository = repository,
+                        onOpenThemeStudio = {
+                            haptics.tap()
+                            showThemePickerSheet = true
+                        }
+                    )
+                }
+            ) { innerPadding ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                ) {
+                    DownloaderScreen(
+                        repository = repository,
+                        onOpenBrowser = { isBrowserOpen = true },
+                        onOpenBrowserWithUrl = { targetUrl ->
+                            com.example.data.browser.BrowserPipController.isExplicitBrowserClose = false
+                            repository.browserRepository.openNewTab(initialUrl = targetUrl)
+                            isBrowserOpen = true
+                        },
+                        onOpenFileManager = {
+                            isFileManagerOpen = true
+                        }
+                    )
+                }
+            }
+        }
+
+        if (isFileManagerOpen) {
+            val ctx = LocalContext.current
+            com.example.ui.screens.DragonFileManagerScreen(
+                repository = repository,
+                onClose = { isFileManagerOpen = false },
+                onOpenInSystemFileManager = {
+                    repository.downloadManager.openDdmRootFolder(ctx)
+                },
+                onExit = {
+                    isFileManagerOpen = false
+                    var c: Context? = ctx
+                    while (c is android.content.ContextWrapper && c !is android.app.Activity) {
+                        c = c.baseContext
+                    }
+                    (c as? android.app.Activity)?.moveTaskToBack(true)
+                }
+            )
+        }
+
+        if (isBrowserOpen) {
+            val ctx = LocalContext.current
+            BrowserScreen(
+                repository = repository,
+                onCloseBrowser = {
+                    com.example.data.browser.BrowserPipController.isExplicitBrowserClose =
+                        !repository.downloadManager.hasActiveOrPausedBrowserStreamTasks()
+                    isBrowserOpen = false
+                },
+                onOpenDownloadsTab = {
+                    com.example.data.browser.BrowserPipController.isExplicitBrowserClose =
+                        !repository.downloadManager.hasActiveOrPausedBrowserStreamTasks()
+                    isBrowserOpen = false
+                },
+                onExitBrowser = {
+                    com.example.data.browser.BrowserPipController.isExplicitBrowserClose =
+                        !repository.downloadManager.hasActiveOrPausedBrowserStreamTasks()
+                    isBrowserOpen = false
+                    var c: Context? = ctx
+                    while (c is android.content.ContextWrapper && c !is android.app.Activity) {
+                        c = c.baseContext
+                    }
+                    (c as? android.app.Activity)?.moveTaskToBack(true)
+                }
+            )
+        }
+
+        com.example.ui.components.DragonMiniAudioPlayerHost(
+            modifier = Modifier.align(Alignment.BottomCenter)
+        )
+
+        com.example.ui.components.PackageInstallResolutionDialogHost()
 
         if (showThemePickerSheet) {
             ThemePickerSheet(

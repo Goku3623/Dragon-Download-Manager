@@ -189,7 +189,7 @@ class CloudflareWarpDns(
     )
     val telemetryFlow: StateFlow<WarpDnsTelemetry> = _telemetryFlow.asStateFlow()
 
-    // Bootstrap client resolves Cloudflare, AdGuard, Quad9, Google, OpenDNS, CleanBrowsing, NextDNS, and Mullvad DoH hosts
+    // Bootstrap client resolves Cloudflare, AdGuard, Quad9, Google, OpenDNS, CleanBrowsing, Control D, and Mullvad DoH hosts
     // directly by static IPv4 bytes so encrypted DoH never depends on ISP system DNS.
     private val dohBootstrapClient: OkHttpClient by lazy {
         val staticDns = object : Dns {
@@ -256,12 +256,6 @@ class CloudflareWarpDns(
                         InetAddress.getByAddress(hostname, MULLVAD_SECONDARY_BYTES)
                     )
                     else -> {
-                        if (lower.endsWith("nextdns.io")) {
-                            return listOf(
-                                InetAddress.getByAddress(hostname, NEXTDNS_PRIMARY_BYTES),
-                                InetAddress.getByAddress(hostname, NEXTDNS_SECONDARY_BYTES)
-                            )
-                        }
                         val literalBytes = parseIpv4Bytes(lower)
                         if (literalBytes != null) {
                             return listOf(InetAddress.getByAddress(hostname, literalBytes))
@@ -1429,8 +1423,6 @@ class CloudflareWarpDns(
         private val CLEANBROWSING_SECONDARY_BYTES = byteArrayOf(185.toByte(), 228.toByte(), 169.toByte(), 9)
         private val CONTROLD_PRIMARY_BYTES = byteArrayOf(76, 76, 2, 0)
         private val CONTROLD_SECONDARY_BYTES = byteArrayOf(76, 76, 2, 2)
-        private val NEXTDNS_PRIMARY_BYTES = byteArrayOf(45, 90, 28, 0)
-        private val NEXTDNS_SECONDARY_BYTES = byteArrayOf(45, 90, 30, 0)
         private val MULLVAD_PRIMARY_BYTES = byteArrayOf(194.toByte(), 242.toByte(), 2, 2)
         private val MULLVAD_SECONDARY_BYTES = byteArrayOf(194.toByte(), 242.toByte(), 2, 3)
 

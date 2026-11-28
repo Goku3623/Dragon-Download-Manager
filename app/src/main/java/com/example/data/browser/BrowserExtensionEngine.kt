@@ -5,9 +5,13 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.webkit.WebResourceResponse
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
@@ -112,37 +116,73 @@ class BrowserExtensionEngine(private val context: Context) {
     private val prefs = context.getSharedPreferences("dragon_browser_extensions_v1", Context.MODE_PRIVATE)
     private val kvStoragePrefs = context.getSharedPreferences("dragon_browser_ext_storage_kv", Context.MODE_PRIVATE)
 
+    private val engineIoScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     // Store unpacked extension packages inside cacheDir rather than filesDir so Android OS
     // does not bloat permanent App User Data size, while keeping temporary archive staging isolated.
-    private val extensionsRootDir: File = File(context.cacheDir, "browser_extensions_store").apply { mkdirs() }
-    private val tempStagingDir: File = File(context.cacheDir, "ext_temp_staging").apply { mkdirs() }
+    private val extensionsRootDir: File = File(context.cacheDir, "browser_extensions_store")
+    private val tempStagingDir: File = File(context.cacheDir, "ext_temp_staging")
 
+    private val httpClientLock = Any()
     @Volatile
-    private var crossOriginHttpClient: OkHttpClient = buildHttpClient(Dns.SYSTEM)
+    private var currentDns: Dns = Dns.SYSTEM
+    @Volatile
+    private var _crossOriginHttpClient: OkHttpClient? = null
+    @Volatile
+    private var _directExtensionHttpClient: OkHttpClient? = null
+
+    private val crossOriginHttpClient: OkHttpClient
+        get() = _crossOriginHttpClient ?: synchronized(httpClientLock) {
+            _crossOriginHttpClient ?: buildHttpClient(currentDns).also { _crossOriginHttpClient = it }
+        }
+
+    private val directExtensionHttpClient: OkHttpClient
+        get() = _directExtensionHttpClient ?: synchronized(httpClientLock) {
+            _directExtensionHttpClient ?: buildDirectHttpClient(currentDns).also { _directExtensionHttpClient = it }
+        }
 
     private fun buildHttpClient(dns: Dns): OkHttpClient {
         return OkHttpClient.Builder()
             .dns(dns)
             .proxySelector(BrowserProxyManager.okHttpProxySelector)
             .proxyAuthenticator(BrowserProxyManager.okHttpProxyAuthenticator)
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(25, TimeUnit.SECONDS)
+            .connectTimeout(12, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+    }
+
+    private fun buildDirectHttpClient(dns: Dns): OkHttpClient {
+        return OkHttpClient.Builder()
+            .dns(dns)
+            .proxy(java.net.Proxy.NO_PROXY)
+            .connectTimeout(12, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .build()
     }
 
     fun setHttpDns(dns: Dns) {
-        crossOriginHttpClient = buildHttpClient(dns)
+        synchronized(httpClientLock) {
+            currentDns = dns
+            _crossOriginHttpClient = null
+            _directExtensionHttpClient = null
+        }
     }
 
     private val _extensionsFlow = MutableStateFlow<List<BrowserExtension>>(emptyList())
     val extensionsFlow: StateFlow<List<BrowserExtension>> = _extensionsFlow.asStateFlow()
 
     init {
-        migrateLegacyFilesDirExtensionsAndCleanTemp()
-        loadExtensions()
-        pruneOrphanedExtensionDirectories()
+        engineIoScope.launch {
+            runCatching { extensionsRootDir.mkdirs() }
+            runCatching { tempStagingDir.mkdirs() }
+            migrateLegacyFilesDirExtensionsAndCleanTemp()
+            loadExtensions()
+            pruneOrphanedExtensionDirectories()
+        }
     }
 
     /**
@@ -236,10 +276,14 @@ class BrowserExtensionEngine(private val context: Context) {
         }
         _extensionsFlow.value = updated
         persistExtensions(updated)
+        if (!enabled) {
+            clearExtensionProxySettings(extensionId)
+        }
     }
 
     fun removeExtension(extensionId: String): Boolean {
         val target = _extensionsFlow.value.find { it.id == extensionId } ?: return false
+        clearExtensionProxySettings(extensionId)
         if (target.installDirPath.isNotBlank()) {
             val installDir = File(target.installDirPath)
             runCatching { installDir.deleteRecursively() }
@@ -1787,7 +1831,19 @@ class BrowserExtensionEngine(private val context: Context) {
             } else {
                 builder.get()
             }
-            crossOriginHttpClient.newCall(builder.build()).execute().use { resp ->
+            val builtReq = builder.build()
+            val response = try {
+                val r = crossOriginHttpClient.newCall(builtReq).execute()
+                if (r.code == 407 || r.code == 502) {
+                    r.close()
+                    directExtensionHttpClient.newCall(builtReq).execute()
+                } else {
+                    r
+                }
+            } catch (_: Exception) {
+                directExtensionHttpClient.newCall(builtReq).execute()
+            }
+            response.use { resp ->
                 val rawBytes = resp.body?.bytes() ?: ByteArray(0)
                 val contentTypeHeader = resp.header("Content-Type").orEmpty()
                 val mimeType = contentTypeHeader.substringBefore(';').trim().lowercase(Locale.US).ifBlank {
@@ -2160,6 +2216,9 @@ class BrowserExtensionEngine(private val context: Context) {
                         window.__dragonExtConnectListeners = window.parent.__dragonExtConnectListeners = window.parent.__dragonExtConnectListeners || [];
                         window.__dragonExtStorageChangedListeners = window.parent.__dragonExtStorageChangedListeners = window.parent.__dragonExtStorageChangedListeners || [];
                         window.__dragonExtStorageCache = window.parent.__dragonExtStorageCache = window.parent.__dragonExtStorageCache || {};
+                        window.__dragonExtAuthRequiredListeners = window.parent.__dragonExtAuthRequiredListeners = window.parent.__dragonExtAuthRequiredListeners || [];
+                        window.__dragonExtProxyChangeListeners = window.parent.__dragonExtProxyChangeListeners = window.parent.__dragonExtProxyChangeListeners || [];
+                        window.__dragonExtProxyState = window.parent.__dragonExtProxyState = window.parent.__dragonExtProxyState || {};
                         if (window.parent.DragonExtensionBridge) {
                             window.DragonExtensionBridge = window.parent.DragonExtensionBridge;
                         }
@@ -2536,7 +2595,7 @@ class BrowserExtensionEngine(private val context: Context) {
     }
 
     fun mergeExtensionStorageJson(extId: String, patchJson: String): String {
-        synchronized(kvStoragePrefs) {
+        val saved = synchronized(kvStoragePrefs) {
             val currentObj = runCatching { JSONObject(getExtensionStorageJson(extId)) }.getOrElse { JSONObject() }
             val patchObj = runCatching { JSONObject(patchJson) }.getOrElse { JSONObject() }
             val keys = patchObj.keys()
@@ -2544,10 +2603,18 @@ class BrowserExtensionEngine(private val context: Context) {
                 val k = keys.next()
                 currentObj.put(k, patchObj.get(k))
             }
-            val saved = currentObj.toString()
-            kvStoragePrefs.edit().putString("kv_$extId", saved).apply()
-            return saved
+            val updatedStr = currentObj.toString()
+            kvStoragePrefs.edit().putString("kv_$extId", updatedStr).apply()
+            updatedStr
         }
+        // Automatically sync newly stored VPN proxy credentials if an extension proxy is active
+        runCatching {
+            val extracted = extractCredentialsFromExtensionStorage(extId)
+            if (extracted != null && extracted.first.isNotBlank()) {
+                setExtensionProxyAuth(extId, extracted.first, extracted.second)
+            }
+        }
+        return saved
     }
 
     fun removeExtensionStorageKeys(extId: String, keysJsonArray: String): String {
@@ -2567,6 +2634,323 @@ class BrowserExtensionEngine(private val context: Context) {
         synchronized(kvStoragePrefs) {
             kvStoragePrefs.edit().putString("kv_$extId", "{}").apply()
         }
+    }
+
+    // --- Extension Proxy Control (chrome.proxy.settings & webRequest.onAuthRequired) ---
+
+    @Volatile
+    private var lastExtensionProxySettingsJsonByExt = mutableMapOf<String, String>()
+
+    @Volatile
+    private var lastExtensionProxyAuthByExt = mutableMapOf<String, Pair<String, String>>()
+
+    fun getExtensionProxySettingsJson(extId: String): String {
+        val stored = synchronized(lastExtensionProxySettingsJsonByExt) {
+            lastExtensionProxySettingsJsonByExt[extId]
+        } ?: kvStoragePrefs.getString("proxy_cfg_$extId", null)
+        if (!stored.isNullOrBlank()) {
+            return stored
+        }
+        val activeExtProxy = BrowserProxyManager.getExtensionManagedProxyProfile()
+        if (activeExtProxy != null) {
+            return JSONObject().apply {
+                put("levelOfControl", "controlled_by_this_extension")
+                put("value", JSONObject().apply {
+                    put("mode", "fixed_servers")
+                    put("rules", JSONObject().apply {
+                        put("singleProxy", JSONObject().apply {
+                            put("scheme", activeExtProxy.type.scheme)
+                            put("host", activeExtProxy.host)
+                            put("port", activeExtProxy.port)
+                        })
+                        put("bypassList", JSONArray(activeExtProxy.bypassRules))
+                    })
+                })
+            }.toString()
+        }
+        return JSONObject().apply {
+            put("levelOfControl", "controllable_by_this_extension")
+            put("value", JSONObject().apply {
+                put("mode", "system")
+            })
+        }.toString()
+    }
+
+    fun setExtensionProxyAuth(extId: String, username: String, password: String) {
+        val u = username.trim()
+        val p = password
+        if (u.isBlank() && p.isBlank()) return
+        synchronized(lastExtensionProxyAuthByExt) {
+            lastExtensionProxyAuthByExt[extId] = u to p
+        }
+        kvStoragePrefs.edit()
+            .putString("proxy_auth_u_$extId", u)
+            .putString("proxy_auth_p_$extId", p)
+            .apply()
+        // If an extension proxy is already active for this extension without credentials (or with older credentials), update it live
+        val currentExtProxy = BrowserProxyManager.getExtensionManagedProxyProfile()
+        if (currentExtProxy != null && (currentExtProxy.username != u || currentExtProxy.password != p)) {
+            val updatedFallbacks = currentExtProxy.fallbackProxies.map { fb ->
+                fb.copy(username = fb.username.ifBlank { u }, password = if (fb.username.isNotBlank()) fb.password else p)
+            }
+            val updated = currentExtProxy.copy(username = u, password = p, fallbackProxies = updatedFallbacks)
+            BrowserProxyManager.applyExtensionProxyProfile(context, extId, updated)
+        }
+    }
+
+    private fun mapProxySchemeToType(rawScheme: String): BrowserProxyType {
+        return when (rawScheme.trim().lowercase(Locale.US)) {
+            "https", "ssl", "tls" -> BrowserProxyType.HTTPS
+            "socks5", "socks5h", "socks" -> BrowserProxyType.SOCKS5
+            "socks4", "socks4a" -> BrowserProxyType.SOCKS4
+            else -> BrowserProxyType.HTTP
+        }
+    }
+
+    fun applyExtensionProxySettings(extId: String, detailsJson: String): String {
+        return try {
+            val root = JSONObject(detailsJson)
+            val valueObj = root.optJSONObject("value") ?: root
+            val mode = valueObj.optString("mode", "fixed_servers").trim().lowercase(Locale.US)
+
+            if (mode == "direct" || mode == "system" || mode == "auto_detect") {
+                clearExtensionProxySettings(extId)
+                return getExtensionProxySettingsJson(extId)
+            }
+
+            data class ParsedEndpoint(
+                val scheme: String,
+                val host: String,
+                val port: Int,
+                val user: String = "",
+                val pass: String = ""
+            )
+
+            val parsedEndpoints = mutableListOf<ParsedEndpoint>()
+            var parsedUser = valueObj.optString("username", "").trim()
+            var parsedPass = valueObj.optString("password", "")
+            val bypassList = mutableListOf<String>()
+            bypassList.addAll(BrowserProxyProfile.DEFAULT_BYPASS_RULES)
+
+            val rulesObj = valueObj.optJSONObject("rules")
+            if (rulesObj != null) {
+                val ruleKeys = listOf("singleProxy", "proxyForHttps", "proxyForHttp", "fallbackProxy")
+                for (rk in ruleKeys) {
+                    val rObj = rulesObj.optJSONObject(rk) ?: continue
+                    val h = rObj.optString("host", "").trim().removePrefix("[").removeSuffix("]")
+                    if (h.isNotBlank()) {
+                        val s = rObj.optString("scheme", "http").trim().lowercase(Locale.US).ifBlank { "http" }
+                        val p = rObj.optInt("port", 0)
+                        val u = rObj.optString("username", "").trim()
+                        val pw = rObj.optString("password", "")
+                        if (parsedUser.isBlank() && u.isNotBlank()) parsedUser = u
+                        if (parsedPass.isBlank() && pw.isNotBlank()) parsedPass = pw
+                        parsedEndpoints.add(ParsedEndpoint(s, h, p, u, pw))
+                    }
+                }
+                val bypassArr = rulesObj.optJSONArray("bypassList")
+                if (bypassArr != null) {
+                    for (i in 0 until bypassArr.length()) {
+                        val b = bypassArr.optString(i, "").trim()
+                        if (b.isNotBlank() && b !in bypassList) {
+                            bypassList.add(b)
+                        }
+                    }
+                }
+            }
+
+            // Parse PAC script endpoints (preferring JS-evaluated PAC result if present, plus raw pacScript.data)
+            val evaluatedPac = valueObj.optString("__evaluatedPacResult", "").trim()
+            val rawPacData = valueObj.optJSONObject("pacScript")?.optString("data", "").orEmpty()
+            val combinedPacText = buildString {
+                if (evaluatedPac.isNotBlank()) append(evaluatedPac).append('\n')
+                if (rawPacData.isNotBlank()) append(rawPacData)
+            }
+            if (combinedPacText.isNotBlank()) {
+                val pacRegex = Regex(
+                    """\b(HTTPS|PROXY|HTTP|SOCKS5|SOCKS4|SOCKS)\s+([a-zA-Z0-9._-]+|\[\S+?\]):(\d{1,5})\b""",
+                    RegexOption.IGNORE_CASE
+                )
+                for (match in pacRegex.findAll(combinedPacText)) {
+                    val kw = match.groupValues[1].uppercase(Locale.US)
+                    val s = when (kw) {
+                        "HTTPS" -> "https"
+                        "SOCKS5", "SOCKS" -> "socks5"
+                        "SOCKS4" -> "socks4"
+                        else -> "http"
+                    }
+                    val h = match.groupValues[2].trim().removePrefix("[").removeSuffix("]")
+                    val p = match.groupValues[3].toIntOrNull() ?: 0
+                    if (h.isNotBlank() && !h.equals("localhost", ignoreCase = true) && h != "127.0.0.1") {
+                        parsedEndpoints.add(ParsedEndpoint(s, h, p))
+                    }
+                }
+            }
+
+            // Also support direct top-level host/port/scheme if passed by custom/simplified scripts
+            if (parsedEndpoints.isEmpty()) {
+                val topHost = valueObj.optString("host", "").trim().removePrefix("[").removeSuffix("]")
+                if (topHost.isNotBlank()) {
+                    val topScheme = valueObj.optString("scheme", "http").trim().lowercase(Locale.US).ifBlank { "http" }
+                    val topPort = valueObj.optInt("port", 0)
+                    parsedEndpoints.add(ParsedEndpoint(topScheme, topHost, topPort))
+                }
+            }
+
+            val distinctEndpoints = parsedEndpoints.distinctBy {
+                "${it.scheme}:${it.host.lowercase(Locale.US)}:${it.port}"
+            }
+
+            if (distinctEndpoints.isEmpty()) {
+                clearExtensionProxySettings(extId)
+                return getExtensionProxySettingsJson(extId)
+            }
+
+            // Merge any credentials captured from chrome.webRequest.onAuthRequired, persisted prefs, or extension storage
+            val savedAuth = synchronized(lastExtensionProxyAuthByExt) { lastExtensionProxyAuthByExt[extId] }
+            if (parsedUser.isBlank() && savedAuth != null) {
+                parsedUser = savedAuth.first
+                parsedPass = savedAuth.second
+            }
+            if (parsedUser.isBlank()) {
+                val persistedU = kvStoragePrefs.getString("proxy_auth_u_$extId", "").orEmpty().trim()
+                val persistedP = kvStoragePrefs.getString("proxy_auth_p_$extId", "").orEmpty()
+                if (persistedU.isNotBlank()) {
+                    parsedUser = persistedU
+                    parsedPass = persistedP
+                }
+            }
+            if (parsedUser.isBlank()) {
+                val kvAutoAuth = extractCredentialsFromExtensionStorage(extId)
+                if (kvAutoAuth != null) {
+                    parsedUser = kvAutoAuth.first
+                    parsedPass = kvAutoAuth.second
+                }
+            }
+
+            val extName = _extensionsFlow.value.find { it.id == extId }?.name ?: "VPN Extension"
+            val primary = distinctEndpoints.first()
+            val primaryType = mapProxySchemeToType(primary.scheme)
+            val primaryPort = if (primary.port in 1..65535) primary.port else primaryType.defaultPort
+
+            val fallbackProfiles = distinctEndpoints.drop(1).mapIndexed { idx, ep ->
+                val epType = mapProxySchemeToType(ep.scheme)
+                val epPort = if (ep.port in 1..65535) ep.port else epType.defaultPort
+                BrowserProxyProfile(
+                    id = "ext_vpn_${extId}_fb_$idx",
+                    name = "$extName Fallback #${idx + 1} (${epType.label})",
+                    type = epType,
+                    host = ep.host,
+                    port = epPort,
+                    username = ep.user.ifBlank { parsedUser },
+                    password = if (ep.user.isNotBlank()) ep.pass else parsedPass,
+                    bypassRules = bypassList,
+                    reverseBypass = false,
+                    applyToDownloads = true
+                )
+            }
+
+            val profile = BrowserProxyProfile(
+                id = "ext_vpn_$extId",
+                name = "$extName (${primaryType.label})",
+                type = primaryType,
+                host = primary.host,
+                port = primaryPort,
+                username = primary.user.ifBlank { parsedUser },
+                password = if (primary.user.isNotBlank()) primary.pass else parsedPass,
+                bypassRules = bypassList,
+                reverseBypass = false,
+                applyToDownloads = true,
+                fallbackProxies = fallbackProfiles
+            )
+
+            val storedStatusJson = JSONObject().apply {
+                put("levelOfControl", "controlled_by_this_extension")
+                put("value", valueObj)
+            }.toString()
+
+            synchronized(lastExtensionProxySettingsJsonByExt) {
+                lastExtensionProxySettingsJsonByExt[extId] = storedStatusJson
+            }
+            kvStoragePrefs.edit().putString("proxy_cfg_$extId", storedStatusJson).apply()
+
+            BrowserProxyManager.applyExtensionProxyProfile(context, extId, profile)
+            storedStatusJson
+        } catch (_: Exception) {
+            getExtensionProxySettingsJson(extId)
+        }
+    }
+
+    fun clearExtensionProxySettings(extId: String): String {
+        synchronized(lastExtensionProxySettingsJsonByExt) {
+            lastExtensionProxySettingsJsonByExt.remove(extId)
+        }
+        kvStoragePrefs.edit().remove("proxy_cfg_$extId").apply()
+        BrowserProxyManager.clearExtensionProxyProfile(context, extId)
+        return getExtensionProxySettingsJson(extId)
+    }
+
+    private fun extractCredentialsFromExtensionStorage(extId: String): Pair<String, String>? {
+        val raw = getExtensionStorageJson(extId)
+        if (raw.isBlank() || raw == "{}") return null
+        return runCatching {
+            val obj = JSONObject(raw)
+            val userKeys = listOf(
+                "proxyUsername", "proxy_username", "vpnUsername", "vpn_username",
+                "vpnUser", "vpn_user", "authUsername", "auth_username", "authUser", "auth_user",
+                "username", "user_name", "userName", "user", "login", "account_id", "accountId", "uuid"
+            )
+            val passKeys = listOf(
+                "proxyPassword", "proxy_password", "vpnPassword", "vpn_password",
+                "vpnPass", "vpn_pass", "authPassword", "auth_password", "authPass", "auth_pass",
+                "password", "pass", "secret", "api_key", "apiKey", "access_token", "accessToken", "token"
+            )
+            fun firstMatchingString(node: JSONObject, candidates: List<String>): String {
+                for (k in candidates) {
+                    val v = node.opt(k)
+                    if (v is String && v.isNotBlank() && !v.startsWith("{") && !v.startsWith("[")) {
+                        return v.trim()
+                    }
+                }
+                return ""
+            }
+            fun findCreds(node: JSONObject, depth: Int): Pair<String, String>? {
+                if (depth > 4) return null
+                val u = firstMatchingString(node, userKeys)
+                val p = firstMatchingString(node, passKeys)
+                if (u.isNotBlank() && p.isNotBlank()) return u to p
+                val keys = node.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val childObj = node.optJSONObject(k)
+                    if (childObj != null) {
+                        val found = findCreds(childObj, depth + 1)
+                        if (found != null) return found
+                    } else {
+                        val childArr = node.optJSONArray(k)
+                        if (childArr != null) {
+                            for (i in 0 until minOf(childArr.length(), 10)) {
+                                val elemObj = childArr.optJSONObject(i) ?: continue
+                                val found = findCreds(elemObj, depth + 1)
+                                if (found != null) return found
+                            }
+                        } else {
+                            // Some extensions store serialized JSON inside a string value
+                            val strVal = node.optString(k, "").trim()
+                            if (strVal.startsWith("{") && strVal.endsWith("}")) {
+                                val parsedInner = runCatching { JSONObject(strVal) }.getOrNull()
+                                if (parsedInner != null) {
+                                    val found = findCreds(parsedInner, depth + 1)
+                                    if (found != null) return found
+                                }
+                            }
+                        }
+                    }
+                }
+                return null
+            }
+            findCreds(obj, 0)
+        }.getOrNull()
     }
 
     /**
@@ -2623,7 +3007,19 @@ class BrowserExtensionEngine(private val context: Context) {
                 builder.method(method, null)
             }
 
-            crossOriginHttpClient.newCall(builder.build()).execute().use { resp ->
+            val builtReq = builder.build()
+            val response = try {
+                val r = crossOriginHttpClient.newCall(builtReq).execute()
+                if (r.code == 407 || r.code == 502) {
+                    r.close()
+                    directExtensionHttpClient.newCall(builtReq).execute()
+                } else {
+                    r
+                }
+            } catch (_: Exception) {
+                directExtensionHttpClient.newCall(builtReq).execute()
+            }
+            response.use { resp ->
                 val text = resp.body?.string().orEmpty()
                 val respHeaders = StringBuilder()
                 for (i in 0 until resp.headers.size) {
@@ -2656,6 +3052,9 @@ class BrowserExtensionEngine(private val context: Context) {
             window.__dragonExtConnectListeners = window.__dragonExtConnectListeners || [];
             window.__dragonExtStorageChangedListeners = window.__dragonExtStorageChangedListeners || [];
             window.__dragonExtStorageCache = window.__dragonExtStorageCache || {};
+            window.__dragonExtAuthRequiredListeners = window.__dragonExtAuthRequiredListeners || [];
+            window.__dragonExtProxyChangeListeners = window.__dragonExtProxyChangeListeners || [];
+            window.__dragonExtProxyState = window.__dragonExtProxyState || {};
 
             try {
                 if (typeof Promise !== 'undefined' && typeof Promise.withResolvers !== 'function') {
@@ -3639,18 +4038,267 @@ class BrowserExtensionEngine(private val context: Context) {
                             onRuleMatchedDebug: makeEventTarget([])
                         };
                     })(),
-                    webRequest: {
-                        ResourceType: { MAIN_FRAME: 'main_frame', SUB_FRAME: 'sub_frame', STYLESHEET: 'stylesheet', SCRIPT: 'script', IMAGE: 'image', FONT: 'font', OBJECT: 'object', XMLHTTPREQUEST: 'xmlhttprequest', PING: 'ping', CSP_REPORT: 'csp_report', MEDIA: 'media', WEBSOCKET: 'websocket', OTHER: 'other' },
-                        onBeforeRequest: makeEventTarget([]),
-                        onBeforeSendHeaders: makeEventTarget([]),
-                        onSendHeaders: makeEventTarget([]),
-                        onHeadersReceived: makeEventTarget([]),
-                        onResponseStarted: makeEventTarget([]),
-                        onBeforeRedirect: makeEventTarget([]),
-                        onCompleted: makeEventTarget([]),
-                        onErrorOccurred: makeEventTarget([]),
-                        handlerBehaviorChanged: function(cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); }
-                    },
+                    webRequest: (function() {
+                        var authRequiredListeners = window.__dragonExtAuthRequiredListeners = window.__dragonExtAuthRequiredListeners || [];
+                        var sharedState = window.__dragonExtProxyState = window.__dragonExtProxyState || {};
+                        var probeSingleAuthListener = function(fn, explicitHost, explicitPort) {
+                            if (typeof fn !== 'function') return;
+                            try {
+                                var activeHost = explicitHost || 'vpn.proxy.server';
+                                var activePort = explicitPort || 443;
+                                try {
+                                    var curP = sharedState.currentValue || window.__dragonExtProxyCurrentValue;
+                                    if (!explicitHost && curP) {
+                                        if (curP.rules) {
+                                            var sp = curP.rules.singleProxy || curP.rules.proxyForHttps || curP.rules.proxyForHttp || curP.rules.fallbackProxy;
+                                            if (sp && sp.host) activeHost = sp.host;
+                                            if (sp && sp.port) activePort = Number(sp.port) || 443;
+                                        } else if (curP.__evaluatedPacResult || (curP.pacScript && curP.pacScript.data)) {
+                                            var pacSrc = String(curP.__evaluatedPacResult || curP.pacScript.data || '');
+                                            var pm = pacSrc.match(/\b(?:HTTPS|PROXY|HTTP|SOCKS5|SOCKS4|SOCKS)\s+([a-zA-Z0-9._-]+|\[\S+?\]):(\d{1,5})\b/i);
+                                            if (pm) {
+                                                activeHost = pm[1];
+                                                activePort = Number(pm[2]) || 443;
+                                            }
+                                        }
+                                    }
+                                } catch (e) {}
+                                var fakeDetails = {
+                                    requestId: 'dragon_auth_probe_' + Date.now(),
+                                    url: 'https://www.google.com/',
+                                    method: 'GET',
+                                    frameId: 0,
+                                    parentFrameId: -1,
+                                    tabId: 1,
+                                    type: 'main_frame',
+                                    challenger: { host: activeHost, port: activePort },
+                                    isProxy: true,
+                                    realm: 'Proxy',
+                                    scheme: 'basic',
+                                    timeStamp: Date.now()
+                                };
+                                var handleAuthResp = function(resp) {
+                                    try {
+                                        if (resp && resp.authCredentials && resp.authCredentials.username) {
+                                            var u = String(resp.authCredentials.username || '');
+                                            var p = String(resp.authCredentials.password || '');
+                                            sharedState.lastAuth = { username: u, password: p };
+                                            window.__dragonExtProxyLastAuth = sharedState.lastAuth;
+                                            if (window.DragonExtensionBridge && window.DragonExtensionBridge.proxyAuthSet) {
+                                                window.DragonExtensionBridge.proxyAuthSet(extId, u, p);
+                                            }
+                                        }
+                                    } catch (e) {}
+                                };
+                                var ret = fn(fakeDetails, handleAuthResp);
+                                if (ret && typeof ret.then === 'function') {
+                                    ret.then(handleAuthResp).catch(function() {});
+                                } else if (ret && typeof ret === 'object') {
+                                    handleAuthResp(ret);
+                                }
+                            } catch (e) {}
+                        };
+                        var probeAuthListenerForCredentials = function(fn) {
+                            if (typeof fn !== 'function') return;
+                            setTimeout(function() { probeSingleAuthListener(fn); }, 10);
+                        };
+                        window.__dragonProbeExtensionProxyAuth = function(hostHint, portHint) {
+                            var list = window.__dragonExtAuthRequiredListeners || authRequiredListeners;
+                            for (var i = 0; i < list.length; i++) {
+                                probeSingleAuthListener(list[i], hostHint, portHint);
+                            }
+                        };
+                        return {
+                            ResourceType: { MAIN_FRAME: 'main_frame', SUB_FRAME: 'sub_frame', STYLESHEET: 'stylesheet', SCRIPT: 'script', IMAGE: 'image', FONT: 'font', OBJECT: 'object', XMLHTTPREQUEST: 'xmlhttprequest', PING: 'ping', CSP_REPORT: 'csp_report', MEDIA: 'media', WEBSOCKET: 'websocket', OTHER: 'other' },
+                            OnAuthRequiredOptions: { RESPONSE_HEADERS: 'responseHeaders', BLOCKING: 'blocking', ASYNC_BLOCKING: 'asyncBlocking', EXTRA_HEADERS: 'extraHeaders' },
+                            onBeforeRequest: makeEventTarget([]),
+                            onBeforeSendHeaders: makeEventTarget([]),
+                            onSendHeaders: makeEventTarget([]),
+                            onHeadersReceived: makeEventTarget([]),
+                            onAuthRequired: makeEventTarget(authRequiredListeners, probeAuthListenerForCredentials),
+                            onResponseStarted: makeEventTarget([]),
+                            onBeforeRedirect: makeEventTarget([]),
+                            onCompleted: makeEventTarget([]),
+                            onErrorOccurred: makeEventTarget([]),
+                            handlerBehaviorChanged: function(cb) { if (typeof cb === 'function') setTimeout(cb, 0); return Promise.resolve(); }
+                        };
+                    })(),
+                    proxy: (function() {
+                        var proxySettingChangeListeners = window.__dragonExtProxyChangeListeners = window.__dragonExtProxyChangeListeners || [];
+                        var proxyErrorListeners = [];
+                        var proxyRequestListeners = [];
+                        var sharedState = window.__dragonExtProxyState = window.__dragonExtProxyState || {};
+                        var evaluatePacScriptToProxyString = function(pacCode) {
+                            if (!pacCode || typeof pacCode !== 'string') return '';
+                            try {
+                                var helpers =
+                                    "function isPlainHostName(h){return String(h||'').indexOf('.')===-1;}\n" +
+                                    "function dnsDomainIs(h,d){h=String(h||'').toLowerCase();d=String(d||'').toLowerCase();return h.length>=d.length&&h.substring(h.length-d.length)===d;}\n" +
+                                    "function localHostOrDomainIs(h,hd){h=String(h||'').toLowerCase();hd=String(hd||'').toLowerCase();return h===hd||hd.indexOf(h+'.')===0;}\n" +
+                                    "function isResolvable(h){return true;}\n" +
+                                    "function isInNet(h,p,m){return false;}\n" +
+                                    "function dnsResolve(h){return '8.8.8.8';}\n" +
+                                    "function myIpAddress(){return '192.168.1.2';}\n" +
+                                    "function dnsDomainLevels(h){return String(h||'').split('.').length-1;}\n" +
+                                    "function shExpMatch(s,p){try{var re=new RegExp('^'+String(p||'').replace(/[.+^{}$()|\\[\\]\\\\]/g,'\\\\$&').replace(/\\*/g,'.*').replace(/\\?/g,'.')+'$','i');return re.test(String(s||''));}catch(e){return false;}}\n" +
+                                    "function weekdayRange(){return true;}\n" +
+                                    "function dateRange(){return true;}\n" +
+                                    "function timeRange(){return true;}\n";
+                                var runner = new Function('url', 'host', helpers + '\n' + pacCode + '\nif (typeof FindProxyForURL === "function") return FindProxyForURL(url, host); return "";');
+                                var out = runner('https://www.google.com/', 'www.google.com');
+                                return (typeof out === 'string') ? out : '';
+                            } catch (e) {
+                                return '';
+                            }
+                        };
+                        var readProxySettingsObj = function() {
+                            try {
+                                if (window.DragonExtensionBridge && window.DragonExtensionBridge.proxyGet) {
+                                    var raw = window.DragonExtensionBridge.proxyGet(extId);
+                                    if (raw) {
+                                        var parsed = JSON.parse(raw);
+                                        if (parsed && parsed.value) {
+                                            sharedState.currentValue = parsed.value;
+                                            window.__dragonExtProxyCurrentValue = parsed.value;
+                                            return parsed;
+                                        }
+                                    }
+                                }
+                            } catch (e) {}
+                            var fallbackVal = sharedState.currentValue || window.__dragonExtProxyCurrentValue || { mode: 'system' };
+                            return {
+                                value: fallbackVal,
+                                levelOfControl: 'controlled_by_this_extension'
+                            };
+                        };
+                        var fireProxyChange = function(detailsObj) {
+                            var list = window.__dragonExtProxyChangeListeners || proxySettingChangeListeners;
+                            for (var i = 0; i < list.length; i++) {
+                                try { list[i](detailsObj); } catch (e) {}
+                            }
+                        };
+                        return {
+                            Mode: { DIRECT: 'direct', AUTO_DETECT: 'auto_detect', PAC_SCRIPT: 'pac_script', FIXED_SERVERS: 'fixed_servers', SYSTEM: 'system' },
+                            Scheme: { HTTP: 'http', HTTPS: 'https', QUIC: 'quic', SOCKS4: 'socks4', SOCKS5: 'socks5' },
+                            settings: {
+                                get: function(details, callback) {
+                                    var cb = (typeof details === 'function') ? details : callback;
+                                    var current = readProxySettingsObj();
+                                    if (typeof cb === 'function') {
+                                        setTimeout(function() { cb(current); }, 0);
+                                    }
+                                    return Promise.resolve(current);
+                                },
+                                set: function(details, callback) {
+                                    var payload = (details && typeof details === 'object') ? details : { value: { mode: 'system' } };
+                                    var val = payload.value || payload;
+                                    try {
+                                        if (val && val.pacScript && val.pacScript.data) {
+                                            var evalPac = evaluatePacScriptToProxyString(val.pacScript.data);
+                                            if (evalPac) {
+                                                val.__evaluatedPacResult = evalPac;
+                                            }
+                                        }
+                                    } catch (e) {}
+                                    sharedState.currentValue = val;
+                                    window.__dragonExtProxyCurrentValue = val;
+                                    try {
+                                        if (window.__dragonProbeExtensionProxyAuth) {
+                                            window.__dragonProbeExtensionProxyAuth();
+                                        }
+                                        var lastAuth = sharedState.lastAuth || window.__dragonExtProxyLastAuth;
+                                        if (lastAuth && lastAuth.username) {
+                                            val.username = val.username || lastAuth.username;
+                                            val.password = val.password || lastAuth.password;
+                                        }
+                                        if (window.DragonExtensionBridge && window.DragonExtensionBridge.proxySet) {
+                                            window.DragonExtensionBridge.proxySet(extId, JSON.stringify({ value: val }));
+                                        }
+                                    } catch (e) {}
+                                    var updated = {
+                                        value: val,
+                                        levelOfControl: 'controlled_by_this_extension'
+                                    };
+                                    setTimeout(function() {
+                                        if (window.__dragonProbeExtensionProxyAuth) {
+                                            window.__dragonProbeExtensionProxyAuth();
+                                        }
+                                        fireProxyChange(updated);
+                                        if (typeof callback === 'function') callback();
+                                    }, 0);
+                                    return Promise.resolve();
+                                },
+                                clear: function(details, callback) {
+                                    var cb = (typeof details === 'function') ? details : callback;
+                                    sharedState.currentValue = { mode: 'system' };
+                                    window.__dragonExtProxyCurrentValue = { mode: 'system' };
+                                    try {
+                                        if (window.DragonExtensionBridge && window.DragonExtensionBridge.proxyClear) {
+                                            window.DragonExtensionBridge.proxyClear(extId);
+                                        }
+                                    } catch (e) {}
+                                    var cleared = {
+                                        value: { mode: 'system' },
+                                        levelOfControl: 'controllable_by_this_extension'
+                                    };
+                                    setTimeout(function() {
+                                        fireProxyChange(cleared);
+                                        if (typeof cb === 'function') cb();
+                                    }, 0);
+                                    return Promise.resolve();
+                                },
+                                onChange: makeEventTarget(proxySettingChangeListeners)
+                            },
+                            onRequest: makeEventTarget(proxyRequestListeners, function(fn) {
+                                // Firefox WebExtension browser.proxy.onRequest support: probe listener to extract proxy return info
+                                setTimeout(function() {
+                                    try {
+                                        var probeRet = fn({
+                                            requestId: '1',
+                                            url: 'https://www.google.com/',
+                                            method: 'GET',
+                                            type: 'main_frame',
+                                            tabId: 1,
+                                            timeStamp: Date.now()
+                                        });
+                                        var applyFxProxy = function(info) {
+                                            var item = Array.isArray(info) ? info[0] : info;
+                                            if (item && item.host && item.port) {
+                                                var scheme = String(item.type || 'http').toLowerCase();
+                                                if (scheme === 'socks') scheme = 'socks5';
+                                                var synth = {
+                                                    mode: 'fixed_servers',
+                                                    username: item.username || '',
+                                                    password: item.password || '',
+                                                    rules: {
+                                                        singleProxy: {
+                                                            scheme: scheme,
+                                                            host: String(item.host),
+                                                            port: Number(item.port)
+                                                        }
+                                                    }
+                                                };
+                                                if (window.DragonExtensionBridge && window.DragonExtensionBridge.proxySet) {
+                                                    window.DragonExtensionBridge.proxySet(extId, JSON.stringify({ value: synth }));
+                                                }
+                                            } else if (item && item.type === 'direct') {
+                                                if (window.DragonExtensionBridge && window.DragonExtensionBridge.proxyClear) {
+                                                    window.DragonExtensionBridge.proxyClear(extId);
+                                                }
+                                            }
+                                        };
+                                        if (probeRet && typeof probeRet.then === 'function') {
+                                            probeRet.then(applyFxProxy).catch(function() {});
+                                        } else if (probeRet) {
+                                            applyFxProxy(probeRet);
+                                        }
+                                    } catch (e) {}
+                                }, 20);
+                            }),
+                            onError: makeEventTarget(proxyErrorListeners),
+                            onProxyError: makeEventTarget(proxyErrorListeners)
+                        };
+                    })(),
                     management: {
                         getSelf: function(cb) { var info = { id: extId, name: (extMeta && extMeta.name) || extId, version: (extMeta && extMeta.version) || '1.0', enabled: true, installType: 'normal', type: 'extension' }; if (typeof cb === 'function') setTimeout(function() { cb(info); }, 0); return Promise.resolve(info); },
                         get: function(id, cb) { return chromeObj.management.getSelf(cb); },
@@ -4117,6 +4765,16 @@ class BrowserExtensionEngine(private val context: Context) {
                 }
             }
             _extensionsFlow.value = loaded
+            // Restore any persisted extension-managed VPN/Proxy configuration for currently enabled extensions
+            for (ext in loaded) {
+                if (ext.enabled) {
+                    val savedProxyJson = kvStoragePrefs.getString("proxy_cfg_${ext.id}", null)
+                    if (!savedProxyJson.isNullOrBlank()) {
+                        runCatching { applyExtensionProxySettings(ext.id, savedProxyJson) }
+                        break
+                    }
+                }
+            }
         } catch (_: Exception) {
             _extensionsFlow.value = builtIns
         }

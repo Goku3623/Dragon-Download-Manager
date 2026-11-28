@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.Intent
 import android.content.MutableContextWrapper
 import android.graphics.Bitmap
 import android.net.Uri
@@ -85,6 +86,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.toAndroidRectF
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
@@ -115,6 +117,11 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import com.example.DragonBrowserLauncherActivity
+import com.example.R
+import com.example.service.DragonFloatingBrowserService
 import kotlin.math.roundToInt
 import com.example.data.browser.BrowserBookmark
 import com.example.data.browser.BrowserExtension
@@ -237,7 +244,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
 private object ActiveBrowserScreenCallbacks {
     @Volatile var token: Any? = null
     @Volatile var onDownloadIntercepted: ((MediaInfo, MediaFormatOption) -> Unit)? = null
-    @Volatile var onRendererCrashed: ((String, WebView?) -> Unit)? = null
+    @Volatile var onRendererCrashed: ((String, WebView?, Boolean) -> Unit)? = null
     @Volatile var onLongPressLink: ((String) -> Unit)? = null
     @Volatile var onShowFullscreenVideo: ((View, WebChromeClient.CustomViewCallback?) -> Unit)? = null
     @Volatile var onHideFullscreenVideo: (() -> Unit)? = null
@@ -282,7 +289,8 @@ private object ActiveBrowserScreenCallbacks {
 fun BrowserScreen(
     repository: KernelRepository,
     onCloseBrowser: () -> Unit,
-    onOpenDownloadsTab: () -> Unit
+    onOpenDownloadsTab: () -> Unit,
+    onExitBrowser: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val focusManager = LocalFocusManager.current
@@ -306,6 +314,8 @@ fun BrowserScreen(
     val consoleLogsByTab by browserRepo.consoleLogsByTabFlow.collectAsState()
     val networkLogsByTab by browserRepo.networkLogsByTabFlow.collectAsState()
     val mediaGrabberEnabled by browserRepo.mediaGrabberEnabledFlow.collectAsState()
+    val streamingLinkGrabberEnabled by browserRepo.streamingLinkGrabberEnabledFlow.collectAsState()
+    val fileGrabberEnabled by browserRepo.fileGrabberEnabledFlow.collectAsState()
     val pageInspectorEnabled by browserRepo.pageInspectorEnabledFlow.collectAsState()
     val savedPasswords by browserRepo.savedPasswordsFlow.collectAsState()
     val googleSyncState by browserRepo.googleSyncStateFlow.collectAsState()
@@ -377,6 +387,7 @@ fun BrowserScreen(
     var floatingPipTabId by remember { mutableStateOf<String?>(null) }
     var lastDownloadInterceptUrl by remember { mutableStateOf("") }
     var lastDownloadInterceptMs by remember { mutableStateOf(0L) }
+    var pausedTabIdsAfterCrash by remember { mutableStateOf<Set<String>>(emptySet()) }
 
     fun launchSystemChromePasskeyFlow(targetUrl: String) {
         val uri = runCatching { Uri.parse(targetUrl) }.getOrNull() ?: return
@@ -726,14 +737,29 @@ fun BrowserScreen(
         }
     }
 
-    // Keep active tab AND any in-app floating PiP tab unpaused across tab switches
+    // Keep active tab, floating PiP tab, AND any Telegram tab with an active download unpaused across tab switches
     LaunchedEffect(activeTab.id, webViews.size, floatingPipTabId) {
+        val hasActiveStream = downloadManager.hasActiveBrowserStreamTasks()
         webViews.forEach { (id, wv) ->
+            if (com.example.data.browser.WebViewRendererGuard.isDestroyed(wv)) return@forEach
             runCatching {
-                if (id == activeTab.id || id == floatingPipTabId) {
+                val isActiveTgTab = hasActiveStream && runCatching {
+                    wv.url.orEmpty().contains("telegram.org", ignoreCase = true)
+                }.getOrDefault(false)
+                if (id == activeTab.id || id == floatingPipTabId || isActiveTgTab) {
+                    com.example.data.browser.WebViewRendererGuard.applyRendererPrioritySafely(
+                        wv,
+                        WebView.RENDERER_PRIORITY_IMPORTANT,
+                        false
+                    )
                     wv.resumeTimers()
                     wv.onResume()
                 } else {
+                    com.example.data.browser.WebViewRendererGuard.applyRendererPrioritySafely(
+                        wv,
+                        WebView.RENDERER_PRIORITY_BOUND,
+                        true
+                    )
                     wv.onPause()
                 }
             }
@@ -769,17 +795,18 @@ fun BrowserScreen(
     DisposableEffect(Unit) {
         BrowserPipController.updateBrowserOpen(true)
         onDispose {
-            val retainBackgroundMedia = !BrowserPipController.isExplicitBrowserClose && (
+            val retainForActiveStream = downloadManager.hasActiveBrowserStreamTasks()
+            val retainBackgroundMedia = retainForActiveStream || (!BrowserPipController.isExplicitBrowserClose && (
                 BrowserPipController.stateFlow.value.shouldKeepBackgroundMediaAlive ||
                     BrowserPipController.isBackgroundMinimizedFlow.value ||
                     BrowserPipController.isInPipModeFlow.value
-                )
+                ))
             if (!retainBackgroundMedia) {
                 BrowserPipController.updateFloatingPipTab(null)
                 BrowserPipController.updateFullscreenVideo(false)
                 BrowserPipController.updateStreamPlayerOpen(false)
-                BrowserPipController.updateBrowserOpen(false)
             }
+            BrowserPipController.updateBrowserOpen(false)
         }
     }
 
@@ -941,18 +968,26 @@ fun BrowserScreen(
                 Lifecycle.Event.ON_PAUSE -> {
                     val activity = context.findActivity()
                     val pipState = BrowserPipController.stateFlow.value
-                    val keepMediaAlive = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
-                        activity?.isInPictureInPictureMode == true) ||
+                    val hasActiveStream = downloadManager.hasActiveBrowserStreamTasks()
+                    val isFloatingBrowserActive = DragonFloatingBrowserService.isFloatingActiveFlow.value
+                    val keepMediaAlive = hasActiveStream ||
+                        (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
+                            activity?.isInPictureInPictureMode == true) ||
                         BrowserPipController.isInPipModeFlow.value ||
                         pipState.shouldKeepBackgroundMediaAlive
                     if (keepMediaAlive) {
                         webViews.forEach { (id, wv) ->
                             runCatching {
-                                if (id == currentActiveTabId || id == currentFloatingPipTabId) {
+                                val isTgStreamTab = hasActiveStream && runCatching {
+                                    wv.url.orEmpty().contains("telegram.org", ignoreCase = true)
+                                }.getOrDefault(false)
+                                if (id == currentActiveTabId || id == currentFloatingPipTabId || isTgStreamTab) {
                                     if (wv is BackgroundMediaWebView) {
                                         wv.keepMediaAliveInBackground = true
                                     }
-                                    wv.evaluateJavascript(PIP_ARM_TRANSITION_GUARD_JS, null)
+                                    if (!hasActiveStream) {
+                                        wv.evaluateJavascript(PIP_ARM_TRANSITION_GUARD_JS, null)
+                                    }
                                     wv.resumeTimers()
                                     wv.onResume()
                                 } else {
@@ -967,30 +1002,44 @@ fun BrowserScreen(
                                     wv.keepMediaAliveInBackground = false
                                 }
                                 wv.onPause()
-                                wv.pauseTimers()
+                                // WebView.pauseTimers() is process-wide! Never call it while Floating Browser is active.
+                                if (isFloatingBrowserActive) {
+                                    wv.resumeTimers()
+                                } else {
+                                    wv.pauseTimers()
+                                }
                             }
                         }
                         oauthPopupWebView?.let { popup ->
                             runCatching { popup.onPause() }
                         }
                     }
+                    if (isFloatingBrowserActive) {
+                        DragonFloatingBrowserService.keepFloatingMediaAlive()
+                    }
                 }
                 Lifecycle.Event.ON_STOP -> {
                     val activity = context.findActivity()
                     val pipState = BrowserPipController.stateFlow.value
-                    val keepMediaAlive = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
-                        activity?.isInPictureInPictureMode == true) ||
+                    val hasActiveStream = downloadManager.hasActiveBrowserStreamTasks()
+                    val isFloatingBrowserActive = DragonFloatingBrowserService.isFloatingActiveFlow.value
+                    val keepMediaAlive = hasActiveStream ||
+                        (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
+                            activity?.isInPictureInPictureMode == true) ||
                         BrowserPipController.isInPipModeFlow.value ||
                         BrowserPipController.isBackgroundMinimizedFlow.value ||
                         pipState.shouldKeepBackgroundMediaAlive
                     if (keepMediaAlive) {
                         webViews.forEach { (id, wv) ->
                             runCatching {
-                                if (id == currentActiveTabId || id == currentFloatingPipTabId) {
+                                val isTgStreamTab = hasActiveStream && runCatching {
+                                    wv.url.orEmpty().contains("telegram.org", ignoreCase = true)
+                                }.getOrDefault(false)
+                                if (id == currentActiveTabId || id == currentFloatingPipTabId || isTgStreamTab) {
                                     if (wv is BackgroundMediaWebView) {
                                         wv.keepMediaAliveInBackground = true
                                     }
-                                    if (!BrowserPipController.isInPipModeFlow.value) {
+                                    if (!BrowserPipController.isInPipModeFlow.value && !hasActiveStream) {
                                         wv.evaluateJavascript(PIP_ENTER_BACKGROUND_AUDIO_MODE_JS, null)
                                     }
                                     wv.resumeTimers()
@@ -1005,12 +1054,20 @@ fun BrowserScreen(
                                     wv.keepMediaAliveInBackground = false
                                 }
                                 wv.onPause()
-                                wv.pauseTimers()
+                                // WebView.pauseTimers() is process-wide! Never call it while Floating Browser is active.
+                                if (isFloatingBrowserActive) {
+                                    wv.resumeTimers()
+                                } else {
+                                    wv.pauseTimers()
+                                }
                             }
                         }
                         oauthPopupWebView?.let { popup ->
                             runCatching { popup.onPause() }
                         }
+                    }
+                    if (isFloatingBrowserActive) {
+                        DragonFloatingBrowserService.keepFloatingMediaAlive()
                     }
                 }
                 Lifecycle.Event.ON_RESUME -> {
@@ -1051,30 +1108,27 @@ fun BrowserScreen(
         onDispose {
             ActiveBrowserScreenCallbacks.clearIfMatches(callbacksOwnerToken)
             subPopupWebView?.let { sub ->
-                runCatching {
-                    sub.stopLoading()
-                    (sub.parent as? ViewGroup)?.removeView(sub)
-                    sub.destroy()
-                }
+                com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(sub)
                 subPopupWebView = null
             }
             oauthPopupWebView?.let { popup ->
-                runCatching {
-                    popup.stopLoading()
-                    (popup.parent as? ViewGroup)?.removeView(popup)
-                    popup.destroy()
-                }
+                com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(popup)
                 oauthPopupWebView = null
             }
-            val retainBackgroundMedia = !BrowserPipController.isExplicitBrowserClose && (
+            val hasTelegramWebTab = webViews.values.any { wv ->
+                !com.example.data.browser.WebViewRendererGuard.isDestroyed(wv) &&
+                    runCatching { wv.url.orEmpty().contains("telegram.org", ignoreCase = true) }.getOrDefault(false)
+            }
+            val retainForActiveStream = downloadManager.hasActiveOrPausedBrowserStreamTasks() || hasTelegramWebTab
+            val retainBackgroundMedia = retainForActiveStream || (!BrowserPipController.isExplicitBrowserClose && (
                 BrowserPipController.stateFlow.value.shouldKeepBackgroundMediaAlive ||
                     BrowserPipController.isBackgroundMinimizedFlow.value ||
                     BrowserPipController.isInPipModeFlow.value
-                )
+                ))
             if (retainBackgroundMedia && webViews.isNotEmpty()) {
                 webViews.forEach { (id, wv) ->
-                    if ((id == currentActiveTabId || id == currentFloatingPipTabId) && wv is BackgroundMediaWebView) {
-                        wv.keepMediaAliveInBackground = true
+                    if ((retainForActiveStream || id == currentActiveTabId || id == currentFloatingPipTabId) && wv is BackgroundMediaWebView) {
+                        wv.keepMediaAliveInBackground = downloadManager.hasActiveOrPausedBrowserStreamTasks()
                     }
                 }
                 com.example.data.browser.BackgroundMediaWebViewStore.retainForBackgroundPlayback(
@@ -1090,12 +1144,8 @@ fun BrowserScreen(
             } else {
                 com.example.data.browser.BackgroundMediaWebViewStore.stopAndReleaseAll()
                 webViews.values.forEach { wv ->
-                    try {
-                        wv.resumeTimers()
-                        wv.stopLoading()
-                        (wv.parent as? ViewGroup)?.removeView(wv)
-                        wv.destroy()
-                    } catch (_: Exception) {}
+                    runCatching { wv.resumeTimers() }
+                    com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(wv)
                 }
                 webViews.clear()
             }
@@ -1106,18 +1156,18 @@ fun BrowserScreen(
         if (floatingPipTabId == tabId) {
             floatingPipTabId = null
         }
+        pausedTabIdsAfterCrash = pausedTabIdsAfterCrash - tabId
+        com.example.data.browser.WebViewRendererGuard.resetCrashHistory("browser_tab_$tabId")
         val wasLastIncognito = browserRepo.closeTab(tabId)
         webViews.remove(tabId)?.let { wv ->
-            try {
-                wv.stopLoading()
-                (wv.parent as? ViewGroup)?.removeView(wv)
-                if (wasLastIncognito) {
+            if (wasLastIncognito && !com.example.data.browser.WebViewRendererGuard.isDestroyed(wv)) {
+                runCatching {
                     wv.clearCache(true)
                     wv.clearHistory()
                     CookieManager.getInstance().removeSessionCookies(null)
                 }
-                wv.destroy()
-            } catch (_: Exception) {}
+            }
+            com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(wv)
         }
     }
 
@@ -1146,8 +1196,10 @@ fun BrowserScreen(
         hasEditedOmnibox = false
         omniboxValue = TextFieldValue(targetUrl, TextRange.Zero)
         focusManager.clearFocus()
+        pausedTabIdsAfterCrash = pausedTabIdsAfterCrash - activeTab.id
+        com.example.data.browser.WebViewRendererGuard.resetCrashHistory("browser_tab_${activeTab.id}")
         browserRepo.updateTabState(activeTab.id) { it.copy(url = targetUrl, isLoading = true, progress = 12) }
-        webViews[activeTab.id]?.loadUrl(targetUrl)
+        webViews[activeTab.id]?.takeIf { !com.example.data.browser.WebViewRendererGuard.isDestroyed(it) }?.loadUrl(targetUrl)
     }
 
     fun openUrlInTab(url: String, inNewTab: Boolean = false, incognito: Boolean = activeTab.isIncognito) {
@@ -1184,32 +1236,68 @@ fun BrowserScreen(
         val platform = MediaPlatform.detectFromUrl(candidate.url).let { detected ->
             if (detected == MediaPlatform.UNSUPPORTED) MediaPlatform.DIRECT else detected
         }
-        val isGeneric = candidate.kind == GrabbedMediaKind.FILE
-        val isAudio = candidate.kind == GrabbedMediaKind.AUDIO
+        val initialExt = candidate.containerExt.trim().lowercase(Locale.US).removePrefix(".")
+        val baseTitle = candidate.title.ifBlank { activeTab.title }.trim()
+        val rawNameForResolve = if (initialExt.isNotBlank() && initialExt != "bin" && !baseTitle.endsWith(".$initialExt", ignoreCase = true)) {
+            "$baseTitle.$initialExt"
+        } else {
+            baseTitle
+        }
+        val resolvedType = DragonDownloadManager.resolveFileTypeAndName(
+            rawFilename = rawNameForResolve,
+            rawMimeType = candidate.mimeType.takeIf { it.isNotBlank() },
+            url = candidate.url,
+            platform = platform
+        )
+        val finalExt = if (initialExt in setOf("m3u8", "mpd")) initialExt else resolvedType.extension
+        val isAudio = candidate.kind == GrabbedMediaKind.AUDIO || resolvedType.isAudio
+        val isGeneric = candidate.kind == GrabbedMediaKind.FILE && !resolvedType.isVideo && !isAudio
         val mime = when {
-            isAudio -> "audio/${candidate.containerExt}"
-            isGeneric -> "application/octet-stream"
-            else -> "video/${candidate.containerExt}"
+            candidate.mimeType.isNotBlank() && !candidate.mimeType.equals("application/octet-stream", ignoreCase = true) ->
+                candidate.mimeType
+            finalExt == "m3u8" -> "application/vnd.apple.mpegurl"
+            finalExt == "mpd" -> "application/dash+xml"
+            else -> resolvedType.mimeType
+        }
+        val displayTitleNoDupExt = resolvedType.filename.let { fname ->
+            val extSuffix = ".$finalExt"
+            if (fname.endsWith(extSuffix, ignoreCase = true) && fname.length > extSuffix.length) {
+                fname.dropLast(extSuffix.length)
+            } else {
+                fname
+            }
+        }.ifBlank { baseTitle }
+        val resolvedUa = runCatching { webViews[activeTab.id]?.settings?.userAgentString }.getOrNull()
+            ?: resolveBrowserUserAgent(context, activeTab.desktopMode)
+        val cookieHeader = collectBrowserDownloadCookies(
+            downloadUrl = candidate.url,
+            refererUrl = activeTab.url,
+            explicitPageCookies = null
+        )
+        val headersMap = LinkedHashMap<String, String>().apply {
+            put("Referer", activeTab.url)
+            put("User-Agent", resolvedUa)
+            if (!cookieHeader.isNullOrBlank()) {
+                put("Cookie", cookieHeader)
+            }
         }
         val opt = MediaFormatOption(
             id = "grab_${candidate.url.hashCode()}",
-            qualityLabel = candidate.kind.label,
+            qualityLabel = if (isGeneric) finalExt.uppercase(Locale.US) else candidate.kind.label,
             resolutionHeight = if (!isAudio && !isGeneric) 1080 else 0,
-            container = candidate.containerExt,
+            container = finalExt,
             mimeType = mime,
+            contentLengthBytes = candidate.contentLengthBytes.coerceAtLeast(-1L),
             isAudioOnly = isAudio,
             streamUrl = candidate.url,
-            requestHeaders = mapOf(
-                "Referer" to activeTab.url,
-                "User-Agent" to resolveBrowserUserAgent(context, activeTab.desktopMode)
-            ),
+            requestHeaders = headersMap,
             isGenericFile = isGeneric,
             fileCategoryLabel = candidate.sourceLabel
         )
         val info = MediaInfo(
             originalUrl = activeTab.url,
             canonicalUrl = candidate.url,
-            title = candidate.title.ifBlank { activeTab.title },
+            title = displayTitleNoDupExt,
             creator = Uri.parse(activeTab.url).host?.removePrefix("www.") ?: "Browser",
             durationSeconds = 0L,
             durationFormatted = if (isGeneric) "File" else "Live Stream",
@@ -1531,7 +1619,11 @@ fun BrowserScreen(
                         IconButton(
                             onClick = {
                                 haptics.tap()
-                                val wv = webViews[activeTab.id]
+                                pausedTabIdsAfterCrash = pausedTabIdsAfterCrash - activeTab.id
+                                com.example.data.browser.WebViewRendererGuard.resetCrashHistory("browser_tab_${activeTab.id}")
+                                val wv = webViews[activeTab.id]?.takeIf {
+                                    !com.example.data.browser.WebViewRendererGuard.isDestroyed(it)
+                                }
                                 if (activeTab.isLoading) {
                                     wv?.stopLoading()
                                 } else {
@@ -1617,13 +1709,15 @@ fun BrowserScreen(
                         ActiveBrowserScreenCallbacks.onDownloadIntercepted = { mediaInfo, format ->
                             handleBrowserDownloadIntercepted(mediaInfo, format)
                         }
-                        ActiveBrowserScreenCallbacks.onRendererCrashed = { crashedTabId, crashedView ->
-                            try {
-                                crashedView?.stopLoading()
-                                (crashedView?.parent as? ViewGroup)?.removeView(crashedView)
-                                crashedView?.destroy()
-                            } catch (_: Throwable) {}
+                        ActiveBrowserScreenCallbacks.onRendererCrashed = { crashedTabId, crashedView, shouldAutoReload ->
+                            com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(crashedView)
                             webViews.remove(crashedTabId)
+                            if (!shouldAutoReload) {
+                                pausedTabIdsAfterCrash = pausedTabIdsAfterCrash + crashedTabId
+                                repository.showActionFeedback("Tab paused after renderer reset — tap Reload to retry")
+                            } else {
+                                pausedTabIdsAfterCrash = pausedTabIdsAfterCrash - crashedTabId
+                            }
                             browserRepo.updateTabState(crashedTabId) {
                                 it.copy(isLoading = false, progress = 100)
                             }
@@ -1657,30 +1751,18 @@ fun BrowserScreen(
                         ActiveBrowserScreenCallbacks.onAttachSubPopup = { childWv ->
                             subPopupWebView?.let { prev ->
                                 if (prev !== childWv) {
-                                    runCatching {
-                                        prev.stopLoading()
-                                        (prev.parent as? ViewGroup)?.removeView(prev)
-                                        prev.destroy()
-                                    }
+                                    com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(prev)
                                 }
                             }
                             subPopupWebView = childWv
                         }
                         ActiveBrowserScreenCallbacks.onCloseWindowPopup = { closingWv ->
                             if (subPopupWebView === closingWv) {
-                                runCatching {
-                                    closingWv.stopLoading()
-                                    (closingWv.parent as? ViewGroup)?.removeView(closingWv)
-                                    closingWv.destroy()
-                                }
+                                com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(closingWv)
                                 subPopupWebView = null
                             }
                             if (oauthPopupWebView === closingWv) {
-                                runCatching {
-                                    closingWv.stopLoading()
-                                    (closingWv.parent as? ViewGroup)?.removeView(closingWv)
-                                    closingWv.destroy()
-                                }
+                                com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(closingWv)
                                 oauthPopupWebView = null
                             }
                         }
@@ -1737,19 +1819,26 @@ fun BrowserScreen(
                             }
                         }
                         val targetId = activeTab.id
-                        val existingWv = webViews[targetId]
+                        val existingWv = webViews[targetId]?.takeIf {
+                            !com.example.data.browser.WebViewRendererGuard.isDestroyed(it)
+                        }
                         val activeWebView = existingWv ?: createConfiguredBrowserWebView(
                             context = MutableContextWrapper(context),
                             tab = activeTab,
                             desktopMode = activeTab.desktopMode,
                             warpDns = downloadManager.warpDns,
                             browserRepo = browserRepo,
+                            downloadManager = downloadManager,
                             mainHandler = mainHandler,
                             onDownloadIntercepted = { mediaInfo, format ->
                                 ActiveBrowserScreenCallbacks.onDownloadIntercepted?.invoke(mediaInfo, format)
                             },
-                            onRendererCrashed = { crashedTabId, crashedView ->
-                                ActiveBrowserScreenCallbacks.onRendererCrashed?.invoke(crashedTabId, crashedView)
+                            onRendererCrashed = { crashedTabId, crashedView, shouldAutoReload ->
+                                ActiveBrowserScreenCallbacks.onRendererCrashed?.invoke(
+                                    crashedTabId,
+                                    crashedView,
+                                    shouldAutoReload
+                                )
                             },
                             onLongPressLink = { url ->
                                 ActiveBrowserScreenCallbacks.onLongPressLink?.invoke(url)
@@ -1817,7 +1906,12 @@ fun BrowserScreen(
                             }
                         ).also { created ->
                             webViews[targetId] = created
-                            created.loadUrl(activeTab.url)
+                            if (targetId in pausedTabIdsAfterCrash) {
+                                pausedTabIdsAfterCrash = pausedTabIdsAfterCrash - targetId
+                                created.loadUrl("about:blank")
+                            } else {
+                                created.loadUrl(activeTab.url)
+                            }
                         }
 
                         // Sync Desktop UA, Client Hints, LayoutAlgorithm & viewport ONLY when Desktop Mode actually toggles
@@ -2898,6 +2992,53 @@ fun BrowserScreen(
 
                                     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
+                                    // Float Dragon Browser (Manually Resizable System Overlay)
+                                    val isFloatingBrowserActive by DragonFloatingBrowserService.isFloatingActiveFlow.collectAsState()
+                                    DropdownMenuItem(
+                                        text = {
+                                            Column {
+                                                Text(
+                                                    text = if (isFloatingBrowserActive) "Float Dragon Browser (Active)" else "Float Dragon Browser",
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                                Text(
+                                                    text = "Manually resizable floating window over DDM & other apps",
+                                                    fontSize = 10.sp,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        },
+                                        leadingIcon = {
+                                            Icon(
+                                                imageVector = Icons.Default.PictureInPictureAlt,
+                                                contentDescription = "Float Dragon Browser",
+                                                tint = NeonCyan
+                                            )
+                                        },
+                                        onClick = {
+                                            haptics.confirm()
+                                            showOverflowMenu = false
+                                            showMoreSubmenu = false
+                                            if (DragonFloatingBrowserService.canDrawOverlays(context)) {
+                                                val currentPageUrl = webViews[activeTab.id]?.url
+                                                    ?.takeIf { it.isNotBlank() }
+                                                    ?: activeTab.url
+                                                DragonFloatingBrowserService.startFloating(context, currentPageUrl)
+                                                onCloseBrowser()
+                                            } else {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Allow 'Display over other apps' permission, then tap Float Dragon Browser again.",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                                DragonFloatingBrowserService.openOverlayPermissionSettings(context)
+                                            }
+                                        },
+                                        modifier = Modifier.testTag("menu_float_dragon_browser")
+                                    )
+
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
                                     // Security & Malware Shield
                                     val shieldArmed = securityShieldState.malwareShieldEnabled
                                     DropdownMenuItem(
@@ -3227,6 +3368,81 @@ fun BrowserScreen(
                                         },
                                         modifier = Modifier.testTag("menu_import_bookmarks")
                                     )
+
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+                                    // Bottom of More menu: Dragon Browser App Drawer Shortcut toggle with Dragon-themed logo
+                                    var isBrowserShortcutEnabled by remember(showOverflowMenu, showMoreSubmenu) {
+                                        mutableStateOf(DragonBrowserLauncherActivity.isAppDrawerShortcutEnabled(context))
+                                    }
+                                    DropdownMenuItem(
+                                        text = {
+                                            Column {
+                                                Text("Dragon Browser Shortcut", fontWeight = FontWeight.Bold)
+                                                Text(
+                                                    text = if (isBrowserShortcutEnabled) {
+                                                        "Enabled • Added to App Drawer"
+                                                    } else {
+                                                        "Add Dragon Browser icon to App Drawer"
+                                                    },
+                                                    fontSize = 10.sp,
+                                                    color = if (isBrowserShortcutEnabled) NeonCyan else MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        },
+                                        leadingIcon = {
+                                            AsyncImage(
+                                                model = remember(context) {
+                                                    ImageRequest.Builder(context)
+                                                        .data(R.drawable.ic_dragon_browser_v2_1795623003158)
+                                                        .size(96, 96)
+                                                        .crossfade(false)
+                                                        .build()
+                                                },
+                                                contentDescription = "Dragon Browser App Drawer Logo",
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier
+                                                    .size(28.dp)
+                                                    .clip(RoundedCornerShape(7.dp))
+                                                    .border(0.9.dp, NeonCyan.copy(alpha = 0.65f), RoundedCornerShape(7.dp))
+                                            )
+                                        },
+                                        trailingIcon = {
+                                            Switch(
+                                                checked = isBrowserShortcutEnabled,
+                                                onCheckedChange = { enabled ->
+                                                    haptics.toggle(enabled)
+                                                    val updated = DragonBrowserLauncherActivity.setAppDrawerShortcutEnabled(context, enabled)
+                                                    isBrowserShortcutEnabled = updated
+                                                    val msg = if (updated) {
+                                                        "Dragon Browser shortcut added to your App Drawer!"
+                                                    } else {
+                                                        "Dragon Browser shortcut removed from App Drawer"
+                                                    }
+                                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                                    repository.showActionFeedback(msg)
+                                                },
+                                                modifier = Modifier
+                                                    .scale(0.78f)
+                                                    .height(28.dp)
+                                                    .testTag("switch_browser_app_drawer_shortcut")
+                                            )
+                                        },
+                                        onClick = {
+                                            val next = !isBrowserShortcutEnabled
+                                            haptics.toggle(next)
+                                            val updated = DragonBrowserLauncherActivity.setAppDrawerShortcutEnabled(context, next)
+                                            isBrowserShortcutEnabled = updated
+                                            val msg = if (updated) {
+                                                "Dragon Browser shortcut added to your App Drawer!"
+                                            } else {
+                                                "Dragon Browser shortcut removed from App Drawer"
+                                            }
+                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                            repository.showActionFeedback(msg)
+                                        },
+                                        modifier = Modifier.testTag("menu_browser_app_drawer_shortcut")
+                                    )
                                 } else {
                                 // New Tab
                                 DropdownMenuItem(
@@ -3352,7 +3568,20 @@ fun BrowserScreen(
 
                                 // Media Grabber
                                 DropdownMenuItem(
-                                    text = { Text("Media Grabber", fontWeight = FontWeight.SemiBold) },
+                                    text = {
+                                        Column {
+                                            Text("Media Grabber", fontWeight = FontWeight.SemiBold)
+                                            val statusParts = buildList {
+                                                if (streamingLinkGrabberEnabled) add("Stream Link ON")
+                                                if (fileGrabberEnabled) add("File ON")
+                                            }
+                                            Text(
+                                                text = if (statusParts.isEmpty()) "All grabbers OFF" else statusParts.joinToString(" • "),
+                                                fontSize = 10.sp,
+                                                color = if (statusParts.isEmpty()) WarningOrange else NeonCyan
+                                            )
+                                        }
+                                    },
                                     leadingIcon = {
                                         Icon(
                                             imageVector = Icons.Default.VideoLibrary,
@@ -3450,14 +3679,21 @@ fun BrowserScreen(
 
                                 HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
-                                // Exit Browser Option (closes all open tabs automatically on exit)
+                                // Exit Browser Option (preserves all open tabs & returns to app drawer)
                                 DropdownMenuItem(
                                     text = {
-                                        Text(
-                                            text = "Exit Browser",
-                                            fontWeight = FontWeight.Bold,
-                                            color = DangerRed
-                                        )
+                                        Column {
+                                            Text(
+                                                text = "Exit Browser",
+                                                fontWeight = FontWeight.Bold,
+                                                color = DangerRed
+                                            )
+                                            Text(
+                                                text = "Return to app drawer • Keep opened tabs",
+                                                fontSize = 10.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
                                     },
                                     leadingIcon = {
                                         Icon(
@@ -3469,24 +3705,12 @@ fun BrowserScreen(
                                     onClick = {
                                         haptics.warning()
                                         showOverflowMenu = false
-                                        val hadIncognito = tabs.any { it.isIncognito }
-                                        webViews.values.forEach { wv ->
-                                            runCatching {
-                                                wv.stopLoading()
-                                                (wv.parent as? ViewGroup)?.removeView(wv)
-                                                if (hadIncognito) {
-                                                    wv.clearCache(true)
-                                                    wv.clearHistory()
-                                                }
-                                                wv.destroy()
-                                            }
+                                        browserRepo.persistTabsNow()
+                                        if (onExitBrowser != null) {
+                                            onExitBrowser()
+                                        } else {
+                                            onCloseBrowser()
                                         }
-                                        webViews.clear()
-                                        if (hadIncognito) {
-                                            runCatching { CookieManager.getInstance().removeSessionCookies(null) }
-                                        }
-                                        browserRepo.closeAllTabs()
-                                        onCloseBrowser()
                                     },
                                     modifier = Modifier.testTag("menu_exit_browser")
                                 )
@@ -3737,22 +3961,65 @@ fun BrowserScreen(
 
         BrowserOverlaySheet.MEDIA_GRABBER -> {
             BrowserMediaGrabberDialog(
+                tabId = activeTab.id,
                 pageTitle = activeTab.title,
                 pageUrl = activeTab.url,
+                userAgent = runCatching { webViews[activeTab.id]?.settings?.userAgentString }.getOrNull()
+                    ?: resolveBrowserUserAgent(context, activeTab.desktopMode),
                 candidates = currentGrabbedMedia,
-                isGrabberEnabled = mediaGrabberEnabled,
-                onToggleGrabberEnabled = { enabled ->
+                isStreamingLinkGrabberEnabled = streamingLinkGrabberEnabled,
+                onToggleStreamingLinkGrabber = { enabled ->
                     haptics.toggle(enabled)
-                    browserRepo.setMediaGrabberEnabled(enabled)
+                    browserRepo.setStreamingLinkGrabberEnabled(enabled)
                     if (enabled) {
                         webViews[activeTab.id]?.evaluateJavascript(DOM_MEDIA_SCANNER_JS, null)
                     }
                 },
+                isFileGrabberEnabled = fileGrabberEnabled,
+                onToggleFileGrabber = { enabled ->
+                    haptics.toggle(enabled)
+                    browserRepo.setFileGrabberEnabled(enabled)
+                    if (enabled) {
+                        webViews[activeTab.id]?.evaluateJavascript(DOM_MEDIA_SCANNER_JS, null)
+                    }
+                },
+                browserRepo = browserRepo,
                 downloadManager = downloadManager,
                 onRefreshScan = {
                     haptics.tap()
-                    if (mediaGrabberEnabled) {
+                    if (streamingLinkGrabberEnabled || fileGrabberEnabled) {
                         webViews[activeTab.id]?.evaluateJavascript(DOM_MEDIA_SCANNER_JS, null)
+                    }
+                },
+                onCopyStreamLink = { streamUrl ->
+                    haptics.confirm()
+                    Toast.makeText(
+                        context,
+                        "Streaming link copied! Paste in external player",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    repository.showActionFeedback("Streaming link copied: $streamUrl")
+                },
+                onOpenInExternalPlayer = { streamUrl, title ->
+                    haptics.confirm()
+                    val launched = runCatching {
+                        val extIntent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(Uri.parse(streamUrl), "video/*")
+                            putExtra(Intent.EXTRA_TITLE, title)
+                            putExtra("title", title)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        context.startActivity(Intent.createChooser(extIntent, "Play stream in external player").apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        })
+                        true
+                    }.getOrDefault(false)
+                    if (!launched) {
+                        Toast.makeText(
+                            context,
+                            "No external player found. Link copied to clipboard!",
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
                 },
                 onSelectCandidateStream = { candidate ->
@@ -4152,34 +4419,18 @@ fun BrowserScreen(
                 if (!activeTab.isIncognito) {
                     runCatching { CookieManager.getInstance().flush() }
                 }
-                runCatching {
-                    subPopupWebView?.stopLoading()
-                    (subPopupWebView?.parent as? ViewGroup)?.removeView(subPopupWebView)
-                    subPopupWebView?.destroy()
-                }
+                com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(subPopupWebView)
                 subPopupWebView = null
-                runCatching {
-                    popupWv.stopLoading()
-                    (popupWv.parent as? ViewGroup)?.removeView(popupWv)
-                    popupWv.destroy()
-                }
+                com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(popupWv)
                 oauthPopupWebView = null
                 if (!targetUrl.isNullOrBlank()) {
                     openUrlInTab(targetUrl, inNewTab = true)
                 }
             },
             onDismiss = {
-                runCatching {
-                    subPopupWebView?.stopLoading()
-                    (subPopupWebView?.parent as? ViewGroup)?.removeView(subPopupWebView)
-                    subPopupWebView?.destroy()
-                }
+                com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(subPopupWebView)
                 subPopupWebView = null
-                runCatching {
-                    popupWv.stopLoading()
-                    (popupWv.parent as? ViewGroup)?.removeView(popupWv)
-                    popupWv.destroy()
-                }
+                com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(popupWv)
                 oauthPopupWebView = null
             }
         )
@@ -4522,6 +4773,346 @@ fun BrowserScreen(
     }
 }
 
+private data class AccurateGrabbedNameResult(
+    val filename: String,
+    val extension: String,
+    val mimeType: String,
+    val kind: GrabbedMediaKind,
+    val confidence: Int
+)
+
+private val GENERIC_GRABBED_STEMS = setOf(
+    "", "index", "master", "playlist", "manifest", "chunklist", "chunk", "segment", "init",
+    "videoplayback", "video", "audio", "media", "stream", "play", "player", "watch", "file",
+    "download", "dl", "get", "fetch", "attachment", "document", "blob", "unnamed", "untitled",
+    "video player", "media element", "click here", "download now", "free download",
+    "direct download", "save", "save file", "mirror", "server", "link", "open", "view",
+    "hls", "dash", "prog", "progressive", "source", "src", "content", "asset", "data"
+)
+
+private val WEB_SCRIPT_EXTENSIONS = setOf(
+    "html", "htm", "php", "asp", "aspx", "jsp", "cfm", "cgi", "do", "action", "xhtml", "shtml"
+)
+
+private fun parseFilenameFromContentDispositionHeader(contentDisposition: String?): String? {
+    if (contentDisposition.isNullOrBlank()) return null
+    val utf8Match = Regex("filename\\*\\s*=\\s*(?:UTF-8''|utf-8''|[^']*'[^']*')([^;]+)", RegexOption.IGNORE_CASE)
+        .find(contentDisposition)?.groupValues?.getOrNull(1)?.trim()?.trim('"', '\'')
+    if (!utf8Match.isNullOrBlank()) {
+        val decoded = runCatching { Uri.decode(utf8Match) }.getOrDefault(utf8Match)
+            .substringAfterLast('/')
+            .substringAfterLast('\\')
+            .trim()
+        if (decoded.isNotBlank()) return decoded
+    }
+    val quotedMatch = Regex("filename\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
+        .find(contentDisposition)?.groupValues?.getOrNull(1)?.trim()
+        ?: Regex("filename\\s*=\\s*([^;]+)", RegexOption.IGNORE_CASE)
+            .find(contentDisposition)?.groupValues?.getOrNull(1)?.trim()?.trim('"', '\'')
+    if (!quotedMatch.isNullOrBlank()) {
+        val decoded = runCatching { Uri.decode(quotedMatch) }.getOrDefault(quotedMatch)
+            .substringAfterLast('/')
+            .substringAfterLast('\\')
+            .trim()
+        if (decoded.isNotBlank()) return decoded
+    }
+    return null
+}
+
+private fun decodeUrlFilenamePiece(raw: String): String {
+    var s = raw.trim()
+    repeat(2) {
+        val decoded = runCatching { java.net.URLDecoder.decode(s, "UTF-8") }
+            .getOrElse { runCatching { Uri.decode(s) }.getOrDefault(s) }
+        if (decoded == s) return@repeat
+        s = decoded
+    }
+    return s.substringAfterLast('/').substringAfterLast('\\').trim()
+}
+
+private fun isGenericOrOpaqueFileStem(rawNameOrStem: String): Boolean {
+    val stem = rawNameOrStem.substringBeforeLast('.').trim().lowercase(Locale.US)
+    if (stem.length <= 1) return true
+    if (stem in GENERIC_GRABBED_STEMS) return true
+    if (Regex("^\\d+$").matches(stem)) return true
+    if (Regex("^(?:240|360|480|540|720|1080|1440|2160)p?$").matches(stem)) return true
+    if (Regex("^dash_\\d+$").matches(stem)) return true
+    if (Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").matches(stem)) return true
+    if (stem.length >= 20 && Regex("^[0-9a-f_-]+$").matches(stem)) return true
+    if (stem.length >= 28 && !stem.contains(' ') && !stem.contains('_') && !stem.contains('-') && Regex("^[a-z0-9]+$").matches(stem)) {
+        return true
+    }
+    return false
+}
+
+private fun cleanPageOrDomLabelForFilename(raw: String): String {
+    var cleaned = raw
+        .replace(Regex("[\\r\\n\\t]+"), " ")
+        .replace(Regex("\\s{2,}"), " ")
+        .trim()
+    if (cleaned.isBlank()) return ""
+    // Strip common site branding suffixes like " - YouTube", " | Vimeo", " — Site"
+    val separators = listOf(" - ", " | ", " — ", " – ", " :: ", " • ")
+    for (sep in separators) {
+        val idx = cleaned.lastIndexOf(sep)
+        if (idx > 8 && cleaned.length - (idx + sep.length) <= 32) {
+            val suffix = cleaned.substring(idx + sep.length).trim().lowercase(Locale.US)
+            if (suffix.isNotEmpty() && !suffix.contains('.')) {
+                cleaned = cleaned.substring(0, idx).trim()
+                break
+            }
+        }
+    }
+    return cleaned
+        .replace(Regex("[\\\\/:*?\"<>|]+"), " ")
+        .replace(Regex("\\s{2,}"), " ")
+        .trim()
+        .take(120)
+}
+
+private fun extractFilenameFromUrlQueryParams(url: String): Pair<String, Int>? {
+    val parsed = runCatching { Uri.parse(url) }.getOrNull() ?: return null
+    val names = runCatching { parsed.queryParameterNames }.getOrNull().orEmpty()
+    if (names.isEmpty()) return null
+
+    // 1. Check response-content-disposition / rscd / content-disposition query params (S3, R2, GCS, CDN)
+    for (param in names) {
+        val lower = param.lowercase(Locale.US)
+        if (lower == "response-content-disposition" || lower == "rscd" || lower == "content-disposition" || lower == "disposition") {
+            val value = runCatching { parsed.getQueryParameter(param) }.getOrNull()
+            val cdName = parseFilenameFromContentDispositionHeader(value)
+            if (!cdName.isNullOrBlank()) {
+                return MalwareProtectionEngine.sanitizeDownloadFilename(cdName) to 4
+            }
+        }
+    }
+
+    // 2. Check explicit filename query params across cloud hosts and download endpoints
+    val filenameKeys = listOf("filename", "file_name", "attname", "saveas", "docname", "file", "name", "fn", "download", "title")
+    for (key in filenameKeys) {
+        val matchedParam = names.firstOrNull { it.equals(key, ignoreCase = true) } ?: continue
+        val rawVal = runCatching { parsed.getQueryParameter(matchedParam) }.getOrNull()?.trim().orEmpty()
+        if (rawVal.isBlank() || rawVal.equals("1", true) || rawVal.equals("true", true) || rawVal.equals("yes", true)) {
+            continue
+        }
+        val decoded = decodeUrlFilenamePiece(rawVal)
+        if (decoded.length >= 2 && !isGenericOrOpaqueFileStem(decoded)) {
+            return MalwareProtectionEngine.sanitizeDownloadFilename(decoded) to 2
+        }
+    }
+    return null
+}
+
+private fun extractFilenameFromUrlPath(url: String): Pair<String?, String> {
+    val parsed = runCatching { Uri.parse(url) }.getOrNull() ?: return null to ""
+    val segments = parsed.pathSegments.orEmpty().map { decodeUrlFilenamePiece(it) }.filter { it.isNotBlank() }
+    if (segments.isEmpty()) return null to ""
+
+    var foundExt = ""
+    for (seg in segments.asReversed().take(3)) {
+        val ext = if (seg.contains('.')) {
+            seg.substringAfterLast('.', "").lowercase(Locale.US).takeIf { it.length in 2..6 && it !in WEB_SCRIPT_EXTENSIONS }.orEmpty()
+        } else ""
+        if (foundExt.isEmpty() && ext.isNotEmpty()) {
+            foundExt = ext
+        }
+        if (ext.isNotEmpty() && !isGenericOrOpaqueFileStem(seg)) {
+            return MalwareProtectionEngine.sanitizeDownloadFilename(seg) to ext
+        }
+    }
+    // Check last segment even if no extension, provided it's clearly a descriptive filename stem
+    val last = segments.last()
+    if (!last.contains('.') && last.length in 4..96 && !isGenericOrOpaqueFileStem(last) &&
+        (last.contains(' ') || last.contains('_') || last.contains('-'))
+    ) {
+        return MalwareProtectionEngine.sanitizeDownloadFilename(last) to foundExt
+    }
+    return null to foundExt
+}
+
+private fun resolveAccurateGrabbedFileName(
+    url: String,
+    domDownloadAttr: String? = null,
+    domLabel: String? = null,
+    pageTitle: String? = null,
+    contentDisposition: String? = null,
+    mimeType: String? = null,
+    fallbackKind: GrabbedMediaKind = GrabbedMediaKind.FILE
+): AccurateGrabbedNameResult {
+    val lowerUrl = url.lowercase(Locale.US)
+    val platform = MediaPlatform.detectFromUrl(url).let {
+        if (it == MediaPlatform.UNSUPPORTED) MediaPlatform.DIRECT else it
+    }
+    val (pathFile, pathExt) = extractFilenameFromUrlPath(url)
+    val queryResult = extractFilenameFromUrlQueryParams(url)
+    val cdName = parseFilenameFromContentDispositionHeader(contentDisposition)
+
+    val cleanDlAttr = domDownloadAttr?.trim()
+        ?.takeIf { it.isNotBlank() && !it.equals("download", true) && !it.equals("true", true) }
+        ?.let { decodeUrlFilenamePiece(it) }
+        ?.takeIf { it.isNotBlank() }
+
+    val cleanDomLabel = domLabel?.let { cleanPageOrDomLabelForFilename(it) }
+        ?.takeIf { it.length >= 2 && !isGenericOrOpaqueFileStem(it) }
+
+    val cleanPageTitle = pageTitle?.let { cleanPageOrDomLabelForFilename(it) }
+        ?.takeIf { it.length >= 2 && !isGenericOrOpaqueFileStem(it) }
+
+    val hostFallback = runCatching { Uri.parse(url).host?.removePrefix("www.") }.getOrNull()
+        ?.substringBefore('.')
+        ?.takeIf { it.isNotBlank() }
+        ?: "download"
+
+    // Pick best candidate name with explicit confidence score (4 = server header, 3 = HTML download attr, 2 = URL, 1 = DOM, 0 = page title)
+    val (chosenRawName, confidence) = when {
+        !cdName.isNullOrBlank() -> MalwareProtectionEngine.sanitizeDownloadFilename(cdName) to 4
+        queryResult != null && queryResult.second >= 4 -> queryResult.first to 4
+        !cleanDlAttr.isNullOrBlank() && !isGenericOrOpaqueFileStem(cleanDlAttr) ->
+            MalwareProtectionEngine.sanitizeDownloadFilename(cleanDlAttr) to 3
+        queryResult != null -> queryResult.first to 2
+        !pathFile.isNullOrBlank() -> pathFile to 2
+        !cleanDomLabel.isNullOrBlank() -> MalwareProtectionEngine.sanitizeDownloadFilename(cleanDomLabel) to 1
+        !cleanPageTitle.isNullOrBlank() -> MalwareProtectionEngine.sanitizeDownloadFilename(cleanPageTitle) to 0
+        else -> MalwareProtectionEngine.sanitizeDownloadFilename("${hostFallback}_${System.currentTimeMillis() % 10000}") to 0
+    }
+
+    // Determine best extension across chosen name, URL path, MIME type, and fallbackKind
+    val nameExt = if (chosenRawName.contains('.')) {
+        chosenRawName.substringAfterLast('.', "").lowercase(Locale.US)
+            .takeIf { it.length in 1..6 && it !in WEB_SCRIPT_EXTENSIONS && it !in setOf("bin", "tmp", "part") }
+            .orEmpty()
+    } else ""
+
+    val isHls = pathExt == "m3u8" || lowerUrl.contains(".m3u8") || mimeType?.contains("mpegurl", true) == true
+    val isDash = pathExt == "mpd" || lowerUrl.contains(".mpd") || mimeType?.contains("dash+xml", true) == true
+
+    val seededName = when {
+        nameExt.isNotEmpty() -> chosenRawName
+        isHls -> "$chosenRawName.m3u8"
+        isDash -> "$chosenRawName.mpd"
+        pathExt.isNotEmpty() -> "$chosenRawName.$pathExt"
+        else -> chosenRawName
+    }
+
+    val resolvedType = DragonDownloadManager.resolveFileTypeAndName(
+        rawFilename = seededName,
+        rawMimeType = mimeType,
+        url = url,
+        platform = platform
+    )
+
+    val finalExt = when {
+        isHls -> "m3u8"
+        isDash -> "mpd"
+        resolvedType.extension != "bin" -> resolvedType.extension
+        pathExt.isNotEmpty() -> pathExt
+        fallbackKind == GrabbedMediaKind.VIDEO -> "mp4"
+        fallbackKind == GrabbedMediaKind.AUDIO -> "m4a"
+        else -> "bin"
+    }
+
+    val finalFilename = if (finalExt != "bin" && !resolvedType.filename.endsWith(".$finalExt", ignoreCase = true)) {
+        val base = if (resolvedType.filename.endsWith(".bin", ignoreCase = true)) {
+            resolvedType.filename.dropLast(4)
+        } else {
+            resolvedType.filename
+        }
+        "$base.$finalExt"
+    } else {
+        resolvedType.filename
+    }
+
+    val finalMime = when {
+        isHls -> "application/vnd.apple.mpegurl"
+        isDash -> "application/dash+xml"
+        resolvedType.mimeType.isNotBlank() && resolvedType.mimeType != "application/octet-stream" -> resolvedType.mimeType
+        finalExt == "mp4" -> "video/mp4"
+        finalExt == "m4a" -> "audio/mp4"
+        else -> resolvedType.mimeType
+    }
+
+    val finalKind = when {
+        isHls || isDash || resolvedType.isVideo -> GrabbedMediaKind.VIDEO
+        resolvedType.isAudio -> GrabbedMediaKind.AUDIO
+        finalExt != "bin" && resolvedType.isGenericFile -> GrabbedMediaKind.FILE
+        else -> fallbackKind
+    }
+
+    return AccurateGrabbedNameResult(
+        filename = MalwareProtectionEngine.sanitizeDownloadFilename(finalFilename),
+        extension = finalExt,
+        mimeType = finalMime,
+        kind = finalKind,
+        confidence = confidence
+    )
+}
+
+private data class ProbedRemoteFileMeta(
+    val contentDisposition: String?,
+    val contentType: String?,
+    val contentLength: Long
+)
+
+private fun probeGrabbedCandidateServerMetadata(
+    targetUrl: String,
+    refererUrl: String,
+    userAgent: String
+): ProbedRemoteFileMeta? {
+    if (!targetUrl.startsWith("http://", true) && !targetUrl.startsWith("https://", true)) return null
+    val cookieHeader = collectBrowserDownloadCookies(
+        downloadUrl = targetUrl,
+        refererUrl = refererUrl,
+        explicitPageCookies = null
+    )
+
+    fun runProbe(method: String, rangeHeader: String?): ProbedRemoteFileMeta? {
+        var conn: java.net.HttpURLConnection? = null
+        return try {
+            conn = (java.net.URL(targetUrl).openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = method
+                instanceFollowRedirects = true
+                connectTimeout = 2500
+                readTimeout = 2500
+                setRequestProperty("User-Agent", userAgent)
+                if (refererUrl.startsWith("http", true)) {
+                    setRequestProperty("Referer", refererUrl)
+                }
+                if (!cookieHeader.isNullOrBlank()) {
+                    setRequestProperty("Cookie", cookieHeader)
+                }
+                if (!rangeHeader.isNullOrBlank()) {
+                    setRequestProperty("Range", rangeHeader)
+                }
+            }
+            val code = conn.responseCode
+            if (code !in 200..299 && code != 206) {
+                return null
+            }
+            val cd = conn.getHeaderField("Content-Disposition")
+            val ct = conn.getHeaderField("Content-Type")?.substringBefore(';')?.trim()
+            val cr = conn.getHeaderField("Content-Range")
+            val totalFromCr = cr?.substringAfterLast('/')?.trim()?.toLongOrNull() ?: -1L
+            val cl = conn.getHeaderField("Content-Length")?.trim()?.toLongOrNull() ?: -1L
+            val finalLen = if (totalFromCr > 0L) totalFromCr else if (code == 200 && cl > 0L) cl else -1L
+            // Ignore HTML error/login pages masquerading as files
+            if (ct != null && ct.startsWith("text/html", ignoreCase = true) && cd.isNullOrBlank()) {
+                return null
+            }
+            ProbedRemoteFileMeta(
+                contentDisposition = cd,
+                contentType = ct,
+                contentLength = finalLen
+            )
+        } catch (_: Throwable) {
+            null
+        } finally {
+            runCatching { conn?.disconnect() }
+        }
+    }
+
+    return runProbe("HEAD", null) ?: runProbe("GET", "bytes=0-0")
+}
+
 internal fun resolveWebViewDownloadFileName(
     url: String,
     contentDisposition: String?,
@@ -4530,42 +5121,12 @@ internal fun resolveWebViewDownloadFileName(
 ): String {
     val cleanExplicit = explicitFilename?.trim()?.takeIf { it.isNotBlank() && it != "download" && it != "true" }
     if (cleanExplicit != null) {
-        return runCatching { Uri.decode(cleanExplicit) }.getOrDefault(cleanExplicit)
-            .substringAfterLast('/')
-            .substringAfterLast('\\')
-            .trim()
+        return decodeUrlFilenamePiece(cleanExplicit)
     }
-    if (!contentDisposition.isNullOrBlank()) {
-        val utf8Match = Regex("filename\\*\\s*=\\s*(?:UTF-8''|utf-8'')([^;]+)", RegexOption.IGNORE_CASE)
-            .find(contentDisposition)?.groupValues?.getOrNull(1)?.trim()?.trim('"', '\'')
-        if (!utf8Match.isNullOrBlank()) {
-            val decoded = runCatching { Uri.decode(utf8Match) }.getOrDefault(utf8Match)
-                .substringAfterLast('/')
-                .substringAfterLast('\\')
-                .trim()
-            if (decoded.isNotBlank()) return decoded
-        }
-        val quotedMatch = Regex("filename\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
-            .find(contentDisposition)?.groupValues?.getOrNull(1)?.trim()
-            ?: Regex("filename\\s*=\\s*([^;]+)", RegexOption.IGNORE_CASE)
-                .find(contentDisposition)?.groupValues?.getOrNull(1)?.trim()?.trim('"', '\'')
-        if (!quotedMatch.isNullOrBlank()) {
-            val decoded = runCatching { Uri.decode(quotedMatch) }.getOrDefault(quotedMatch)
-                .substringAfterLast('/')
-                .substringAfterLast('\\')
-                .trim()
-            if (decoded.isNotBlank()) return decoded
-        }
-    }
-    val pathSegment = runCatching {
-        Uri.parse(url).lastPathSegment?.let { Uri.decode(it) }?.trim()
-    }.getOrNull()
-    if (!pathSegment.isNullOrBlank() && pathSegment.contains('.')) {
-        val extCandidate = pathSegment.substringAfterLast('.', "").lowercase(Locale.US)
-        if (extCandidate.length in 2..6 && extCandidate !in setOf("html", "htm", "php", "asp", "aspx", "jsp")) {
-            return pathSegment
-        }
-    }
+    parseFilenameFromContentDispositionHeader(contentDisposition)?.let { return it }
+    extractFilenameFromUrlQueryParams(url)?.first?.let { return it }
+    val (pathFile, _) = extractFilenameFromUrlPath(url)
+    if (!pathFile.isNullOrBlank()) return pathFile
     val guessed = runCatching { URLUtil.guessFileName(url, contentDisposition, mimetype) }.getOrNull()
     return guessed?.takeIf { it.isNotBlank() } ?: "download_${System.currentTimeMillis()}.bin"
 }
@@ -4684,9 +5245,10 @@ private fun createConfiguredBrowserWebView(
     desktopMode: Boolean,
     warpDns: com.example.data.downloader.CloudflareWarpDns,
     browserRepo: BrowserStateRepository,
+    downloadManager: DragonDownloadManager? = null,
     mainHandler: Handler,
     onDownloadIntercepted: (MediaInfo, MediaFormatOption) -> Unit,
-    onRendererCrashed: (tabId: String, crashedView: WebView?) -> Unit = { _, _ -> },
+    onRendererCrashed: (tabId: String, crashedView: WebView?, shouldAutoReload: Boolean) -> Unit = { _, _, _ -> },
     onLongPressLink: (String) -> Unit = {},
     onShowFullscreenVideo: (View, WebChromeClient.CustomViewCallback?) -> Unit = { _, _ -> },
     onHideFullscreenVideo: () -> Unit = {},
@@ -4788,6 +5350,33 @@ private fun createConfiguredBrowserWebView(
                 ?: tab.url
         }
 
+        fun isTelegramWebExplicitDownloadUrl(rawUrl: String): Boolean {
+            val lower = rawUrl.trim().lowercase(Locale.US)
+            if (!lower.startsWith("https://") && !lower.startsWith("http://")) return false
+            val isTgWebHost = lower.contains("://web.telegram.org/") ||
+                lower.contains("://webk.telegram.org/") ||
+                lower.contains("://webz.telegram.org/") ||
+                lower.contains("://weba.telegram.org/")
+            if (!isTgWebHost) return false
+            return lower.contains("/download/") || lower.contains("/d/")
+        }
+
+        fun isTelegramWebStreamUrl(rawUrl: String): Boolean {
+            val lower = rawUrl.trim().lowercase(Locale.US)
+            if (!lower.startsWith("https://") && !lower.startsWith("http://")) return false
+            val isTgWebHost = lower.contains("://web.telegram.org/") ||
+                lower.contains("://webk.telegram.org/") ||
+                lower.contains("://webz.telegram.org/") ||
+                lower.contains("://weba.telegram.org/")
+            if (!isTgWebHost) return false
+            return lower.contains("/stream/") ||
+                lower.contains("/progressive/") ||
+                lower.contains("/download/") ||
+                lower.contains("/d/")
+        }
+
+        val recentDispatchedStreamUrls = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
         fun dispatchWebViewDownload(
             rawUrl: String,
             userAgent: String?,
@@ -4800,27 +5389,34 @@ private fun createConfiguredBrowserWebView(
         ) {
             val cleanUrl = rawUrl.trim()
             if (cleanUrl.isBlank()) return
-            if (cleanUrl.startsWith("blob:", ignoreCase = true) || cleanUrl.startsWith("data:", ignoreCase = true)) {
-                val safeBlobUrl = JSONObject.quote(cleanUrl)
-                val safeName = JSONObject.quote(explicitFilename?.takeIf { it.isNotBlank() } ?: resolveWebViewDownloadFileName(cleanUrl, contentDisposition, mimetype))
+            val isBlobOrData = cleanUrl.startsWith("blob:", ignoreCase = true) ||
+                cleanUrl.startsWith("data:", ignoreCase = true)
+            val isTgWebStream = !isBlobOrData && isTelegramWebStreamUrl(cleanUrl)
+            if (isBlobOrData || isTgWebStream) {
+                val nowMs = android.os.SystemClock.elapsedRealtime()
+                val prevMs = recentDispatchedStreamUrls[cleanUrl]
+                if (prevMs != null && (nowMs - prevMs) < 3_500L) {
+                    return
+                }
+                recentDispatchedStreamUrls[cleanUrl] = nowMs
+                val safeTargetUrl = JSONObject.quote(cleanUrl)
+                val safeName = JSONObject.quote(
+                    explicitFilename?.takeIf { it.isNotBlank() }
+                        ?: resolveWebViewDownloadFileName(cleanUrl, contentDisposition, mimetype)
+                )
                 val safeMime = JSONObject.quote(mimetype ?: "application/octet-stream")
+                val safeTotalHint = contentLength.coerceAtLeast(-1L)
+                val targetConns = (downloadManager?.maxConnectionsFlow?.value ?: 8).coerceIn(1, 16)
                 mainHandler.post {
                     evaluateJavascript(
-                        """
-                        (function(){
-                          try {
-                            fetch($safeBlobUrl).then(function(r){ return r.blob(); }).then(function(b){
-                              var reader = new FileReader();
-                              reader.onloadend = function(){
-                                if (window.DragonBrowserBridge && reader.result) {
-                                  window.DragonBrowserBridge.onBlobDownloadBase64(reader.result, $safeName, b.type || $safeMime);
-                                }
-                              };
-                              reader.readAsDataURL(b);
-                            });
-                          } catch(e) {}
-                        })();
-                        """.trimIndent(),
+                        buildAcceleratedWebStreamJs(
+                            safeTargetUrl = safeTargetUrl,
+                            safeName = safeName,
+                            safeMime = safeMime,
+                            totalHintBytes = safeTotalHint,
+                            isTelegramStream = isTgWebStream,
+                            maxConnections = targetConns
+                        ),
                         null
                     )
                 }
@@ -4939,7 +5535,7 @@ private fun createConfiguredBrowserWebView(
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             runCatching {
-                setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true)
+                setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
             }
         }
 
@@ -4986,12 +5582,93 @@ private fun createConfiguredBrowserWebView(
                 WebViewCompat.addDocumentStartJavaScript(this, DesktopViewportController.DESKTOP_VIEWPORT_CONTROLLER_JS, setOf("*"))
                 WebViewCompat.addDocumentStartJavaScript(this, PASSKEY_WEBAUTHN_HOOK_JS, setOf("*"))
                 WebViewCompat.addDocumentStartJavaScript(this, WEB_PIP_POLYFILL_JS, setOf("*"))
+                WebViewCompat.addDocumentStartJavaScript(this, UNIVERSAL_DOWNLOAD_HOOK_JS, setOf("*"))
             }
         }
 
         val cookieManager = CookieManager.getInstance()
         cookieManager.setAcceptCookie(true)
         cookieManager.setAcceptThirdPartyCookies(this, true)
+
+        val activeBlobStreams = java.util.concurrent.ConcurrentHashMap<String, ActiveNativeBlobStream>()
+        val ownedTgWebKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        val blobStreamExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val webViewWeakRef = java.lang.ref.WeakReference<WebView>(this)
+        var controlListenerRef: ((String, String?, String?, String?, DragonDownloadManager.ExternalStreamControlAction) -> Boolean)? = null
+        val streamControlListener: (String, String?, String?, String?, DragonDownloadManager.ExternalStreamControlAction) -> Boolean =
+            { taskId, webTaskKey, streamId, filename, action ->
+                val wv = webViewWeakRef.get()
+                if (wv == null) {
+                    controlListenerRef?.let { downloadManager?.unregisterExternalStreamControlListener(it) }
+                    false
+                } else {
+                    val actionStr = when (action) {
+                        DragonDownloadManager.ExternalStreamControlAction.PAUSE -> "pause"
+                        DragonDownloadManager.ExternalStreamControlAction.RESUME -> "resume"
+                        DragonDownloadManager.ExternalStreamControlAction.CANCEL -> "cancel"
+                    }
+                    val matchingStreamEntry = activeBlobStreams.entries.firstOrNull { (sid, s) ->
+                        (streamId != null && sid == streamId) || s.taskId == taskId
+                    }
+                    val resolvedStreamId = matchingStreamEntry?.key ?: streamId
+                    val tabUrlSafe = (browserRepo.tabsFlow.value.find { it.id == tab.id }?.url ?: tab.url).lowercase(Locale.US)
+                    val ownsKey = !webTaskKey.isNullOrBlank() && webTaskKey in ownedTgWebKeys
+                    val isTgPage = ownsKey ||
+                        matchingStreamEntry?.value?.isTelegramOrigin == true ||
+                        tabUrlSafe.contains("telegram.org") ||
+                        tabUrlSafe.contains("t.me/")
+                    var handled = false
+
+                    if (matchingStreamEntry != null && action == DragonDownloadManager.ExternalStreamControlAction.CANCEL) {
+                        handled = true
+                        blobStreamExecutor.execute {
+                            val removed = activeBlobStreams.remove(matchingStreamEntry.key)
+                            if (removed != null) {
+                                removed.aborted = true
+                                runCatching { removed.outputStream.close() }
+                                runCatching { removed.tempFile.delete() }
+                            }
+                        }
+                    }
+
+                    if (!resolvedStreamId.isNullOrBlank() && (matchingStreamEntry != null || isTgPage)) {
+                        handled = true
+                        val safeSid = JSONObject.quote(resolvedStreamId)
+                        mainHandler.post {
+                            runCatching {
+                                wv.resumeTimers()
+                                wv.onResume()
+                                wv.evaluateJavascript(
+                                    "if(window.__dragonControlStream){window.__dragonControlStream($safeSid,'$actionStr');}",
+                                    null
+                                )
+                            }
+                        }
+                    }
+
+                    val resolvedFilename = filename?.takeIf { it.isNotBlank() }
+                        ?: matchingStreamEntry?.value?.cleanName?.takeIf { it.isNotBlank() }
+                    val tgControlKey = webTaskKey?.takeIf { it.isNotBlank() } ?: ""
+                    if (isTgPage && (tgControlKey.isNotBlank() || !resolvedFilename.isNullOrBlank())) {
+                        handled = true
+                        val safeKey = JSONObject.quote(tgControlKey)
+                        val safeFilename = JSONObject.quote(resolvedFilename ?: "")
+                        mainHandler.post {
+                            runCatching {
+                                wv.resumeTimers()
+                                wv.onResume()
+                                wv.evaluateJavascript(
+                                    "if(window.__dragonControlTelegramDownload){window.__dragonControlTelegramDownload($safeKey,'$actionStr',$safeFilename);}",
+                                    null
+                                )
+                            }
+                        }
+                    }
+                    handled
+                }
+            }
+        controlListenerRef = streamControlListener
+        downloadManager?.registerExternalStreamControlListener(streamControlListener)
 
         addJavascriptInterface(
             object {
@@ -5000,6 +5677,7 @@ private fun createConfiguredBrowserWebView(
                     try {
                         val arr = JSONArray(jsonArrayStr)
                         mainHandler.post {
+                            val activeTabTitle = browserRepo.tabsFlow.value.find { it.id == tab.id }?.title ?: tab.title
                             for (i in 0 until arr.length()) {
                                 val obj = arr.optJSONObject(i) ?: continue
                                 val mediaUrl = obj.optString("url", "").trim()
@@ -5007,21 +5685,32 @@ private fun createConfiguredBrowserWebView(
                                     continue
                                 }
                                 val lower = mediaUrl.lowercase(Locale.US)
-                                val ext = mediaUrl.substringBefore("?").substringAfterLast('.', "")
-                                    .lowercase(Locale.US).takeIf { it.length in 2..5 } ?: "mp4"
-                                val kind = when {
-                                    WebViewMediaExtractor.isLikelyAudioStreamUrl(lower) -> GrabbedMediaKind.AUDIO
-                                    WebViewMediaExtractor.isLikelyDownloadableFileUrl(lower) -> GrabbedMediaKind.FILE
+                                val kindHint = obj.optString("kind", "").lowercase(Locale.US)
+                                val fallbackKind = when {
+                                    kindHint == "audio" || WebViewMediaExtractor.isLikelyAudioStreamUrl(lower) -> GrabbedMediaKind.AUDIO
+                                    kindHint == "file" || WebViewMediaExtractor.isLikelyDownloadableFileUrl(lower) -> GrabbedMediaKind.FILE
                                     else -> GrabbedMediaKind.VIDEO
                                 }
+                                val resolved = resolveAccurateGrabbedFileName(
+                                    url = mediaUrl,
+                                    domDownloadAttr = obj.optString("downloadAttr", "").takeIf { it.isNotBlank() },
+                                    domLabel = obj.optString("label", "").takeIf { it.isNotBlank() },
+                                    pageTitle = obj.optString("pageTitle", "").ifBlank { activeTabTitle },
+                                    mimeType = obj.optString("mime", "").takeIf { it.isNotBlank() },
+                                    fallbackKind = fallbackKind
+                                )
+                                val hostLabel = runCatching { Uri.parse(mediaUrl).host?.removePrefix("www.") }.getOrNull()
+                                    ?.takeIf { it.isNotBlank() } ?: "Page DOM"
                                 browserRepo.recordGrabbedMedia(
                                     tabId = tab.id,
                                     candidate = GrabbedMediaCandidate(
                                         url = mediaUrl,
-                                        title = obj.optString("label", "").ifBlank { tab.title },
-                                        kind = kind,
-                                        containerExt = ext,
-                                        sourceLabel = "Page DOM"
+                                        title = resolved.filename,
+                                        kind = resolved.kind,
+                                        containerExt = resolved.extension,
+                                        sourceLabel = hostLabel,
+                                        mimeType = resolved.mimeType,
+                                        filenameConfidence = resolved.confidence
                                     )
                                 )
                             }
@@ -5068,11 +5757,24 @@ private fun createConfiguredBrowserWebView(
                             val rawBase64 = dataUrlOrBase64.substringAfter("base64,", dataUrlOrBase64)
                             val bytes = android.util.Base64.decode(rawBase64, android.util.Base64.DEFAULT)
                             if (bytes.isEmpty()) return@Thread
-                            val cleanName = MalwareProtectionEngine.sanitizeDownloadFilename(
+                            val refererUrl = resolveCurrentRefererUrl()
+                            val rawSanitized = MalwareProtectionEngine.sanitizeDownloadFilename(
                                 fileName?.trim()?.takeIf { it.isNotBlank() }
                                     ?: "browser_download_${System.currentTimeMillis()}.bin"
                             )
-                            val headerSlice = bytes.copyOf(bytes.size.coerceAtMost(128))
+                            val headerSlice = bytes.copyOf(bytes.size.coerceAtMost(256))
+                            val isTelegramOrigin = refererUrl.contains("telegram.org", ignoreCase = true) ||
+                                refererUrl.contains("t.me", ignoreCase = true)
+                            val resolvedType = DragonDownloadManager.resolveFileTypeAndName(
+                                rawFilename = rawSanitized,
+                                rawMimeType = mimeType,
+                                headerBytes = headerSlice,
+                                url = refererUrl,
+                                platform = if (isTelegramOrigin) MediaPlatform.TELEGRAM else MediaPlatform.DIRECT
+                            )
+                            val cleanName = MalwareProtectionEngine.sanitizeDownloadFilename(resolvedType.filename)
+                            val resolvedMime = resolvedType.mimeType
+                            val subFolder = resolvedType.subFolder
                             val disguisedErr = MalwareProtectionEngine.detectDisguisedBinaryError(cleanName, headerSlice)
                             if (disguisedErr != null) {
                                 MalwareProtectionEngine.recordThreatEvent(
@@ -5089,9 +5791,9 @@ private fun createConfiguredBrowserWebView(
                                 return@Thread
                             }
                             val dlVerdict = MalwareProtectionEngine.inspectDownload(
-                                url = resolveCurrentRefererUrl(),
+                                url = refererUrl,
                                 rawFilename = cleanName,
-                                mimeType = mimeType,
+                                mimeType = resolvedMime,
                                 context = context
                             )
                             if (dlVerdict.isCriticalBlock) {
@@ -5108,41 +5810,112 @@ private fun createConfiguredBrowserWebView(
                                 }
                                 return@Thread
                             }
-                            val subFolder = DragonDownloadManager.subFolderForType(
-                                extension = cleanName.substringAfterLast('.', "bin"),
-                                mimeType = mimeType ?: "application/octet-stream",
-                                isAudioOnly = false,
-                                isGenericFile = true
-                            )
-                            val resolvedMime = mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
-                            var exportedToPublic = false
-                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                                try {
-                                    val resolver = context.contentResolver
-                                    val values = android.content.ContentValues().apply {
-                                        put(android.provider.MediaStore.Downloads.DISPLAY_NAME, cleanName)
-                                        put(android.provider.MediaStore.Downloads.MIME_TYPE, resolvedMime)
-                                        put(
-                                            android.provider.MediaStore.Downloads.RELATIVE_PATH,
-                                            "${android.os.Environment.DIRECTORY_DOWNLOADS}/$subFolder"
+
+                            val tempDir = java.io.File(context.cacheDir, "ddm_blob_streams").apply { mkdirs() }
+                            val tempFile = java.io.File(tempDir, "b64_${System.currentTimeMillis()}.part")
+                            tempFile.writeBytes(bytes)
+
+                            var savedFilePath = "${android.os.Environment.DIRECTORY_DOWNLOADS}/$subFolder/$cleanName"
+                            var savedPublicUriString: String? = null
+                            if (downloadManager != null) {
+                                val (exportedFile, exportedUri) = downloadManager.exportFileToCategoryDownloads(
+                                    sourceFile = tempFile,
+                                    filename = cleanName,
+                                    mimeType = resolvedMime,
+                                    isAudioOnly = resolvedType.isAudio,
+                                    isGenericFile = resolvedType.isGenericFile,
+                                    extension = resolvedType.extension,
+                                    url = refererUrl,
+                                    platform = if (isTelegramOrigin) MediaPlatform.TELEGRAM else MediaPlatform.DIRECT
+                                )
+                                savedFilePath = exportedFile.absolutePath
+                                savedPublicUriString = exportedUri?.toString()
+                            } else {
+                                var exportedToPublic = false
+                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                                    try {
+                                        val resolver = context.contentResolver
+                                        val values = android.content.ContentValues().apply {
+                                            put(android.provider.MediaStore.Downloads.DISPLAY_NAME, cleanName)
+                                            put(android.provider.MediaStore.Downloads.MIME_TYPE, resolvedMime)
+                                            put(
+                                                android.provider.MediaStore.Downloads.RELATIVE_PATH,
+                                                "${android.os.Environment.DIRECTORY_DOWNLOADS}/$subFolder"
+                                            )
+                                            put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+                                        }
+                                        val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                                        if (uri != null) {
+                                            resolver.openOutputStream(uri)?.use { out -> out.write(bytes) }
+                                            values.clear()
+                                            values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+                                            resolver.update(uri, values, null, null)
+                                            exportedToPublic = true
+                                            savedPublicUriString = uri.toString()
+                                        }
+                                    } catch (_: Throwable) {}
+                                } else {
+                                    try {
+                                        @Suppress("DEPRECATION")
+                                        val pubDir = java.io.File(
+                                            android.os.Environment.getExternalStoragePublicDirectory(
+                                                android.os.Environment.DIRECTORY_DOWNLOADS
+                                            ),
+                                            subFolder
+                                        ).apply { mkdirs() }
+                                        val dest = java.io.File(pubDir, cleanName)
+                                        dest.writeBytes(bytes)
+                                        android.media.MediaScannerConnection.scanFile(
+                                            context,
+                                            arrayOf(dest.absolutePath),
+                                            arrayOf(resolvedMime),
+                                            null
                                         )
-                                        put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
-                                    }
-                                    val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                                    if (uri != null) {
-                                        resolver.openOutputStream(uri)?.use { out -> out.write(bytes) }
-                                        values.clear()
-                                        values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
-                                        resolver.update(uri, values, null, null)
+                                        savedFilePath = dest.absolutePath
                                         exportedToPublic = true
-                                    }
-                                } catch (_: Throwable) {}
+                                    } catch (_: Throwable) {}
+                                }
+                                if (!exportedToPublic) {
+                                    val fallbackDir = java.io.File(context.cacheDir, "ddm_exports/$subFolder").apply { mkdirs() }
+                                    val dest = java.io.File(fallbackDir, cleanName)
+                                    dest.writeBytes(bytes)
+                                    savedFilePath = dest.absolutePath
+                                }
+                                runCatching { tempFile.delete() }
                             }
-                            if (!exportedToPublic) {
-                                // Fallback to cacheDir so permanent App User Data does not bloat
-                                val cacheDir = java.io.File(context.cacheDir, "ddm_exports/$subFolder").apply { mkdirs() }
-                                java.io.File(cacheDir, cleanName).writeBytes(bytes)
+
+                            val taskId = if (isTelegramOrigin) {
+                                downloadManager?.findActiveTelegramWebTaskIdByName(cleanName)
+                                    ?: "stream_b64_${System.currentTimeMillis()}"
+                            } else {
+                                "stream_b64_${System.currentTimeMillis()}"
                             }
+                            downloadManager?.let { dm ->
+                                if (dm.tasksFlow.value.none { it.id == taskId }) {
+                                    dm.startExternalStreamTask(
+                                        taskId = taskId,
+                                        filename = cleanName,
+                                        sourceUrl = refererUrl,
+                                        mimeType = resolvedMime,
+                                        totalBytes = bytes.size.toLong(),
+                                        platform = if (isTelegramOrigin) MediaPlatform.TELEGRAM else MediaPlatform.DIRECT,
+                                        activeConnections = 1,
+                                        creatorLabel = if (isTelegramOrigin) "Telegram Web" else "Dragon Browser"
+                                    )
+                                }
+                                dm.completeExternalStreamTask(
+                                    taskId = taskId,
+                                    savedFilePath = savedFilePath,
+                                    publicUriString = savedPublicUriString,
+                                    finalBytes = bytes.size.toLong(),
+                                    resolvedFilename = cleanName,
+                                    resolvedExtension = resolvedType.extension,
+                                    resolvedMimeType = resolvedMime,
+                                    isAudioOnly = resolvedType.isAudio,
+                                    isGenericFile = resolvedType.isGenericFile
+                                )
+                            }
+
                             val textCandidate = if (bytes.size <= 5 * 1024 * 1024) {
                                 val extLower = cleanName.substringAfterLast('.', "").lowercase(Locale.US)
                                 val mimeLower = resolvedMime.lowercase(Locale.US)
@@ -5181,11 +5954,470 @@ private fun createConfiguredBrowserWebView(
                                     }
                                     Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                                 } else {
-                                    Toast.makeText(context, "Downloaded to Download/$subFolder: $cleanName", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "Saved to Download/$subFolder: $cleanName", Toast.LENGTH_SHORT).show()
                                 }
                             }
                         } catch (_: Throwable) {}
                     }.start()
+                }
+
+                @JavascriptInterface
+                fun onBlobStreamStart(
+                    streamId: String,
+                    fileName: String?,
+                    mimeType: String?,
+                    totalBytes: Long,
+                    isTelegramAccelerated: Boolean
+                ) {
+                    if (streamId.isBlank()) return
+                    blobStreamExecutor.execute {
+                        try {
+                            val refererUrl = resolveCurrentRefererUrl()
+                            val isTelegramOrigin = isTelegramAccelerated ||
+                                streamId.startsWith("tg_") ||
+                                refererUrl.contains("telegram.org", ignoreCase = true) ||
+                                refererUrl.contains("t.me", ignoreCase = true)
+                            val rawSanitized = MalwareProtectionEngine.sanitizeDownloadFilename(
+                                fileName?.trim()?.takeIf { it.isNotBlank() }
+                                    ?: "browser_download_${System.currentTimeMillis()}.bin"
+                            )
+                            val resolvedType = DragonDownloadManager.resolveFileTypeAndName(
+                                rawFilename = rawSanitized,
+                                rawMimeType = mimeType,
+                                url = refererUrl,
+                                platform = if (isTelegramOrigin) MediaPlatform.TELEGRAM else MediaPlatform.DIRECT
+                            )
+                            val cleanName = MalwareProtectionEngine.sanitizeDownloadFilename(resolvedType.filename)
+                            val resolvedMime = resolvedType.mimeType
+                            val subFolder = resolvedType.subFolder
+                            val dlVerdict = MalwareProtectionEngine.inspectDownload(
+                                url = refererUrl,
+                                rawFilename = cleanName,
+                                mimeType = resolvedMime,
+                                context = context
+                            )
+                            if (dlVerdict.isCriticalBlock) {
+                                MalwareProtectionEngine.recordThreatEvent(
+                                    context = context,
+                                    category = dlVerdict.category,
+                                    severity = dlVerdict.riskLevel,
+                                    target = cleanName,
+                                    reason = dlVerdict.reason,
+                                    blocked = true
+                                )
+                                mainHandler.post {
+                                    Toast.makeText(context, "Blocked malicious download: ${dlVerdict.reason}", Toast.LENGTH_LONG).show()
+                                }
+                                return@execute
+                            }
+                            val streamsDir = java.io.File(context.cacheDir, "ddm_blob_streams").apply { mkdirs() }
+                            val safeStreamKey = streamId.replace(Regex("[^a-zA-Z0-9_-]"), "_").take(48)
+                            val tempFile = java.io.File(streamsDir, "${safeStreamKey}_${System.currentTimeMillis()}.part")
+                            val outStream = java.io.BufferedOutputStream(java.io.FileOutputStream(tempFile), 1024 * 1024)
+                            val activeConns = if (isTelegramAccelerated) 16 else 1
+                            val adoptedTaskId = if (isTelegramOrigin) {
+                                downloadManager?.findActiveTelegramWebTaskIdByName(cleanName)
+                            } else null
+                            val managerTaskId = adoptedTaskId ?: "stream_${safeStreamKey}_${System.currentTimeMillis()}"
+                            downloadManager?.bindExternalStreamId(managerTaskId, streamId)
+                            if (adoptedTaskId == null) {
+                                downloadManager?.startExternalStreamTask(
+                                    taskId = managerTaskId,
+                                    filename = cleanName,
+                                    sourceUrl = refererUrl,
+                                    mimeType = resolvedMime,
+                                    totalBytes = totalBytes,
+                                    platform = if (isTelegramOrigin) MediaPlatform.TELEGRAM else MediaPlatform.DIRECT,
+                                    activeConnections = activeConns,
+                                    creatorLabel = if (isTelegramOrigin) "Telegram Web" else "Dragon Browser"
+                                )
+                            } else {
+                                downloadManager?.updateExternalStreamTaskMetadata(
+                                    taskId = managerTaskId,
+                                    filename = cleanName,
+                                    extension = resolvedType.extension,
+                                    mimeType = resolvedMime,
+                                    isAudioOnly = resolvedType.isAudio,
+                                    isGenericFile = resolvedType.isGenericFile
+                                )
+                                downloadManager?.updateExternalStreamTaskProgress(
+                                    taskId = managerTaskId,
+                                    downloadedBytes = 0L,
+                                    totalBytes = totalBytes,
+                                    speedBytesPerSec = 0L,
+                                    activeConnections = activeConns
+                                )
+                            }
+                            activeBlobStreams[streamId] = ActiveNativeBlobStream(
+                                streamId = streamId,
+                                taskId = managerTaskId,
+                                sourceUrl = refererUrl,
+                                isTelegramOrigin = isTelegramOrigin,
+                                cleanName = cleanName,
+                                resolvedExt = resolvedType.extension,
+                                resolvedMime = resolvedMime,
+                                subFolder = subFolder,
+                                isAudioOnly = resolvedType.isAudio,
+                                isGenericFile = resolvedType.isGenericFile,
+                                totalBytes = totalBytes,
+                                activeConnections = activeConns,
+                                tempFile = tempFile,
+                                outputStream = outStream,
+                                startedAtMs = android.os.SystemClock.elapsedRealtime()
+                            )
+                            val label = when {
+                                isTelegramAccelerated -> "Telegram high-speed download started (${activeConns}x parallel): $cleanName"
+                                isTelegramOrigin -> "Telegram download started: $cleanName"
+                                else -> "Downloading to Download/$subFolder: $cleanName"
+                            }
+                            mainHandler.post {
+                                Toast.makeText(context, label, Toast.LENGTH_SHORT).show()
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                }
+
+                @JavascriptInterface
+                fun onBlobStreamChunk(streamId: String, base64Chunk: String) {
+                    if (streamId.isBlank() || base64Chunk.isBlank()) return
+                    blobStreamExecutor.execute {
+                        val stream = activeBlobStreams[streamId] ?: return@execute
+                        if (stream.aborted) return@execute
+                        try {
+                            val rawBase64 = base64Chunk.substringAfter("base64,", base64Chunk)
+                            val bytes = android.util.Base64.decode(rawBase64, android.util.Base64.DEFAULT)
+                            if (bytes.isEmpty()) return@execute
+                            if (!stream.headerInspected) {
+                                stream.headerInspected = true
+                                val headerSlice = bytes.copyOf(bytes.size.coerceAtMost(256))
+                                val sniffedType = DragonDownloadManager.resolveFileTypeAndName(
+                                    rawFilename = stream.cleanName,
+                                    rawMimeType = stream.resolvedMime,
+                                    headerBytes = headerSlice,
+                                    url = stream.sourceUrl,
+                                    platform = if (stream.isTelegramOrigin) MediaPlatform.TELEGRAM else MediaPlatform.DIRECT
+                                )
+                                val updatedName = MalwareProtectionEngine.sanitizeDownloadFilename(sniffedType.filename)
+                                if (updatedName != stream.cleanName ||
+                                    sniffedType.subFolder != stream.subFolder ||
+                                    sniffedType.mimeType != stream.resolvedMime
+                                ) {
+                                    stream.cleanName = updatedName
+                                    stream.resolvedExt = sniffedType.extension
+                                    stream.resolvedMime = sniffedType.mimeType
+                                    stream.subFolder = sniffedType.subFolder
+                                    stream.isAudioOnly = sniffedType.isAudio
+                                    stream.isGenericFile = sniffedType.isGenericFile
+                                    downloadManager?.updateExternalStreamTaskMetadata(
+                                        taskId = stream.taskId,
+                                        filename = stream.cleanName,
+                                        extension = stream.resolvedExt,
+                                        mimeType = stream.resolvedMime,
+                                        isAudioOnly = stream.isAudioOnly,
+                                        isGenericFile = stream.isGenericFile
+                                    )
+                                }
+                                val disguisedErr = MalwareProtectionEngine.detectDisguisedBinaryError(stream.cleanName, headerSlice)
+                                if (disguisedErr != null) {
+                                    stream.aborted = true
+                                    activeBlobStreams.remove(streamId)
+                                    runCatching { stream.outputStream.close() }
+                                    runCatching { stream.tempFile.delete() }
+                                    downloadManager?.failExternalStreamTask(stream.taskId, disguisedErr)
+                                    MalwareProtectionEngine.recordThreatEvent(
+                                        context = context,
+                                        category = "Disguised Blob Malware",
+                                        severity = SecuritySeverity.CRITICAL,
+                                        target = stream.cleanName,
+                                        reason = disguisedErr,
+                                        blocked = true
+                                    )
+                                    mainHandler.post {
+                                        Toast.makeText(context, disguisedErr, Toast.LENGTH_LONG).show()
+                                    }
+                                    return@execute
+                                }
+                            }
+                            stream.outputStream.write(bytes)
+                            stream.writtenBytes += bytes.size.toLong()
+                            val nowMs = android.os.SystemClock.elapsedRealtime()
+                            if (nowMs - stream.lastProgressEmitMs >= 350L) {
+                                stream.lastProgressEmitMs = nowMs
+                                val elapsedMs = (nowMs - stream.startedAtMs).coerceAtLeast(100L)
+                                val speedBps = (stream.writtenBytes * 1000L) / elapsedMs
+                                downloadManager?.updateExternalStreamTaskProgress(
+                                    taskId = stream.taskId,
+                                    downloadedBytes = stream.writtenBytes,
+                                    totalBytes = stream.totalBytes,
+                                    speedBytesPerSec = speedBps,
+                                    activeConnections = stream.activeConnections
+                                )
+                            }
+                        } catch (t: Throwable) {
+                            stream.aborted = true
+                            activeBlobStreams.remove(streamId)
+                            runCatching { stream.outputStream.close() }
+                            runCatching { stream.tempFile.delete() }
+                            downloadManager?.failExternalStreamTask(
+                                stream.taskId,
+                                t.message ?: "Failed writing downloaded chunk"
+                            )
+                        }
+                    }
+                }
+
+                @JavascriptInterface
+                fun onBlobStreamFinish(streamId: String) {
+                    if (streamId.isBlank()) return
+                    blobStreamExecutor.execute {
+                        val stream = activeBlobStreams.remove(streamId) ?: return@execute
+                        if (stream.aborted) {
+                            runCatching { stream.outputStream.close() }
+                            runCatching { stream.tempFile.delete() }
+                            return@execute
+                        }
+                        try {
+                            stream.outputStream.flush()
+                            stream.outputStream.close()
+                            if (stream.writtenBytes <= 0L || !stream.tempFile.exists()) {
+                                runCatching { stream.tempFile.delete() }
+                                downloadManager?.failExternalStreamTask(stream.taskId, "Empty file received from stream")
+                                return@execute
+                            }
+                            val textCandidate = if (stream.writtenBytes <= 5L * 1024L * 1024L) {
+                                val extLower = stream.cleanName.substringAfterLast('.', "").lowercase(Locale.US)
+                                val mimeLower = stream.resolvedMime.lowercase(Locale.US)
+                                if (extLower in setOf("csv", "html", "htm", "json", "txt") ||
+                                    mimeLower.startsWith("text/") ||
+                                    mimeLower.contains("csv") ||
+                                    mimeLower.contains("json") ||
+                                    mimeLower.contains("html")
+                                ) {
+                                    runCatching { stream.tempFile.readText(Charsets.UTF_8) }.getOrNull()
+                                } else null
+                            } else null
+
+                            var savedPublicUriString: String? = null
+                            var savedFilePath = "${android.os.Environment.DIRECTORY_DOWNLOADS}/${stream.subFolder}/${stream.cleanName}"
+                            if (downloadManager != null) {
+                                val (exportedFile, exportedUri) = downloadManager.exportFileToCategoryDownloads(
+                                    sourceFile = stream.tempFile,
+                                    filename = stream.cleanName,
+                                    mimeType = stream.resolvedMime,
+                                    isAudioOnly = stream.isAudioOnly,
+                                    isGenericFile = stream.isGenericFile,
+                                    extension = stream.resolvedExt,
+                                    url = stream.sourceUrl,
+                                    platform = if (stream.isTelegramOrigin) MediaPlatform.TELEGRAM else MediaPlatform.DIRECT
+                                )
+                                savedFilePath = exportedFile.absolutePath
+                                savedPublicUriString = exportedUri?.toString()
+                            } else {
+                                var exportedToPublic = false
+                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                                    try {
+                                        val resolver = context.contentResolver
+                                        val values = android.content.ContentValues().apply {
+                                            put(android.provider.MediaStore.Downloads.DISPLAY_NAME, stream.cleanName)
+                                            put(android.provider.MediaStore.Downloads.MIME_TYPE, stream.resolvedMime)
+                                            put(
+                                                android.provider.MediaStore.Downloads.RELATIVE_PATH,
+                                                "${android.os.Environment.DIRECTORY_DOWNLOADS}/${stream.subFolder}"
+                                            )
+                                            put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+                                        }
+                                        val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                                        if (uri != null) {
+                                            java.io.FileInputStream(stream.tempFile).use { input ->
+                                                resolver.openOutputStream(uri)?.use { out ->
+                                                    input.copyTo(out, 256 * 1024)
+                                                }
+                                            }
+                                            values.clear()
+                                            values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+                                            resolver.update(uri, values, null, null)
+                                            exportedToPublic = true
+                                            savedPublicUriString = uri.toString()
+                                        }
+                                    } catch (_: Throwable) {}
+                                } else {
+                                    try {
+                                        @Suppress("DEPRECATION")
+                                        val pubDir = java.io.File(
+                                            android.os.Environment.getExternalStoragePublicDirectory(
+                                                android.os.Environment.DIRECTORY_DOWNLOADS
+                                            ),
+                                            stream.subFolder
+                                        ).apply { mkdirs() }
+                                        val dest = java.io.File(pubDir, stream.cleanName)
+                                        java.io.FileInputStream(stream.tempFile).use { input ->
+                                            java.io.FileOutputStream(dest).use { out ->
+                                                input.copyTo(out, 256 * 1024)
+                                            }
+                                        }
+                                        android.media.MediaScannerConnection.scanFile(
+                                            context,
+                                            arrayOf(dest.absolutePath),
+                                            arrayOf(stream.resolvedMime),
+                                            null
+                                        )
+                                        savedFilePath = dest.absolutePath
+                                        exportedToPublic = true
+                                    } catch (_: Throwable) {}
+                                }
+                                if (!exportedToPublic) {
+                                    val cacheDir = java.io.File(context.cacheDir, "ddm_exports/${stream.subFolder}").apply { mkdirs() }
+                                    val dest = java.io.File(cacheDir, stream.cleanName)
+                                    java.io.FileInputStream(stream.tempFile).use { input ->
+                                        java.io.FileOutputStream(dest).use { out ->
+                                            input.copyTo(out, 256 * 1024)
+                                        }
+                                    }
+                                    savedFilePath = dest.absolutePath
+                                }
+                                runCatching { stream.tempFile.delete() }
+                            }
+
+                            val elapsedSec = ((android.os.SystemClock.elapsedRealtime() - stream.startedAtMs).coerceAtLeast(100L)) / 1000.0
+                            val mbSize = stream.writtenBytes / (1024.0 * 1024.0)
+                            val speedMbps = mbSize / elapsedSec
+                            val sizeSummary = if (mbSize >= 1.0) {
+                                String.format(Locale.US, "%.1f MB • %.1f MB/s", mbSize, speedMbps)
+                            } else {
+                                String.format(Locale.US, "%.0f KB", stream.writtenBytes / 1024.0)
+                            }
+                            runCatching { stream.tempFile.delete() }
+                            downloadManager?.completeExternalStreamTask(
+                                taskId = stream.taskId,
+                                savedFilePath = savedFilePath,
+                                publicUriString = savedPublicUriString,
+                                finalBytes = stream.writtenBytes,
+                                resolvedFilename = stream.cleanName,
+                                resolvedExtension = stream.resolvedExt,
+                                resolvedMimeType = stream.resolvedMime,
+                                isAudioOnly = stream.isAudioOnly,
+                                isGenericFile = stream.isGenericFile
+                            )
+
+                            mainHandler.post {
+                                val importResult = if (!textCandidate.isNullOrBlank()) {
+                                    browserRepo.tryAutoImportFromDownloadedText(
+                                        fileName = stream.cleanName,
+                                        mimeType = stream.resolvedMime,
+                                        rawText = textCandidate
+                                    )
+                                } else null
+                                if (importResult != null) {
+                                    val msg = if (importResult.kind == com.example.data.browser.DownloadedImportKind.PASSWORDS) {
+                                        if (importResult.added > 0) {
+                                            "Auto-imported & synced ${importResult.added} password(s) from ${stream.cleanName}"
+                                        } else {
+                                            "All ${importResult.skipped} password(s) from ${stream.cleanName} already synced"
+                                        }
+                                    } else {
+                                        if (importResult.added > 0) {
+                                            "Imported ${importResult.added} bookmark(s) from ${stream.cleanName}"
+                                        } else {
+                                            "All ${importResult.skipped} bookmark(s) from ${stream.cleanName} already saved"
+                                        }
+                                    }
+                                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                } else {
+                                    Toast.makeText(
+                                        context,
+                                        "Saved to Download/${stream.subFolder}: ${stream.cleanName} ($sizeSummary)",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
+                            }
+                        } catch (t: Throwable) {
+                            runCatching { stream.outputStream.close() }
+                            runCatching { stream.tempFile.delete() }
+                            downloadManager?.failExternalStreamTask(
+                                stream.taskId,
+                                t.message ?: "Failed saving downloaded file"
+                            )
+                        }
+                    }
+                }
+
+                @JavascriptInterface
+                fun onBlobStreamAbort(streamId: String, reason: String?) {
+                    if (streamId.isBlank()) return
+                    blobStreamExecutor.execute {
+                        val stream = activeBlobStreams.remove(streamId) ?: return@execute
+                        stream.aborted = true
+                        runCatching { stream.outputStream.close() }
+                        runCatching { stream.tempFile.delete() }
+                        downloadManager?.failExternalStreamTask(
+                            stream.taskId,
+                            reason?.takeIf { it.isNotBlank() } ?: "Stream interrupted"
+                        )
+                        if (!reason.isNullOrBlank()) {
+                            mainHandler.post {
+                                Toast.makeText(context, "Download interrupted: $reason", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                }
+
+                @JavascriptInterface
+                fun onTelegramWebDownloadProgress(
+                    webTaskKey: String,
+                    fileName: String?,
+                    downloadedBytes: Long,
+                    totalBytes: Long,
+                    speedBytesPerSec: Long,
+                    pageUrl: String?
+                ) {
+                    if (webTaskKey.isBlank()) return
+                    ownedTgWebKeys.add(webTaskKey)
+                    val cleanName = MalwareProtectionEngine.sanitizeDownloadFilename(
+                        fileName?.trim()?.takeIf { it.isNotBlank() } ?: "Telegram_File"
+                    )
+                    downloadManager?.syncTelegramWebDomTaskProgress(
+                        webTaskKey = webTaskKey,
+                        filename = cleanName,
+                        downloadedBytes = downloadedBytes,
+                        totalBytes = totalBytes,
+                        sourceUrl = pageUrl?.takeIf { it.isNotBlank() } ?: resolveCurrentRefererUrl(),
+                        speedBytesPerSec = speedBytesPerSec
+                    )
+                }
+
+                @JavascriptInterface
+                fun onTelegramWebDownloadCached(
+                    webTaskKey: String,
+                    fileName: String?,
+                    totalBytes: Long
+                ) {
+                    if (webTaskKey.isBlank()) return
+                    val cleanName = MalwareProtectionEngine.sanitizeDownloadFilename(
+                        fileName?.trim()?.takeIf { it.isNotBlank() } ?: "Telegram_File"
+                    )
+                    downloadManager?.markTelegramWebDomTaskCached(
+                        webTaskKey = webTaskKey,
+                        filename = cleanName,
+                        totalBytes = totalBytes
+                    )
+                }
+
+                @JavascriptInterface
+                fun onTelegramWebDownloadCancelled(webTaskKey: String) {
+                    if (webTaskKey.isBlank()) return
+                    downloadManager?.cancelTelegramWebDomTask(webTaskKey)
+                }
+
+                @JavascriptInterface
+                fun onTelegramWebUserReclicked(webTaskKey: String) {
+                    if (webTaskKey.isBlank()) return
+                    downloadManager?.onTelegramWebUserReclicked(webTaskKey)
+                }
+
+                @JavascriptInterface
+                fun onTelegramWebResumeUnavailable(webTaskKey: String) {
+                    if (webTaskKey.isBlank()) return
+                    downloadManager?.onTelegramWebResumeUnavailable(webTaskKey)
                 }
 
                 @JavascriptInterface
@@ -5409,6 +6641,26 @@ private fun createConfiguredBrowserWebView(
                 @JavascriptInterface
                 fun storageClear(extId: String) {
                     browserRepo.extensionEngine.clearExtensionStorage(extId)
+                }
+
+                @JavascriptInterface
+                fun proxyGet(extId: String): String {
+                    return browserRepo.extensionEngine.getExtensionProxySettingsJson(extId)
+                }
+
+                @JavascriptInterface
+                fun proxySet(extId: String, detailsJson: String): String {
+                    return browserRepo.extensionEngine.applyExtensionProxySettings(extId, detailsJson)
+                }
+
+                @JavascriptInterface
+                fun proxyClear(extId: String): String {
+                    return browserRepo.extensionEngine.clearExtensionProxySettings(extId)
+                }
+
+                @JavascriptInterface
+                fun proxyAuthSet(extId: String, username: String, password: String) {
+                    browserRepo.extensionEngine.setExtensionProxyAuth(extId, username, password)
                 }
 
                 @JavascriptInterface
@@ -5719,6 +6971,7 @@ private fun createConfiguredBrowserWebView(
                     desktopMode = isCurrentTabDesktopMode(),
                     warpDns = warpDns,
                     browserRepo = browserRepo,
+                    downloadManager = downloadManager,
                     mainHandler = mainHandler,
                     onDownloadIntercepted = onDownloadIntercepted,
                     onRendererCrashed = onRendererCrashed,
@@ -5849,7 +7102,7 @@ private fun createConfiguredBrowserWebView(
                         }
                         return true
                     }
-                    if (isLikelyDirectCloudDownloadUrl(target)) {
+                    if (isLikelyDirectCloudDownloadUrl(target) || isTelegramWebExplicitDownloadUrl(target)) {
                         dispatchWebViewDownload(
                             rawUrl = target,
                             userAgent = runCatching { view?.settings?.userAgentString ?: settings.userAgentString }.getOrNull(),
@@ -5865,6 +7118,16 @@ private fun createConfiguredBrowserWebView(
                         warpDns.prewarmHostAsync(targetHost)
                     }
                     return false
+                }
+
+                // Route tg:// deep links cleanly into Telegram Web inside Dragon Browser
+                if (target.startsWith("tg://", ignoreCase = true)) {
+                    val tgWebUrl = "https://web.telegram.org/k/#?tgaddr=" +
+                        runCatching { java.net.URLEncoder.encode(target, "UTF-8") }.getOrDefault(target)
+                    mainHandler.post {
+                        view?.loadUrl(tgWebUrl)
+                    }
+                    return true
                 }
 
                 // Allow extension internal URLs (chrome-extension://, moz-extension://) to load inside tabs via virtual origin
@@ -5980,37 +7243,61 @@ private fun createConfiguredBrowserWebView(
                     return extIntercepted
                 }
 
-                // Capture media streams (.m3u8, .mpd, .mp4, .webm, .mkv, .mp3, .m4a, etc.) when Media Grabber is enabled
+                // Capture media streams (.m3u8, .mpd, .mp4, .webm, .mkv, .mp3, .m4a, etc.) when Streaming Link Grabber or File Grabber is enabled
+                // Exclude internal Telegram Web Service Worker virtual URLs (/k/stream/, /k/d/, /progressive/) so Telegram files are not falsely detected as streams.
                 if (browserRepo.mediaGrabberEnabledFlow.value &&
                     isHttp &&
+                    !isTelegramWebStreamUrl(reqUrl) &&
                     !WebViewMediaExtractor.isPreviewUrl(reqUrl) &&
                     !WebViewMediaExtractor.isHtmlEmbedPageUrl(reqUrl)
                 ) {
                     val normalized = WebViewMediaExtractor.normalizeInterceptedStreamUrl(reqUrl)
+                    val reqHeaders = request.requestHeaders
+                    val secFetchDest = reqHeaders?.entries
+                        ?.firstOrNull { it.key.equals("Sec-Fetch-Dest", ignoreCase = true) }
+                        ?.value?.lowercase(Locale.US).orEmpty()
+                    val acceptHeader = reqHeaders?.entries
+                        ?.firstOrNull { it.key.equals("Accept", ignoreCase = true) }
+                        ?.value?.lowercase(Locale.US).orEmpty()
+                    val isHeaderVideoStream = !request.isForMainFrame &&
+                        !lower.endsWith(".ts") && !lower.endsWith(".m4s") &&
+                        (secFetchDest == "video" ||
+                            acceptHeader.startsWith("video/") ||
+                            acceptHeader.contains("application/vnd.apple.mpegurl") ||
+                            acceptHeader.contains("application/x-mpegurl") ||
+                            acceptHeader.contains("application/dash+xml"))
+
                     val detectedKind = when {
-                        WebViewMediaExtractor.isLikelyVideoStreamUrl(lower) -> GrabbedMediaKind.VIDEO
-                        WebViewMediaExtractor.isLikelyAudioStreamUrl(lower) -> GrabbedMediaKind.AUDIO
+                        WebViewMediaExtractor.isLikelyVideoStreamUrl(lower) || isHeaderVideoStream -> GrabbedMediaKind.VIDEO
+                        WebViewMediaExtractor.isLikelyAudioStreamUrl(lower) || secFetchDest == "audio" -> GrabbedMediaKind.AUDIO
                         WebViewMediaExtractor.isLikelyDownloadableFileUrl(lower) -> GrabbedMediaKind.FILE
                         else -> null
                     }
                     if (detectedKind != null) {
-                        val ext = normalized.substringBefore("?").substringAfterLast('.', "")
-                            .lowercase(Locale.US).takeIf { it.length in 2..5 } ?: when (detectedKind) {
-                            GrabbedMediaKind.VIDEO -> "mp4"
-                            GrabbedMediaKind.AUDIO -> "m4a"
-                            GrabbedMediaKind.FILE -> "bin"
-                        }
                         val hostLabel = reqHost?.removePrefix("www.") ?: "Stream"
+                        val explicitMime = when {
+                            acceptHeader.contains("mpegurl") -> "application/vnd.apple.mpegurl"
+                            acceptHeader.contains("dash+xml") -> "application/dash+xml"
+                            else -> null
+                        }
                         mainHandler.post {
-                            val activeTitle = browserRepo.tabsFlow.value.find { it.id == tab.id }?.title ?: "Media"
+                            val activeTitle = browserRepo.tabsFlow.value.find { it.id == tab.id }?.title ?: ""
+                            val resolved = resolveAccurateGrabbedFileName(
+                                url = normalized,
+                                pageTitle = activeTitle,
+                                mimeType = explicitMime,
+                                fallbackKind = detectedKind
+                            )
                             browserRepo.recordGrabbedMedia(
                                 tabId = tab.id,
                                 candidate = GrabbedMediaCandidate(
                                     url = normalized,
-                                    title = activeTitle,
-                                    kind = detectedKind,
-                                    containerExt = ext,
-                                    sourceLabel = hostLabel
+                                    title = resolved.filename,
+                                    kind = resolved.kind,
+                                    containerExt = resolved.extension,
+                                    sourceLabel = hostLabel,
+                                    mimeType = resolved.mimeType,
+                                    filenameConfidence = resolved.confidence
                                 )
                             )
                         }
@@ -6031,7 +7318,11 @@ private fun createConfiguredBrowserWebView(
                     // 2. Fallback OkHttp DNS tunnel ONLY on devices where WebView lacks PROXY_OVERRIDE
                     // (when localBridgeActive == true, 100% of WebView GET/POST/PUT/WS/HTTP2/TLS traffic
                     // already flows natively through LocalBrowserProxyServer using active DNS & Proxy!)
-                    if (!localBridgeActive && activeProxy == null &&
+                    val isTelegramWebHost = reqHost.equals("web.telegram.org", ignoreCase = true) ||
+                        reqHost.equals("webk.telegram.org", ignoreCase = true) ||
+                        reqHost.equals("weba.telegram.org", ignoreCase = true) ||
+                        reqHost.equals("webz.telegram.org", ignoreCase = true)
+                    if (!localBridgeActive && activeProxy == null && !isTelegramWebHost &&
                         warpDns.shouldTunnelBrowserRequest(reqHost, method, request.requestHeaders)
                     ) {
                         val tunneledResponse = warpDns.executeBrowserTunnelRequest(
@@ -6116,7 +7407,7 @@ private fun createConfiguredBrowserWebView(
                         }
                         return
                     }
-                    if (isLikelyDirectCloudDownloadUrl(url)) {
+                    if (isLikelyDirectCloudDownloadUrl(url) || isTelegramWebExplicitDownloadUrl(url)) {
                         dispatchWebViewDownload(
                             rawUrl = url,
                             userAgent = runCatching { view?.settings?.userAgentString ?: settings.userAgentString }.getOrNull(),
@@ -6365,13 +7656,7 @@ private fun createConfiguredBrowserWebView(
                     return
                 }
 
-                // 2. If user explicitly clicked "Proceed Anyway" for this site in the current session, honor it
-                if (MalwareProtectionEngine.isUrlAllowedForSession(errUrl)) {
-                    handler?.proceed()
-                    return
-                }
-
-                // 3. Cancel third-party sub-resource SSL errors silently so they never block the main website
+                // 2. Cancel third-party sub-resource SSL errors silently so they never block the main website
                 val errHost = runCatching { Uri.parse(errUrl).host?.lowercase(Locale.US)?.removePrefix("www.") }.getOrNull().orEmpty()
                 val pageHost = runCatching { Uri.parse(view?.url.orEmpty()).host?.lowercase(Locale.US)?.removePrefix("www.") }.getOrNull().orEmpty()
                 if (errHost.isNotBlank() && pageHost.isNotBlank() && errHost != pageHost) {
@@ -6434,14 +7719,18 @@ private fun createConfiguredBrowserWebView(
                 view: WebView?,
                 detail: RenderProcessGoneDetail?
             ): Boolean {
-                mainHandler.post {
+                val targetView = view ?: this@apply
+                return com.example.data.browser.WebViewRendererGuard.handleRenderProcessGone(
+                    view = targetView,
+                    detail = detail,
+                    trackerKey = if (isPopupWindow) "browser_popup_${tab.id}" else "browser_tab_${tab.id}"
+                ) { shouldAutoReload ->
                     if (isPopupWindow) {
                         onCloseWindowPopup(this@apply)
                     } else {
-                        onRendererCrashed(tab.id, view)
+                        onRendererCrashed(tab.id, targetView, shouldAutoReload)
                     }
                 }
-                return true
             }
         }
     }
@@ -6930,22 +8219,75 @@ private fun BrowserBookmarksDialog(
 
 @Composable
 private fun BrowserMediaGrabberDialog(
+    tabId: String,
     pageTitle: String,
     pageUrl: String,
+    userAgent: String,
     candidates: List<GrabbedMediaCandidate>,
-    isGrabberEnabled: Boolean = true,
-    onToggleGrabberEnabled: (Boolean) -> Unit = {},
+    isStreamingLinkGrabberEnabled: Boolean = true,
+    onToggleStreamingLinkGrabber: (Boolean) -> Unit = {},
+    isFileGrabberEnabled: Boolean = true,
+    onToggleFileGrabber: (Boolean) -> Unit = {},
+    browserRepo: BrowserStateRepository,
     downloadManager: DragonDownloadManager,
     onRefreshScan: () -> Unit,
+    onCopyStreamLink: (String) -> Unit = {},
+    onOpenInExternalPlayer: (String, String) -> Unit = { _, _ -> },
     onSelectCandidateStream: (GrabbedMediaCandidate) -> Unit,
     onSelectCandidateDownload: (GrabbedMediaCandidate) -> Unit,
     onSelectExtractedStream: (MediaInfo, MediaFormatOption) -> Unit,
     onSelectExtractedDownload: (MediaInfo, MediaFormatOption) -> Unit,
     onDismiss: () -> Unit
 ) {
+    val clipboardManager = LocalClipboardManager.current
+    val isAnyGrabberEnabled = isStreamingLinkGrabberEnabled || isFileGrabberEnabled
     var isDeepScanning by remember { mutableStateOf(false) }
     var deepScanError by remember { mutableStateOf<String?>(null) }
     var deepExtractedInfo by remember { mutableStateOf<MediaInfo?>(null) }
+    val probedUrls = remember(tabId) { mutableSetOf<String>() }
+
+    val filteredCandidates = remember(candidates, isStreamingLinkGrabberEnabled, isFileGrabberEnabled) {
+        candidates.filter { item ->
+            (isStreamingLinkGrabberEnabled && item.isVideoStreamingCandidate) ||
+                (isFileGrabberEnabled && item.isDownloadableFileCandidate)
+        }
+    }
+
+    // Background server HEAD probe for grabbed candidates to fetch exact Content-Disposition filename, MIME type, and file size
+    LaunchedEffect(tabId, filteredCandidates.map { it.url }) {
+        val toProbe = filteredCandidates
+            .filter { it.filenameConfidence < 4 && it.url !in probedUrls }
+            .take(12)
+        if (toProbe.isEmpty()) return@LaunchedEffect
+        toProbe.forEach { probedUrls.add(it.url) }
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            toProbe.forEach { cand ->
+                val meta = probeGrabbedCandidateServerMetadata(
+                    targetUrl = cand.url,
+                    refererUrl = pageUrl,
+                    userAgent = userAgent
+                ) ?: return@forEach
+                val resolved = resolveAccurateGrabbedFileName(
+                    url = cand.url,
+                    domLabel = cand.title,
+                    pageTitle = pageTitle,
+                    contentDisposition = meta.contentDisposition,
+                    mimeType = meta.contentType ?: cand.mimeType,
+                    fallbackKind = cand.kind
+                )
+                browserRepo.updateGrabbedMediaMetadata(
+                    tabId = tabId,
+                    url = cand.url,
+                    title = resolved.filename,
+                    kind = resolved.kind,
+                    containerExt = resolved.extension,
+                    mimeType = resolved.mimeType,
+                    contentLengthBytes = meta.contentLength,
+                    filenameConfidence = resolved.confidence
+                )
+            }
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -6958,7 +8300,7 @@ private fun BrowserMediaGrabberDialog(
                 Icon(
                     Icons.Default.VideoLibrary,
                     contentDescription = null,
-                    tint = if (isGrabberEnabled) NeonCyan else MaterialTheme.colorScheme.onSurfaceVariant
+                    tint = if (isAnyGrabberEnabled) NeonCyan else MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Column(modifier = Modifier.weight(1f)) {
                     Text("Media Grabber & Streamer", fontWeight = FontWeight.Black, fontSize = 16.sp)
@@ -6970,16 +8312,109 @@ private fun BrowserMediaGrabberDialog(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
-                Switch(
-                    checked = isGrabberEnabled,
-                    onCheckedChange = onToggleGrabberEnabled,
-                    modifier = Modifier.testTag("switch_media_grabber_dialog")
-                )
             }
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                if (!isGrabberEnabled) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                // Independent Toggle 1: Streaming Link Grabber
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (isStreamingLinkGrabberEnabled) {
+                        NeonCyan.copy(alpha = 0.10f)
+                    } else {
+                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+                    },
+                    border = BorderStroke(
+                        1.dp,
+                        if (isStreamingLinkGrabberEnabled) NeonCyan.copy(alpha = 0.45f)
+                        else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Link,
+                            contentDescription = null,
+                            tint = if (isStreamingLinkGrabberEnabled) NeonCyan else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Streaming Link Grabber",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = if (isStreamingLinkGrabberEnabled) NeonCyan else MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Grab video streaming links to copy & play in external player",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = isStreamingLinkGrabberEnabled,
+                            onCheckedChange = onToggleStreamingLinkGrabber,
+                            modifier = Modifier.testTag("switch_streaming_link_grabber")
+                        )
+                    }
+                }
+
+                // Independent Toggle 2: File Grabber
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (isFileGrabberEnabled) {
+                        SuccessGreen.copy(alpha = 0.10f)
+                    } else {
+                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+                    },
+                    border = BorderStroke(
+                        1.dp,
+                        if (isFileGrabberEnabled) SuccessGreen.copy(alpha = 0.45f)
+                        else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DownloadForOffline,
+                            contentDescription = null,
+                            tint = if (isFileGrabberEnabled) SuccessGreen else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "File Grabber",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = if (isFileGrabberEnabled) SuccessGreen else MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Grab media & page files for download",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = isFileGrabberEnabled,
+                            onCheckedChange = onToggleFileGrabber,
+                            modifier = Modifier.testTag("switch_file_grabber")
+                        )
+                    }
+                }
+
+                if (!isAnyGrabberEnabled) {
                     Surface(
                         shape = RoundedCornerShape(10.dp),
                         color = WarningOrange.copy(alpha = 0.14f),
@@ -6987,7 +8422,7 @@ private fun BrowserMediaGrabberDialog(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = "Media Grabber is OFF. Auto-sniffing and the floating media button are paused.",
+                            text = "Both Streaming Link Grabber and File Grabber are OFF. Auto-sniffing and the floating media button are paused.",
                             fontSize = 11.sp,
                             color = WarningOrange,
                             fontWeight = FontWeight.Medium,
@@ -6995,13 +8430,14 @@ private fun BrowserMediaGrabberDialog(
                         )
                     }
                 }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     OutlinedButton(
                         onClick = onRefreshScan,
-                        enabled = isGrabberEnabled,
+                        enabled = isAnyGrabberEnabled,
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(10.dp)
                     ) {
@@ -7026,7 +8462,7 @@ private fun BrowserMediaGrabberDialog(
                                 }
                             )
                         },
-                        enabled = !isDeepScanning,
+                        enabled = !isDeepScanning && isAnyGrabberEnabled,
                         colors = ButtonDefaults.buttonColors(containerColor = NeonCyan),
                         shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.weight(1f)
@@ -7051,22 +8487,26 @@ private fun BrowserMediaGrabberDialog(
                 LazyColumn(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 310.dp),
+                        .heightIn(max = 280.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     deepExtractedInfo?.let { info ->
-                        items(info.allFormats.take(8), key = { "deep_${it.id}_${it.streamUrl}" }) { fmt ->
+                        val formatsToShow = info.allFormats.filter { fmt ->
+                            (isStreamingLinkGrabberEnabled && !fmt.isAudioOnly && !fmt.isGenericFile) ||
+                                isFileGrabberEnabled
+                        }.take(8)
+                        items(formatsToShow, key = { "deep_${it.id}_${it.streamUrl}" }) { fmt ->
                             Surface(
                                 shape = RoundedCornerShape(10.dp),
                                 color = SuccessGreen.copy(alpha = 0.12f),
                                 border = BorderStroke(1.dp, SuccessGreen.copy(alpha = 0.45f)),
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Row(
+                                Column(
                                     modifier = Modifier.padding(10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    Column(modifier = Modifier.weight(1f)) {
+                                    Column(modifier = Modifier.fillMaxWidth()) {
                                         Text(
                                             text = "${fmt.qualityLabel} • ${fmt.container.uppercase(Locale.US)}",
                                             fontSize = 12.sp,
@@ -7080,108 +8520,253 @@ private fun BrowserMediaGrabberDialog(
                                             overflow = TextOverflow.Ellipsis
                                         )
                                     }
-                                    if (!fmt.isGenericFile) {
-                                        OutlinedButton(
-                                            onClick = { onSelectExtractedStream(info, fmt) },
-                                            shape = RoundedCornerShape(8.dp),
-                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
-                                            modifier = Modifier.padding(end = 6.dp)
-                                        ) {
-                                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(14.dp), tint = NeonCyan)
-                                            Spacer(modifier = Modifier.width(2.dp))
-                                            Text("Stream", fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
-                                        }
-                                    }
-                                    Button(
-                                        onClick = { onSelectExtractedDownload(info, fmt) },
-                                        colors = ButtonDefaults.buttonColors(containerColor = SuccessGreen),
-                                        shape = RoundedCornerShape(8.dp),
-                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("Save", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                        if (isStreamingLinkGrabberEnabled && !fmt.isGenericFile) {
+                                            Button(
+                                                onClick = {
+                                                    clipboardManager.setText(AnnotatedString(fmt.streamUrl))
+                                                    onCopyStreamLink(fmt.streamUrl)
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = NeonCyan),
+                                                shape = RoundedCornerShape(8.dp),
+                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 5.dp)
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.ContentCopy,
+                                                    contentDescription = "Copy Stream Link",
+                                                    modifier = Modifier.size(13.dp),
+                                                    tint = Color(0xFF03131B)
+                                                )
+                                                Spacer(modifier = Modifier.width(3.dp))
+                                                Text(
+                                                    "Copy Link",
+                                                    color = Color(0xFF03131B),
+                                                    fontSize = 10.5.sp,
+                                                    fontWeight = FontWeight.ExtraBold
+                                                )
+                                            }
+                                            OutlinedButton(
+                                                onClick = { onOpenInExternalPlayer(fmt.streamUrl, info.title) },
+                                                shape = RoundedCornerShape(8.dp),
+                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 5.dp)
+                                            ) {
+                                                Icon(
+                                                    Icons.AutoMirrored.Filled.OpenInNew,
+                                                    contentDescription = "Play in External Player",
+                                                    modifier = Modifier.size(13.dp),
+                                                    tint = NeonCyan
+                                                )
+                                                Spacer(modifier = Modifier.width(3.dp))
+                                                Text("External", fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
+                                        if (!fmt.isGenericFile) {
+                                            OutlinedButton(
+                                                onClick = { onSelectExtractedStream(info, fmt) },
+                                                shape = RoundedCornerShape(8.dp),
+                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 5.dp)
+                                            ) {
+                                                Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(14.dp), tint = NeonCyan)
+                                                Spacer(modifier = Modifier.width(2.dp))
+                                                Text("Stream", fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
+                                        if (isFileGrabberEnabled) {
+                                            Button(
+                                                onClick = { onSelectExtractedDownload(info, fmt) },
+                                                colors = ButtonDefaults.buttonColors(containerColor = SuccessGreen),
+                                                shape = RoundedCornerShape(8.dp),
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 5.dp)
+                                            ) {
+                                                Text("Save", color = Color.White, fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
 
-                    if (candidates.isEmpty() && deepExtractedInfo == null) {
+                    if (filteredCandidates.isEmpty() && deepExtractedInfo == null) {
                         item {
+                            val emptyMessage = when {
+                                !isAnyGrabberEnabled ->
+                                    "Turn on Streaming Link Grabber or File Grabber above to capture streaming links or downloadable media files."
+                                isStreamingLinkGrabberEnabled && !isFileGrabberEnabled ->
+                                    "Play a video on the page or tap 'Rescan Page' / 'Deep Extract' to grab the video streaming link for your external player."
+                                !isStreamingLinkGrabberEnabled && isFileGrabberEnabled ->
+                                    "Browse or play media on the page or tap 'Deep Extract' to grab downloadable media files."
+                                else ->
+                                    "Play a video on the page or tap 'Deep Extract' to grab video streaming links or downloadable media files."
+                            }
                             Text(
-                                text = "Play a video on the page or tap 'Deep Extract' to stream or grab video, audio, or downloadable files.",
+                                text = emptyMessage,
                                 fontSize = 12.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(vertical = 14.dp)
                             )
                         }
                     } else {
-                        items(candidates, key = { it.url }) { item ->
+                        items(filteredCandidates, key = { it.url }) { item ->
+                            val isVideoStreamItem = item.isVideoStreamingCandidate
+                            val showStreamLinkActions = isStreamingLinkGrabberEnabled && isVideoStreamItem
+                            val showFileDownloadAction = isFileGrabberEnabled && item.isDownloadableFileCandidate
+                            val folderCat = DragonDownloadManager.categoryForType(
+                                extension = item.containerExt,
+                                mimeType = item.mimeType,
+                                isAudioOnly = item.kind == GrabbedMediaKind.AUDIO,
+                                isGenericFile = item.kind == GrabbedMediaKind.FILE,
+                                url = item.url
+                            )
+                            val sizeSuffix = if (item.contentLengthBytes > 0L) {
+                                " • ${com.example.data.model.formatBytes(item.contentLengthBytes)}"
+                            } else ""
                             Surface(
                                 shape = RoundedCornerShape(10.dp),
                                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.50f),
-                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (showStreamLinkActions) NeonCyan.copy(alpha = 0.45f)
+                                    else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                                ),
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Row(
+                                Column(
                                     modifier = Modifier.padding(10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    Column(modifier = Modifier.weight(1f)) {
+                                    Column(modifier = Modifier.fillMaxWidth()) {
+                                        Text(
+                                            text = item.title.ifBlank { item.url.substringAfterLast('/') },
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Spacer(modifier = Modifier.height(3.dp))
                                         Row(
                                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
                                             Surface(
                                                 shape = RoundedCornerShape(6.dp),
-                                                color = NeonCyan.copy(alpha = 0.2f)
+                                                color = if (showStreamLinkActions) NeonCyan.copy(alpha = 0.22f)
+                                                else SuccessGreen.copy(alpha = 0.2f)
                                             ) {
+                                                val badgeLabel = if (showStreamLinkActions && !showFileDownloadAction) {
+                                                    "STREAM LINK • ${item.containerExt.uppercase(Locale.US)}"
+                                                } else {
+                                                    "${folderCat.folderName.uppercase(Locale.US)} • ${item.containerExt.uppercase(Locale.US)}"
+                                                }
                                                 Text(
-                                                    text = "${item.kind.label} • ${item.containerExt.uppercase(Locale.US)}",
+                                                    text = badgeLabel,
                                                     fontSize = 9.sp,
                                                     fontFamily = FontFamily.Monospace,
                                                     fontWeight = FontWeight.Bold,
-                                                    color = NeonCyan,
+                                                    color = if (showStreamLinkActions) NeonCyan else SuccessGreen,
                                                     modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
                                                 )
                                             }
                                             Text(
-                                                text = item.sourceLabel,
+                                                text = "${item.sourceLabel}$sizeSuffix",
                                                 fontSize = 10.sp,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                 maxLines = 1,
                                                 overflow = TextOverflow.Ellipsis
                                             )
                                         }
-                                        Spacer(modifier = Modifier.height(3.dp))
-                                        Text(
-                                            text = item.url,
-                                            fontSize = 10.sp,
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                    }
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    if (item.kind != GrabbedMediaKind.FILE) {
-                                        OutlinedButton(
-                                            onClick = { onSelectCandidateStream(item) },
-                                            shape = RoundedCornerShape(8.dp),
-                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
-                                            modifier = Modifier.padding(end = 4.dp)
-                                        ) {
-                                            Icon(Icons.Default.PlayArrow, contentDescription = "Stream", modifier = Modifier.size(14.dp), tint = NeonCyan)
-                                            Spacer(modifier = Modifier.width(2.dp))
-                                            Text("Stream", fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
+                                        if (showStreamLinkActions) {
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = item.url,
+                                                fontSize = 9.5.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = NeonCyan.copy(alpha = 0.85f),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
                                         }
                                     }
-                                    FilledTonalButton(
-                                        onClick = { onSelectCandidateDownload(item) },
-                                        shape = RoundedCornerShape(8.dp),
-                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(15.dp))
-                                        Spacer(modifier = Modifier.width(3.dp))
-                                        Text("Get", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                        if (showStreamLinkActions) {
+                                            Button(
+                                                onClick = {
+                                                    clipboardManager.setText(AnnotatedString(item.url))
+                                                    onCopyStreamLink(item.url)
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = NeonCyan),
+                                                shape = RoundedCornerShape(8.dp),
+                                                contentPadding = PaddingValues(horizontal = 9.dp, vertical = 6.dp),
+                                                modifier = Modifier.testTag("btn_copy_stream_link")
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.ContentCopy,
+                                                    contentDescription = "Copy Stream Link",
+                                                    modifier = Modifier.size(13.dp),
+                                                    tint = Color(0xFF03131B)
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    "Copy Link",
+                                                    color = Color(0xFF03131B),
+                                                    fontSize = 10.5.sp,
+                                                    fontWeight = FontWeight.ExtraBold
+                                                )
+                                            }
+                                            OutlinedButton(
+                                                onClick = {
+                                                    onOpenInExternalPlayer(
+                                                        item.url,
+                                                        item.title.ifBlank { pageTitle }
+                                                    )
+                                                },
+                                                shape = RoundedCornerShape(8.dp),
+                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                                                modifier = Modifier.testTag("btn_external_player")
+                                            ) {
+                                                Icon(
+                                                    Icons.AutoMirrored.Filled.OpenInNew,
+                                                    contentDescription = "Play in External Player",
+                                                    modifier = Modifier.size(13.dp),
+                                                    tint = NeonCyan
+                                                )
+                                                Spacer(modifier = Modifier.width(3.dp))
+                                                Text("External", fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
+                                        if (item.kind != GrabbedMediaKind.FILE) {
+                                            OutlinedButton(
+                                                onClick = { onSelectCandidateStream(item) },
+                                                shape = RoundedCornerShape(8.dp),
+                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                                            ) {
+                                                Icon(Icons.Default.PlayArrow, contentDescription = "Stream", modifier = Modifier.size(14.dp), tint = NeonCyan)
+                                                Spacer(modifier = Modifier.width(2.dp))
+                                                Text("Stream", fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
+                                        if (showFileDownloadAction) {
+                                            FilledTonalButton(
+                                                onClick = { onSelectCandidateDownload(item) },
+                                                shape = RoundedCornerShape(8.dp),
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                                modifier = Modifier.testTag("btn_download_grabbed_file")
+                                            ) {
+                                                Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(15.dp))
+                                                Spacer(modifier = Modifier.width(3.dp))
+                                                Text("Get", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -7554,6 +9139,22 @@ private fun BrowserUniversalStreamPlayerDialog(
                                 }
                                 CookieManager.getInstance().setAcceptCookie(true)
                                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                                webViewClient = object : WebViewClient() {
+                                    override fun onRenderProcessGone(
+                                        view: WebView?,
+                                        detail: RenderProcessGoneDetail?
+                                    ): Boolean {
+                                        return com.example.data.browser.WebViewRendererGuard.handleRenderProcessGone(
+                                            view = view ?: this@apply,
+                                            detail = detail,
+                                            trackerKey = "inline_stream_player"
+                                        ) {
+                                            if (streamWebView === view || streamWebView === this@apply) {
+                                                streamWebView = null
+                                            }
+                                        }
+                                    }
+                                }
                                 addJavascriptInterface(
                                     object {
                                         @JavascriptInterface
@@ -7642,11 +9243,7 @@ private fun BrowserUniversalStreamPlayerDialog(
                             if (streamWebView === wv) {
                                 streamWebView = null
                             }
-                            runCatching {
-                                wv.stopLoading()
-                                wv.loadUrl("about:blank")
-                                wv.destroy()
-                            }
+                            com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(wv)
                         }
                     )
                 }
@@ -9412,16 +11009,55 @@ private val WEB_PIP_POLYFILL_JS: String by lazy {
       window.__dragonLastTrustedGestureMs = window.__dragonLastTrustedGestureMs || 0;
       window.__dragonPipTransitionUntil = window.__dragonPipTransitionUntil || 0;
 
-      // Track genuine user taps/clicks (ignore touchstart/touchcancel so Android swipe-home never looks like a pause tap)
-      ['click', 'pointerup', 'touchend', 'keydown'].forEach(function(evtName) {
+      // Track genuine user taps/clicks and directly recover desynced YouTube/HTML5 play-pause button taps after PiP
+      ['pointerdown', 'touchstart', 'mousedown', 'click', 'pointerup', 'touchend', 'keydown'].forEach(function(evtName) {
         document.addEventListener(evtName, function(evt) {
           if (evt && evt.isTrusted && !window.__dragonInPipMode) {
             window.__dragonLastTrustedGestureMs = Date.now();
           }
         }, true);
       });
-      document.addEventListener('touchcancel', function() {
-        window.__dragonLastTrustedGestureMs = 0;
+
+      document.addEventListener('click', function(evt) {
+        try {
+          if (!evt || !evt.isTrusted || window.__dragonInPipMode) return;
+          var t = evt.target;
+          if (!t || !t.closest) return;
+          var btn = t.closest(
+            'button.player-control-play-pause-icon, .ytp-play-button, button[aria-label*="Pause" i], button[aria-label*="Play" i], [role="button"][aria-label*="Pause" i], [role="button"][aria-label*="Play" i]'
+          );
+          if (!btn) return;
+          var vid = window.__dragonLastActiveVideo || document.querySelector('video');
+          if (!vid) return;
+          var wasPausedBeforeClick = vid.paused;
+          window.__dragonLastUserPlayPauseToggleMs = Date.now();
+          if (!wasPausedBeforeClick) {
+            window.__dragonPipUserPaused = true;
+            window.__dragonBackgroundPlayActive = false;
+            window.__dragonWasPlayingBeforePip = false;
+          } else {
+            window.__dragonPipUserPaused = false;
+          }
+          // If the site's custom player state was desynced from <video> after PiP (e.g. m.youtube.com thought it was paused while <video> was playing),
+          // its click handler either no-ops or calls play() again instead of pause(). Verify after 60ms and force the actual toggle!
+          setTimeout(function() {
+            try {
+              if (!vid || window.__dragonInPipMode) return;
+              if (vid.paused === wasPausedBeforeClick) {
+                var nativePauseFn = window.__dragonNativePause || HTMLMediaElement.prototype.pause;
+                if (wasPausedBeforeClick) {
+                  window.__dragonPipUserPaused = false;
+                  vid.play().catch(function(){});
+                } else {
+                  window.__dragonPipUserPaused = true;
+                  window.__dragonBackgroundPlayActive = false;
+                  window.__dragonWasPlayingBeforePip = false;
+                  nativePauseFn.call(vid);
+                }
+              }
+            } catch (e) {}
+          }, 60);
+        } catch (e) {}
       }, true);
 
       var origHiddenDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
@@ -9553,12 +11189,19 @@ private val WEB_PIP_POLYFILL_JS: String by lazy {
         if (typeof origMediaPause === 'function') {
           HTMLMediaElement.prototype.pause = function() {
             try {
+              var now = Date.now();
+              var recentUserTap = (now - (window.__dragonLastTrustedGestureMs || 0)) < 1800 ||
+                (now - (window.__dragonLastUserPlayPauseToggleMs || 0)) < 2500;
+              if (recentUserTap && !window.__dragonInPipMode) {
+                window.__dragonPipUserPaused = true;
+                window.__dragonBackgroundPlayActive = false;
+                window.__dragonWasPlayingBeforePip = false;
+                return origMediaPause.apply(this, arguments);
+              }
               if (!window.__dragonPipUserPaused && !this.ended && (this.tagName === 'VIDEO' || this.tagName === 'AUDIO')) {
-                var now = Date.now();
                 var inPip = !!(window.__dragonInPipMode || window.__dragonBackgroundPlayActive);
                 var inTransition = !!(window.__dragonPipTransitionUntil && now < window.__dragonPipTransitionUntil);
-                var hiddenOrUnfocused = isRealDocumentHidden(document) || !isRealDocumentFocused(document);
-                var recentUserTap = (now - (window.__dragonLastTrustedGestureMs || 0)) < 500;
+                var hiddenOrUnfocused = isRealDocumentHidden(document);
                 if (inPip || (inTransition && !recentUserTap) || (hiddenOrUnfocused && !recentUserTap && !this.paused && this.readyState >= 1)) {
                   return;
                 }
@@ -10249,17 +11892,26 @@ private const val PIP_EXIT_INLINE_SPOTLIGHT_JS = """
         else v.removeAttribute('style');
         v.removeAttribute('data-dragon-pip-saved');
       }
-      if (wasPlaying && !v.ended && v.paused) {
-        try { v.play().catch(function(){}); } catch (e) {}
+      if (wasPlaying && !v.ended) {
+        try {
+          // Re-synchronize YouTube/custom player UI state with the live <video> element after returning from PiP
+          v.dispatchEvent(new Event('play'));
+          v.dispatchEvent(new Event('playing'));
+        } catch (e) {}
+        if (v.paused) {
+          try { v.play().catch(function(){}); } catch (e) {}
+        }
       }
       // Recover if Chromium MediaCodec / YouTube player stalled after PiP -> fullscreen surface resize
       if (wasPlaying && !v.ended) {
         var exitVid = v;
         var exitT0 = exitVid.currentTime;
+        var exitAtMs = Date.now();
         setTimeout(function() {
           try {
-            if (window.__dragonInPipMode || exitVid.ended) return;
-            if (exitVid.paused && !window.__dragonPipUserPaused) {
+            if (window.__dragonInPipMode || exitVid.ended || window.__dragonPipUserPaused) return;
+            if ((window.__dragonLastTrustedGestureMs || 0) >= exitAtMs) return;
+            if (exitVid.paused) {
               exitVid.play().catch(function(){});
             }
           } catch (e) {}
@@ -10267,6 +11919,7 @@ private const val PIP_EXIT_INLINE_SPOTLIGHT_JS = """
         setTimeout(function() {
           try {
             if (window.__dragonInPipMode || exitVid.ended || window.__dragonPipUserPaused) return;
+            if ((window.__dragonLastTrustedGestureMs || 0) >= exitAtMs) return;
             if (exitVid.paused) {
               exitVid.play().catch(function(){});
             } else if (exitVid.readyState >= 2 && Math.abs(exitVid.currentTime - exitT0) < 0.01) {
@@ -10319,6 +11972,38 @@ private const val PIP_EXIT_INLINE_SPOTLIGHT_JS = """
 private const val UNIVERSAL_VIDEO_STREAM_ENHANCER_JS = """
 (function() {
   try {
+    function isRealPlayableVideoElement(cand) {
+      if (!cand || cand.paused || cand.ended) return false;
+      var cls = ((cand.className || '') + ' ' + ((cand.parentElement && cand.parentElement.className) || '')).toLowerCase();
+      // Ignore Telegram animated stickers, custom emoji, reactions, avatars, and chat GIF previews
+      if (cls.indexOf('sticker') !== -1 || cls.indexOf('emoji') !== -1 || cls.indexOf('avatar') !== -1 ||
+          cls.indexOf('reaction') !== -1 || cls.indexOf('gif') !== -1 || cls.indexOf('round') !== -1) {
+        return false;
+      }
+      if (cand.closest && cand.closest('.media-sticker-wrapper, .sticker, .custom-emoji, .avatar, .reaction, .animated-super, .chat-background')) {
+        return false;
+      }
+      var isTgHost = /telegram\.org$/i.test(location.hostname || '');
+      if (isTgHost) {
+        // In Telegram Web, only consider a video actively playing if it is inside Telegram's explicit Media Viewer (.media-viewer-whole / #MediaViewer)
+        // or explicitly unmuted with user controls (never inline silent chat stickers/animations!)
+        var inMediaViewer = cand.closest && cand.closest('.media-viewer-whole, .media-viewer-movers, #MediaViewer, .MediaViewer');
+        if (!inMediaViewer && (cand.muted || cand.loop || !cand.controls)) {
+          return false;
+        }
+      } else {
+        // On general websites, ignore tiny decorative/icon/sticker looping muted videos
+        var r = cand.getBoundingClientRect ? cand.getBoundingClientRect() : null;
+        if (r && (r.width < 140 || r.height < 100) && cand.muted && !cand.controls) {
+          return false;
+        }
+        if (cand.muted && cand.loop && !cand.controls && !(cand.duration > 30)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
     function reportVideoStateToNative(mediaEl) {
       try {
         var activeVideo = null;
@@ -10326,7 +12011,7 @@ private const val UNIVERSAL_VIDEO_STREAM_ENHANCER_JS = """
         var allVids = document.querySelectorAll('video');
         for (var i = 0; i < allVids.length; i++) {
           var cand = allVids[i];
-          if (!cand.paused && !cand.ended) {
+          if (isRealPlayableVideoElement(cand)) {
             activeVideo = cand;
             break;
           }
@@ -10334,7 +12019,7 @@ private const val UNIVERSAL_VIDEO_STREAM_ENHANCER_JS = """
         var allAuds = document.querySelectorAll('audio');
         for (var k = 0; k < allAuds.length; k++) {
           var acand = allAuds[k];
-          if (!acand.paused && !acand.ended) {
+          if (!acand.paused && !acand.ended && !acand.muted && !(acand.duration > 0 && acand.duration < 3)) {
             activeAudio = acand;
             break;
           }
@@ -10478,10 +12163,91 @@ private const val UNIVERSAL_VIDEO_STREAM_ENHANCER_JS = """
     }
     window.__dragonVideoEnhancerInstalled = true;
 
+    function reportDirectVideoStreamUrl(rawUrl, explicitMime) {
+      try {
+        if (!rawUrl || typeof rawUrl !== 'string') return;
+        var u = rawUrl.trim();
+        if (u.indexOf('blob:') === 0 || u.indexOf('data:') === 0) return;
+        if (u.indexOf('http://') !== 0 && u.indexOf('https://') !== 0) {
+          try { u = new URL(u, location.href).href; } catch (e) { return; }
+        }
+        if (u.indexOf('http://') !== 0 && u.indexOf('https://') !== 0) return;
+        var low = u.toLowerCase();
+        if (/\.(ts|m4s|vtt|srt|jpg|jpeg|png|webp|gif|svg|js|css)(\?|#|$)/i.test(low)) return;
+        window.__dragonReportedStreams = window.__dragonReportedStreams || {};
+        if (window.__dragonReportedStreams[u]) return;
+        window.__dragonReportedStreams[u] = true;
+        var isHls = low.indexOf('.m3u8') !== -1 || low.indexOf('format=m3u8') !== -1 || low.indexOf('mpegurl') !== -1;
+        var isDash = low.indexOf('.mpd') !== -1 || low.indexOf('dash+xml') !== -1;
+        var mime = explicitMime || (isHls ? 'application/vnd.apple.mpegurl' : (isDash ? 'application/dash+xml' : 'video/mp4'));
+        var bestTitle = (document.title || '').replace(/[\r\n\t]+/g, ' ').trim();
+        if (window.DragonBrowserBridge && window.DragonBrowserBridge.onDomMediaFound) {
+          window.DragonBrowserBridge.onDomMediaFound(JSON.stringify([{
+            url: u,
+            downloadAttr: '',
+            label: bestTitle,
+            pageTitle: bestTitle,
+            mime: mime,
+            kind: 'video'
+          }]));
+        }
+      } catch (e) {}
+    }
+
+    function isLikelyStreamManifestOrVideoUrl(rawUrl) {
+      if (!rawUrl || typeof rawUrl !== 'string') return false;
+      var low = rawUrl.toLowerCase();
+      if (/\.(ts|m4s|vtt|srt|jpg|jpeg|png|webp|gif|svg|js|css|woff|ttf)(\?|#|$)/i.test(low)) return false;
+      return /\.(m3u8|mpd|mp4|m4v|webm|mkv|mov|avi|flv|3gp|ogv|wmv)(\?|#|$)/i.test(low) ||
+        low.indexOf('.ism/manifest') !== -1 ||
+        low.indexOf('format=m3u8') !== -1 ||
+        low.indexOf('type=m3u8') !== -1 ||
+        low.indexOf('videoplayback?') !== -1 ||
+        low.indexOf('stream.mux.com/') !== -1 ||
+        low.indexOf('jwpcdn.com/') !== -1;
+    }
+
+    if (!window.__dragonStreamNetHookInstalled) {
+      window.__dragonStreamNetHookInstalled = true;
+      try {
+        if (window.fetch) {
+          var origFetch = window.fetch;
+          window.fetch = function(input, init) {
+            try {
+              var reqUrl = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
+              if (isLikelyStreamManifestOrVideoUrl(reqUrl)) {
+                reportDirectVideoStreamUrl(reqUrl, '');
+              }
+            } catch (e) {}
+            return origFetch.apply(this, arguments);
+          };
+        }
+      } catch (e) {}
+      try {
+        if (window.XMLHttpRequest && window.XMLHttpRequest.prototype) {
+          var origOpen = window.XMLHttpRequest.prototype.open;
+          window.XMLHttpRequest.prototype.open = function(method, url) {
+            try {
+              if (typeof url === 'string' && isLikelyStreamManifestOrVideoUrl(url)) {
+                reportDirectVideoStreamUrl(url, '');
+              }
+            } catch (e) {}
+            return origOpen.apply(this, arguments);
+          };
+        }
+      } catch (e) {}
+    }
+
     ['play', 'playing', 'pause', 'ended', 'emptied', 'loadedmetadata', 'resize'].forEach(function(evtName) {
       document.addEventListener(evtName, function(e) {
         if (e && e.target && (e.target.tagName === 'VIDEO' || e.target.tagName === 'AUDIO')) {
           reportVideoStateToNative(e.target);
+          if (e.target.tagName === 'VIDEO' && (evtName === 'play' || evtName === 'playing' || evtName === 'loadedmetadata')) {
+            var vSrc = e.target.currentSrc || e.target.src || '';
+            if (vSrc && vSrc.indexOf('blob:') !== 0) {
+              reportDirectVideoStreamUrl(vSrc, '');
+            }
+          }
         }
       }, true);
     });
@@ -10507,27 +12273,176 @@ private const val DOM_MEDIA_SCANNER_JS = """
   try {
     var out = [];
     var seen = {};
-    function pushItem(url, label) {
-      if (!url || seen[url] || url.indexOf('http') !== 0) return;
-      seen[url] = true;
-      out.push({ url: url, label: label || document.title || '' });
+
+    function cleanText(s) {
+      return String(s || '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
     }
-    var mediaEls = document.querySelectorAll('video, audio, source');
+
+    function getBestPageTitle() {
+      var metas = [
+        'meta[property="og:title"]',
+        'meta[name="twitter:title"]',
+        'meta[name="title"]'
+      ];
+      for (var m = 0; m < metas.length; m++) {
+        var el = document.querySelector(metas[m]);
+        var v = el ? cleanText(el.getAttribute('content')) : '';
+        if (v && v.length >= 2) return v.slice(0, 140);
+      }
+      var h1 = document.querySelector('ytd-watch-metadata h1, h1.title, h1[class*="title" i], article h1, main h1, h1');
+      if (h1) {
+        var h1Text = cleanText(h1.textContent);
+        if (h1Text && h1Text.length >= 2) return h1Text.slice(0, 140);
+      }
+      return cleanText(document.title).slice(0, 140);
+    }
+
+    var pageBestTitle = getBestPageTitle();
+
+    function isGenericButtonLabel(txt) {
+      var l = cleanText(txt).toLowerCase();
+      if (!l || l.length < 2) return true;
+      return /^(download|download now|free download|direct download|save|save file|get|play|watch|open|view|click here|link|mirror|server\s*\d*|hd|sd|\d{3,4}p|\d+(\.\d+)?\s*(kb|mb|gb))$/i.test(l);
+    }
+
+    function inferElementContextLabel(el) {
+      if (!el) return '';
+      var attrs = ['data-filename', 'data-file-name', 'data-name', 'data-title', 'title', 'aria-label'];
+      for (var a = 0; a < attrs.length; a++) {
+        var val = cleanText(el.getAttribute && el.getAttribute(attrs[a]));
+        if (val && !isGenericButtonLabel(val)) return val.slice(0, 140);
+      }
+      var ownText = cleanText(el.innerText || el.textContent);
+      if (ownText && ownText.length <= 120 && !isGenericButtonLabel(ownText)) {
+        return ownText;
+      }
+      var container = el.closest ? el.closest('figure, article, li, tr, .card, .file, .File, .document, .document-container, .Document, .release-asset, [class*="file" i], [class*="item" i], [class*="video" i]') : null;
+      if (container) {
+        var nameSelectors = [
+          '.document-name', '.document-title', '.document-filename', '.filename', '.file-name',
+          '.file-title', '.asset-name', '.video-title', 'figcaption', 'h1', 'h2', 'h3', 'h4',
+          '[data-filename]', 'td:first-child'
+        ];
+        for (var s = 0; s < nameSelectors.length; s++) {
+          var node = container.querySelector(nameSelectors[s]);
+          if (node && node !== el) {
+            var nt = cleanText(node.getAttribute('data-filename') || node.textContent);
+            if (nt && nt.length <= 140 && !isGenericButtonLabel(nt)) return nt;
+          }
+        }
+      }
+      return '';
+    }
+
+    function pushItem(url, downloadAttr, label, mime, kind) {
+      if (!url || typeof url !== 'string') return;
+      var abs = url.trim();
+      if (abs.indexOf('blob:') === 0 || abs.indexOf('data:') === 0) return;
+      if (abs.indexOf('http://') !== 0 && abs.indexOf('https://') !== 0) {
+        try { abs = new URL(abs, location.href).href; } catch (e) { return; }
+      }
+      if (abs.indexOf('http://') !== 0 && abs.indexOf('https://') !== 0) return;
+      if (seen[abs]) return;
+      seen[abs] = true;
+      out.push({
+        url: abs,
+        downloadAttr: cleanText(downloadAttr).slice(0, 140),
+        label: cleanText(label).slice(0, 140),
+        pageTitle: pageBestTitle,
+        mime: cleanText(mime).slice(0, 80),
+        kind: kind || ''
+      });
+    }
+
+    var mediaEls = document.querySelectorAll('video, audio, source, track');
     for (var i = 0; i < mediaEls.length; i++) {
       var el = mediaEls[i];
-      if (el.currentSrc) pushItem(el.currentSrc, 'Video Player');
-      if (el.src) pushItem(el.src, 'Media Element');
+      var tag = (el.tagName || '').toLowerCase();
+      var parentMedia = (tag === 'source' || tag === 'track') ? (el.closest('video, audio') || el.parentElement) : el;
+      var mediaKind = tag === 'track' ? 'file' : ((parentMedia && parentMedia.tagName === 'AUDIO') || tag === 'audio' ? 'audio' : 'video');
+      var mediaMime = el.getAttribute('type') || '';
+      var mediaDlAttr = (el.getAttribute('data-filename') || (parentMedia && parentMedia.getAttribute('data-filename')) || '');
+      var mediaLabel = inferElementContextLabel(el) || inferElementContextLabel(parentMedia) || pageBestTitle;
+      if (el.currentSrc) pushItem(el.currentSrc, mediaDlAttr, mediaLabel, mediaMime, mediaKind);
+      if (el.src) pushItem(el.src, mediaDlAttr, mediaLabel, mediaMime, mediaKind);
     }
-    var links = document.querySelectorAll('a[href]');
-    var extRe = /\.(mp4|m4v|webm|mkv|m3u8|mpd|mov|mp3|m4a|flac|wav|zip|rar|7z|apk|apks|xapk|pdf|epub)(\?|$)/i;
-    for (var j = 0; j < links.length; j++) {
-      var href = links[j].href;
-      if (href && extRe.test(href)) {
-        pushItem(href, (links[j].innerText || '').trim().slice(0, 48));
+
+    // Scan OpenGraph video meta tags and data-video / data-stream attributes
+    var ogVideos = document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"], meta[name="twitter:player:stream"]');
+    for (var ov = 0; ov < ogVideos.length; ov++) {
+      var ogContent = ogVideos[ov].getAttribute('content') || '';
+      if (ogContent && /\.(m3u8|mpd|mp4|m4v|webm|mkv|mov)(\?|#|$)/i.test(ogContent)) {
+        pushItem(ogContent, '', pageBestTitle, '', 'video');
       }
     }
+
+    var dataStreamEls = document.querySelectorAll('[data-video], [data-stream], [data-hls], [data-mp4], [data-src]');
+    for (var ds = 0; ds < dataStreamEls.length; ds++) {
+      var dEl = dataStreamEls[ds];
+      var dVal = dEl.getAttribute('data-video') || dEl.getAttribute('data-stream') || dEl.getAttribute('data-hls') || dEl.getAttribute('data-mp4') || dEl.getAttribute('data-src') || '';
+      if (dVal && /\.(m3u8|mpd|mp4|m4v|webm|mkv|mov)(\?|#|$)/i.test(dVal)) {
+        pushItem(dVal, '', inferElementContextLabel(dEl) || pageBestTitle, '', 'video');
+      }
+    }
+
+    // Scan Performance Resource Timing entries for HLS (.m3u8), DASH (.mpd), and direct video streams loaded via XHR/Fetch/Video
+    try {
+      if (window.performance && window.performance.getEntriesByType) {
+        var resources = window.performance.getEntriesByType('resource') || [];
+        for (var r = resources.length - 1; r >= 0; r--) {
+          var res = resources[r];
+          var rUrl = (res && res.name) ? String(res.name) : '';
+          if (!rUrl) continue;
+          var rLow = rUrl.toLowerCase();
+          if (/\.(ts|m4s|vtt|srt|jpg|jpeg|png|webp|gif|svg|js|css|woff|ttf)(\?|#|$)/i.test(rLow)) continue;
+          var isPerfStream = res.initiatorType === 'video' ||
+            /\.(m3u8|mpd|mp4|m4v|webm|mkv|mov|avi|flv|3gp)(\?|#|$)/i.test(rLow) ||
+            rLow.indexOf('.ism/manifest') !== -1 ||
+            rLow.indexOf('format=m3u8') !== -1 ||
+            rLow.indexOf('type=m3u8') !== -1 ||
+            (rLow.indexOf('videoplayback?') !== -1 && rLow.indexOf('mime=audio') === -1) ||
+            rLow.indexOf('stream.mux.com/') !== -1;
+          if (isPerfStream) {
+            var perfMime = rLow.indexOf('.m3u8') !== -1 || rLow.indexOf('m3u8') !== -1
+              ? 'application/vnd.apple.mpegurl'
+              : (rLow.indexOf('.mpd') !== -1 ? 'application/dash+xml' : 'video/mp4');
+            pushItem(rUrl, '', pageBestTitle, perfMime, 'video');
+          }
+        }
+      }
+    } catch (e) {}
+
+    var extRe = /\.(mp4|m4v|webm|mkv|m3u8|mpd|mov|avi|flv|3gp|ogv|wmv|mp3|m4a|flac|wav|ogg|opus|aac|wma|zip|rar|7z|tar|gz|tgz|bz2|xz|zst|iso|img|apk|apks|xapk|apkm|aab|exe|msi|dmg|pkg|deb|rpm|jar|pdf|epub|mobi|doc|docx|xls|xlsx|ppt|pptx|odt|ods|odp|rtf|txt|csv|json|xml|srt|vtt|ass|ssa|sub|torrent|jpg|jpeg|png|webp|gif|heic|avif|svg|bmp)(\?|#|$)/i;
+    var links = document.querySelectorAll('a[href]');
+    for (var j = 0; j < links.length; j++) {
+      var a = links[j];
+      var href = a.href || a.getAttribute('href') || '';
+      var hasDl = a.hasAttribute('download');
+      var lowerHref = href.toLowerCase();
+      var isAttachmentLink = hasDl ||
+        extRe.test(lowerHref) ||
+        lowerHref.indexOf('response-content-disposition=attachment') !== -1 ||
+        lowerHref.indexOf('content-disposition=attachment') !== -1;
+      if (!isAttachmentLink) continue;
+      var dlAttr = a.getAttribute('download') || a.getAttribute('data-filename') || a.getAttribute('data-file-name') || a.getAttribute('data-name') || '';
+      var linkLabel = inferElementContextLabel(a);
+      var linkKind = /\.(mp3|m4a|flac|wav|ogg|opus|aac|wma)(\?|#|$)/i.test(lowerHref) ? 'audio'
+        : /\.(mp4|m4v|webm|mkv|m3u8|mpd|mov|avi|flv|3gp|ogv|wmv)(\?|#|$)/i.test(lowerHref) ? 'video'
+        : 'file';
+      pushItem(href, dlAttr, linkLabel, a.getAttribute('type') || '', linkKind);
+    }
+
+    var embeds = document.querySelectorAll('embed[src], object[data]');
+    for (var k = 0; k < embeds.length; k++) {
+      var emb = embeds[k];
+      var src = emb.getAttribute('src') || emb.getAttribute('data') || '';
+      if (src && extRe.test(src.toLowerCase())) {
+        pushItem(src, emb.getAttribute('data-filename') || '', inferElementContextLabel(emb) || pageBestTitle, emb.getAttribute('type') || '', 'file');
+      }
+    }
+
     if (out.length > 0 && window.DragonBrowserBridge) {
-      window.DragonBrowserBridge.onDomMediaFound(JSON.stringify(out.slice(0, 30)));
+      window.DragonBrowserBridge.onDomMediaFound(JSON.stringify(out.slice(0, 45)));
     }
   } catch (e) {}
 })();
@@ -10693,10 +12608,78 @@ private const val UNIVERSAL_DOWNLOAD_HOOK_JS = """
       return c;
     }
 
+    // Cache created Blob objects so immediate URL.revokeObjectURL() calls (used by Telegram Web!) never break downloads
+    var blobRegistry = window.__dragonBlobRegistry || new Map();
+    window.__dragonBlobRegistry = blobRegistry;
+    try {
+      var origCreateObjectURL = URL.createObjectURL.bind(URL);
+      var origRevokeObjectURL = URL.revokeObjectURL.bind(URL);
+      URL.createObjectURL = function(obj) {
+        var url = origCreateObjectURL(obj);
+        try {
+          if (obj instanceof Blob) {
+            blobRegistry.set(url, { blob: obj, createdAt: Date.now(), pinned: false });
+            if (blobRegistry.size > 32) {
+              var oldestKey = blobRegistry.keys().next().value;
+              if (oldestKey) {
+                var oldestEntry = blobRegistry.get(oldestKey);
+                if (oldestEntry && !oldestEntry.pinned) blobRegistry.delete(oldestKey);
+              }
+            }
+          }
+        } catch (e) {}
+        return url;
+      };
+      URL.revokeObjectURL = function(url) {
+        try {
+          var entry = blobRegistry.get(url);
+          if (entry) {
+            // Keep Blob alive for 120s so async download handoff never hits Failed to fetch
+            setTimeout(function() {
+              try {
+                var cur = blobRegistry.get(url);
+                if (cur && !cur.pinned) {
+                  blobRegistry.delete(url);
+                  origRevokeObjectURL(url);
+                }
+              } catch (e) {}
+            }, 120000);
+            return;
+          }
+        } catch (e) {}
+        return origRevokeObjectURL(url);
+      };
+    } catch (e) {}
+
+    // ONLY explicit Telegram Web file download endpoints (/d/ and /download/) — NEVER inline playback (/stream/ or /progressive/)!
+    function isTelegramWebExplicitDownloadUrl(rawUrl) {
+      if (!rawUrl || typeof rawUrl !== 'string') return false;
+      var lower = rawUrl.trim().toLowerCase();
+      if (lower.indexOf('http://') !== 0 && lower.indexOf('https://') !== 0) return false;
+      var isTgWeb = lower.indexOf('://web.telegram.org/') !== -1 ||
+        lower.indexOf('://webk.telegram.org/') !== -1 ||
+        lower.indexOf('://webz.telegram.org/') !== -1 ||
+        lower.indexOf('://weba.telegram.org/') !== -1;
+      if (!isTgWeb) return false;
+      return lower.indexOf('/download/') !== -1 || lower.indexOf('/d/') !== -1;
+    }
+
+    function resolveCandidateHref(rawUrl) {
+      if (!rawUrl || typeof rawUrl !== 'string') return '';
+      var trimmed = rawUrl.trim();
+      if (!trimmed) return '';
+      if (trimmed.indexOf('blob:') === 0 || trimmed.indexOf('data:') === 0 ||
+          trimmed.indexOf('http://') === 0 || trimmed.indexOf('https://') === 0) {
+        return trimmed;
+      }
+      try { return new URL(trimmed, location.href).href; } catch (e) { return trimmed; }
+    }
+
     function isLikelyDirectFileDownloadUrl(rawUrl) {
       if (!rawUrl || typeof rawUrl !== 'string') return false;
       var lower = rawUrl.trim().toLowerCase();
       if (lower.indexOf('http://') !== 0 && lower.indexOf('https://') !== 0) return false;
+      if (isTelegramWebExplicitDownloadUrl(rawUrl)) return true;
       if (lower.indexOf('.gofile.io/download/') !== -1 || lower.indexOf('gofile.io/download/') !== -1) return true;
       if (lower.indexOf('pixeldrain.com/api/file/') !== -1 && lower.indexOf('download') !== -1) return true;
       if (lower.indexOf('downloads.sourceforge.net/') !== -1) return true;
@@ -10705,31 +12688,124 @@ private const val UNIVERSAL_DOWNLOAD_HOOK_JS = """
       return /\.(zip|rar|7z|apk|xapk|apks|tar|gz|tgz|xz|bz2|iso|img|bin|exe|msi|dmg|deb|rpm|zst|torrent)$/i.test(pathOnly);
     }
 
-    function handleBlobDownload(blobUrl, fileName) {
-      try {
-        fetch(blobUrl).then(function(r) { return r.blob(); }).then(function(b) {
+    function streamBlobObjectToNative(blobObj, fileName, fallbackMime, onDone) {
+      var bridge = window.DragonBrowserBridge;
+      if (!bridge || !blobObj) {
+        if (onDone) onDone();
+        return;
+      }
+      window.__dragonLastNativeStreamStartMs = Date.now();
+      var resolvedName = fileName || 'download.bin';
+      var resolvedMime = blobObj.type || fallbackMime || 'application/octet-stream';
+      if (bridge.onBlobStreamStart && bridge.onBlobStreamChunk && bridge.onBlobStreamFinish) {
+        var streamId = 'blob_' + Date.now() + '_' + Math.floor(Math.random() * 100000);
+        bridge.onBlobStreamStart(streamId, resolvedName, resolvedMime, blobObj.size || -1, false);
+        var chunkSize = 512 * 1024;
+        var offset = 0;
+        function pumpSlice() {
+          if (offset >= blobObj.size) {
+            bridge.onBlobStreamFinish(streamId);
+            if (onDone) onDone();
+            return;
+          }
+          var slice = blobObj.slice(offset, Math.min(offset + chunkSize, blobObj.size));
           var reader = new FileReader();
           reader.onloadend = function() {
-            if (window.DragonBrowserBridge && reader.result) {
-              window.DragonBrowserBridge.onBlobDownloadBase64(reader.result, fileName || 'download.bin', b.type || 'application/octet-stream');
+            if (reader.result) {
+              var str = String(reader.result);
+              var idx = str.indexOf('base64,');
+              bridge.onBlobStreamChunk(streamId, idx >= 0 ? str.slice(idx + 7) : str);
             }
+            offset += chunkSize;
+            pumpSlice();
           };
-          reader.readAsDataURL(b);
+          reader.onerror = function() {
+            if (bridge.onBlobStreamAbort) bridge.onBlobStreamAbort(streamId, 'Blob read error');
+            if (onDone) onDone();
+          };
+          reader.readAsDataURL(slice);
+        }
+        pumpSlice();
+        return;
+      }
+      var reader = new FileReader();
+      reader.onloadend = function() {
+        if (bridge && reader.result) {
+          bridge.onBlobDownloadBase64(reader.result, resolvedName, resolvedMime);
+        }
+        if (onDone) onDone();
+      };
+      reader.readAsDataURL(blobObj);
+    }
+
+    function handleBlobDownload(blobUrl, fileName) {
+      try {
+        var cached = blobRegistry.get(blobUrl);
+        if (cached && cached.blob) {
+          cached.pinned = true;
+          streamBlobObjectToNative(cached.blob, fileName, cached.blob.type, function() {
+            cached.pinned = false;
+          });
+          return;
+        }
+        fetch(blobUrl).then(function(r) { return r.blob(); }).then(function(b) {
+          streamBlobObjectToNative(b, fileName, b.type, null);
+        }).catch(function(err) {
+          if (window.DragonBrowserBridge && window.DragonBrowserBridge.onBlobStreamAbort) {
+            var sid = 'blob_err_' + Date.now();
+            window.DragonBrowserBridge.onBlobStreamStart(sid, fileName || 'download.bin', 'application/octet-stream', -1, false);
+            window.DragonBrowserBridge.onBlobStreamAbort(sid, (err && err.message) ? err.message : 'Blob URL expired');
+          }
         });
       } catch (e) {}
     }
 
     syncCloudHostCookies();
 
+    // Intercept ONLY explicit download <iframe src="d/..."> or <iframe src="download/..."> (never playback /stream/ URLs)
+    try {
+      var iframeSrcDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'src');
+      if (iframeSrcDesc && iframeSrcDesc.set) {
+        Object.defineProperty(HTMLIFrameElement.prototype, 'src', {
+          configurable: true,
+          enumerable: iframeSrcDesc.enumerable,
+          get: iframeSrcDesc.get,
+          set: function(val) {
+            try {
+              var resolved = resolveCandidateHref(String(val || ''));
+              if (isTelegramWebExplicitDownloadUrl(resolved) && window.DragonBrowserBridge && window.DragonBrowserBridge.onJsDownloadTriggered) {
+                window.DragonBrowserBridge.onJsDownloadTriggered(resolved, '', getMergedPageCookies(), location.href || '');
+                return;
+              }
+            } catch (e) {}
+            return iframeSrcDesc.set.call(this, val);
+          }
+        });
+      }
+      var origSetAttribute = Element.prototype.setAttribute;
+      Element.prototype.setAttribute = function(name, value) {
+        try {
+          if (this && this.tagName === 'IFRAME' && String(name || '').toLowerCase() === 'src') {
+            var resolved = resolveCandidateHref(String(value || ''));
+            if (isTelegramWebExplicitDownloadUrl(resolved) && window.DragonBrowserBridge && window.DragonBrowserBridge.onJsDownloadTriggered) {
+              window.DragonBrowserBridge.onJsDownloadTriggered(resolved, '', getMergedPageCookies(), location.href || '');
+              return;
+            }
+          }
+        } catch (e) {}
+        return origSetAttribute.apply(this, arguments);
+      };
+    } catch (e) {}
+
     var origAnchorClick = HTMLAnchorElement.prototype.click;
     HTMLAnchorElement.prototype.click = function() {
       try {
         syncCloudHostCookies();
-        var href = this.href || this.getAttribute('href') || '';
+        var href = resolveCandidateHref(this.href || this.getAttribute('href') || '');
         var dlAttr = this.getAttribute('download');
         var hasDl = this.hasAttribute('download') || (dlAttr !== null && dlAttr !== undefined);
         if (href) {
-          if (href.indexOf('blob:') === 0 || href.indexOf('data:') === 0) {
+          if ((href.indexOf('blob:') === 0 || href.indexOf('data:') === 0) && hasDl) {
             handleBlobDownload(href, dlAttr || '');
             return;
           }
@@ -10750,7 +12826,7 @@ private const val UNIVERSAL_DOWNLOAD_HOOK_JS = """
         var el = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
         if (!el) return;
         syncCloudHostCookies();
-        var href = el.href || el.getAttribute('href') || '';
+        var href = resolveCandidateHref(el.href || el.getAttribute('href') || '');
         var dlAttr = el.getAttribute('download');
         var hasDl = el.hasAttribute('download') || (dlAttr !== null && dlAttr !== undefined);
         if (href && (href.indexOf('blob:') === 0 || href.indexOf('data:') === 0) && hasDl) {
@@ -10759,6 +12835,9 @@ private const val UNIVERSAL_DOWNLOAD_HOOK_JS = """
           return;
         }
         if (href && (hasDl || isLikelyDirectFileDownloadUrl(href)) && window.DragonBrowserBridge && window.DragonBrowserBridge.onJsDownloadTriggered) {
+          if (isTelegramWebExplicitDownloadUrl(href)) {
+            ev.preventDefault();
+          }
           if (el.target === '_blank') {
             el.removeAttribute('target');
           }
@@ -10772,11 +12851,7 @@ private const val UNIVERSAL_DOWNLOAD_HOOK_JS = """
       try {
         syncCloudHostCookies();
         if (url && typeof url === 'string') {
-          var resolved = new URL(url, location.href).href;
-          if (resolved.indexOf('blob:') === 0 || resolved.indexOf('data:') === 0) {
-            handleBlobDownload(resolved, '');
-            return window;
-          }
+          var resolved = resolveCandidateHref(url);
           if (isLikelyDirectFileDownloadUrl(resolved) && window.DragonBrowserBridge && window.DragonBrowserBridge.onJsDownloadTriggered) {
             window.DragonBrowserBridge.onJsDownloadTriggered(resolved, '', getMergedPageCookies(), location.href || '');
             return window;
@@ -10785,9 +12860,1364 @@ private const val UNIVERSAL_DOWNLOAD_HOOK_JS = """
       } catch (e) {}
       return origWindowOpen ? origWindowOpen.apply(this, arguments) : null;
     };
+
+    // Catch synthetic anchor clicks (a.dispatchEvent(new MouseEvent('click'))) on detached <a download> elements
+    try {
+      var origDispatchEvent = EventTarget.prototype.dispatchEvent;
+      EventTarget.prototype.dispatchEvent = function(ev) {
+        try {
+          if (this && this.tagName === 'A' && ev && ev.type === 'click') {
+            var href = resolveCandidateHref(this.href || this.getAttribute('href') || '');
+            var dlAttr = this.getAttribute('download') || this.download || '';
+            var hasDl = this.hasAttribute('download') || !!dlAttr;
+            if (href) {
+              if ((href.indexOf('blob:') === 0 || href.indexOf('data:') === 0) && hasDl) {
+                handleBlobDownload(href, dlAttr);
+                return false;
+              }
+              if ((hasDl || isLikelyDirectFileDownloadUrl(href)) && window.DragonBrowserBridge && window.DragonBrowserBridge.onJsDownloadTriggered) {
+                window.DragonBrowserBridge.onJsDownloadTriggered(href, dlAttr, getMergedPageCookies(), location.href || '');
+                return false;
+              }
+            }
+          }
+        } catch (e) {}
+        return origDispatchEvent.apply(this, arguments);
+      };
+    } catch (e) {}
+
+    // Mirror ONLY the exact user-clicked, actively downloading Telegram Web document into Dragon Download Manager Panel,
+    // keep Telegram Web unthrottled while downloading, and support true Pause / Resume / Cancel from Download Panel.
+    (function setupTelegramWebDownloadMirror() {
+      try {
+        var host = (location.hostname || '').toLowerCase();
+        var isTgHost = host === 'web.telegram.org' || host === 'webk.telegram.org' ||
+          host === 'weba.telegram.org' || host === 'webz.telegram.org';
+        if (!isTgHost) return;
+        if (window.__dragonTgMirrorStarted) return;
+        window.__dragonTgMirrorStarted = true;
+
+        // Speed Boost #1: Advertise full 16-core concurrency & desktop 4g high-downlink connection so Telegram Web K/A never applies mobile/low-core caps
+        try {
+          Object.defineProperty(navigator, 'hardwareConcurrency', {
+            configurable: true,
+            get: function() { return 16; }
+          });
+        } catch (e) {}
+        try {
+          if (navigator.connection) {
+            Object.defineProperty(navigator.connection, 'effectiveType', { configurable: true, get: function() { return '4g'; } });
+            Object.defineProperty(navigator.connection, 'downlink', { configurable: true, get: function() { return 100; } });
+            Object.defineProperty(navigator.connection, 'rtt', { configurable: true, get: function() { return 15; } });
+            Object.defineProperty(navigator.connection, 'saveData', { configurable: true, get: function() { return false; } });
+          }
+        } catch (e) {}
+
+        // Speed Boost #2: Prevent Telegram Web from entering throttled/idle download mode when user switches to Download Panel
+        window.__dragonTgActiveDownloadsCount = 0;
+        var origHiddenDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden') ||
+          Object.getOwnPropertyDescriptor(document, 'hidden');
+        var origVisDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState') ||
+          Object.getOwnPropertyDescriptor(document, 'visibilityState');
+        try {
+          Object.defineProperty(document, 'hidden', {
+            configurable: true,
+            get: function() {
+              if (window.__dragonTgActiveDownloadsCount > 0) return false;
+              return origHiddenDesc && origHiddenDesc.get ? origHiddenDesc.get.call(document) : false;
+            }
+          });
+          Object.defineProperty(document, 'visibilityState', {
+            configurable: true,
+            get: function() {
+              if (window.__dragonTgActiveDownloadsCount > 0) return 'visible';
+              return origVisDesc && origVisDesc.get ? origVisDesc.get.call(document) : 'visible';
+            }
+          });
+          document.addEventListener('visibilitychange', function(ev) {
+            if (window.__dragonTgActiveDownloadsCount > 0) {
+              try { ev.stopImmediatePropagation(); } catch (e) {}
+            }
+          }, true);
+        } catch (e) {}
+
+        // Speed Boost #3: Hold a lightweight Web Lock while downloading so Chromium never freezes Telegram Web Workers / Service Worker
+        var wakeLockRelease = null;
+        function syncDownloadWakeLock(activeCount) {
+          window.__dragonTgActiveDownloadsCount = activeCount;
+          try {
+            if (activeCount > 0 && !wakeLockRelease && navigator.locks && navigator.locks.request) {
+              navigator.locks.request('dragon_tg_highspeed_dl', function() {
+                return new Promise(function(resolve) {
+                  wakeLockRelease = resolve;
+                });
+              }).catch(function() {});
+            } else if (activeCount <= 0 && wakeLockRelease) {
+              var rel = wakeLockRelease;
+              wakeLockRelease = null;
+              rel();
+            }
+          } catch (e) {}
+        }
+
+        var userClickedElements = typeof WeakSet === 'function' ? new WeakSet() : null;
+        var userClickedKeys = new Map();
+        var lastContextBubbleMid = '';
+        var lastContextBubbleAtMs = 0;
+        var trackedDownloads = new Map();
+        var trackedElements = new Map();
+        var pausedKeys = new Set();
+        var suppressedKeys = new Set();
+        var suppressedFilenames = new Set();
+        var activeCardCancelWatchUntil = typeof WeakMap === 'function' ? new WeakMap() : null;
+        window.__dragonLastNativeStreamStartMs = 0;
+
+        function loadPersistedSet(storageKey, targetSet) {
+          try {
+            var raw = sessionStorage.getItem(storageKey);
+            if (!raw) return;
+            var arr = JSON.parse(raw);
+            if (Array.isArray(arr)) {
+              for (var i = 0; i < arr.length; i++) {
+                if (arr[i]) targetSet.add(String(arr[i]));
+              }
+            }
+          } catch (e) {}
+        }
+
+        function savePersistedSet(storageKey, sourceSet) {
+          try {
+            var arr = [];
+            sourceSet.forEach(function(v) { if (v) arr.push(v); });
+            if (arr.length > 200) arr = arr.slice(arr.length - 200);
+            sessionStorage.setItem(storageKey, JSON.stringify(arr));
+          } catch (e) {}
+        }
+
+        loadPersistedSet('__dragon_tg_suppressed_keys', suppressedKeys);
+        loadPersistedSet('__dragon_tg_suppressed_names', suppressedFilenames);
+
+        function canonicalizeDocCard(node) {
+          if (!node || !node.closest) return null;
+          var inner = node.closest('.document, .File, .Document');
+          if (inner) return inner;
+          var outer = node.closest('.document-container');
+          if (outer) {
+            return outer.querySelector('.document') || outer;
+          }
+          return null;
+        }
+
+        function getBubbleMidForNode(node) {
+          if (!node || !node.closest) return '';
+          var bubble = node.closest('[data-mid], [data-message-id], .bubble, .Message');
+          if (!bubble) return '';
+          return (bubble.getAttribute('data-mid') || bubble.getAttribute('data-message-id') || '').trim();
+        }
+
+        function inferNameForElement(el, idx) {
+          var selectors = [
+            '.document-name', '.document-title', '.document-filename',
+            '.file-title', '.title', '.name', '[data-filename]'
+          ];
+          for (var i = 0; i < selectors.length; i++) {
+            var node = el.querySelector(selectors[i]);
+            if (node) {
+              var txt = (node.getAttribute('data-filename') || node.innerText || node.textContent || '').trim();
+              if (txt && txt.length >= 2) return txt.slice(0, 140);
+            }
+          }
+          var mid = getBubbleMidForNode(el);
+          if (mid) return 'Telegram_File_' + mid;
+          return 'Telegram_File_' + (idx + 1);
+        }
+
+        function computeKeyForCard(el, idx) {
+          var mid = getBubbleMidForNode(el);
+          var docId = (el.getAttribute('data-doc-id') || el.getAttribute('data-id') || '').trim();
+          var name = inferNameForElement(el, idx || 0);
+          return {
+            key: (mid || docId || 'tg') + '|' + name,
+            mid: mid,
+            docId: docId,
+            name: name
+          };
+        }
+
+        function recordContextBubble(ev) {
+          try {
+            if (!ev || ev.isTrusted === false || !ev.target) return;
+            var mid = getBubbleMidForNode(ev.target);
+            if (mid) {
+              lastContextBubbleMid = mid;
+              lastContextBubbleAtMs = Date.now();
+            }
+          } catch (e) {}
+        }
+
+        document.addEventListener('contextmenu', recordContextBubble, true);
+        document.addEventListener('pointerdown', recordContextBubble, true);
+
+        document.addEventListener('click', function(ev) {
+          try {
+            if (!ev || ev.isTrusted === false) return;
+            var target = ev.target;
+            if (!target || !target.closest) return;
+
+            var now = Date.now();
+            // 1. Direct user tap on a specific document card -> authorize ONLY this exact card & always unlock it in Kotlin
+            var docCard = canonicalizeDocCard(target);
+            if (docCard) {
+              var wasAlreadyDownloading = isCardCurrentlyDownloading(docCard);
+              if (userClickedElements) userClickedElements.add(docCard);
+              var meta = computeKeyForCard(docCard, 0);
+              if (meta.mid) userClickedKeys.set('mid:' + meta.mid, now);
+              if (meta.docId) userClickedKeys.set('doc:' + meta.docId, now);
+              trackedElements.set(meta.key, { el: docCard, mid: meta.mid, docId: meta.docId, name: meta.name });
+              suppressedKeys.delete(meta.key);
+              var normClickedName = normalizeFileNameForMatch(meta.name);
+              if (normClickedName) suppressedFilenames.delete(normClickedName);
+              savePersistedSet('__dragon_tg_suppressed_keys', suppressedKeys);
+              savePersistedSet('__dragon_tg_suppressed_names', suppressedFilenames);
+              pausedKeys.delete(meta.key);
+              if (window.DragonBrowserBridge && window.DragonBrowserBridge.onTelegramWebUserReclicked) {
+                window.DragonBrowserBridge.onTelegramWebUserReclicked(meta.key);
+              }
+              // If the card was NOT already downloading (user tapped to start/retry), immediately register in Download Panel!
+              if (!wasAlreadyDownloading && window.DragonBrowserBridge && window.DragonBrowserBridge.onTelegramWebDownloadProgress) {
+                var hintTotal = getStaticTotalBytesHint(docCard);
+                trackedDownloads.set(meta.key, {
+                  name: meta.name,
+                  lastBytes: 0,
+                  lastChangeBytes: 0,
+                  lastChangeTs: now,
+                  totalBytes: hintTotal > 0 ? hintTotal : 0,
+                  lastSpeed: 0,
+                  lastTs: now,
+                  missedCount: -4
+                });
+                window.DragonBrowserBridge.onTelegramWebDownloadProgress(
+                  meta.key,
+                  meta.name,
+                  0,
+                  hintTotal > 0 ? hintTotal : 0,
+                  0,
+                  location.href || ''
+                );
+              }
+              return;
+            }
+
+            // 2. Context-menu "Download" / "Save" click -> authorize ONLY the single bubble that opened the menu
+            var menuItem = target.closest('.btn-menu-item, .MenuItem, [role="menuitem"]');
+            if (menuItem) {
+              var menuText = ((menuItem.innerText || menuItem.textContent || '') + ' ' + (menuItem.className || '')).toLowerCase();
+              if ((menuText.indexOf('download') !== -1 || menuText.indexOf('save') !== -1) &&
+                  lastContextBubbleMid && (now - lastContextBubbleAtMs) < 15000) {
+                userClickedKeys.set('mid:' + lastContextBubbleMid, now);
+                var bubbleEl = document.querySelector('[data-mid="' + lastContextBubbleMid + '"], [data-message-id="' + lastContextBubbleMid + '"]');
+                if (bubbleEl) {
+                  var bubbleCard = canonicalizeDocCard(bubbleEl.querySelector('.document, .File, .Document, .document-container') || bubbleEl);
+                  if (bubbleCard) {
+                    if (userClickedElements) userClickedElements.add(bubbleCard);
+                    var bMeta = computeKeyForCard(bubbleCard, 0);
+                    trackedElements.set(bMeta.key, { el: bubbleCard, mid: bMeta.mid, docId: bMeta.docId, name: bMeta.name });
+                    suppressedKeys.delete(bMeta.key);
+                    var normBMetaName = normalizeFileNameForMatch(bMeta.name);
+                    if (normBMetaName) suppressedFilenames.delete(normBMetaName);
+                    pausedKeys.delete(bMeta.key);
+                    if (window.DragonBrowserBridge && window.DragonBrowserBridge.onTelegramWebUserReclicked) {
+                      window.DragonBrowserBridge.onTelegramWebUserReclicked(bMeta.key);
+                    }
+                    // Immediately register in Download Panel the instant user clicks "Download" in context menu!
+                    if (window.DragonBrowserBridge && window.DragonBrowserBridge.onTelegramWebDownloadProgress) {
+                      var bHintTotal = getStaticTotalBytesHint(bubbleCard);
+                      var bParsed = parseProgressFromText(getVisibleSizeText(bubbleCard));
+                      var bDone = (bParsed && bParsed.total > 0 && bParsed.done < bParsed.total) ? bParsed.done : 0;
+                      var bTotal = (bParsed && bParsed.total > 0) ? bParsed.total : (bHintTotal > 0 ? bHintTotal : 0);
+                      trackedDownloads.set(bMeta.key, {
+                        name: bMeta.name,
+                        lastBytes: bDone,
+                        lastChangeBytes: bDone,
+                        lastChangeTs: now,
+                        totalBytes: bTotal,
+                        lastSpeed: 0,
+                        lastTs: now,
+                        missedCount: -5
+                      });
+                      window.DragonBrowserBridge.onTelegramWebDownloadProgress(
+                        bMeta.key,
+                        bMeta.name,
+                        bDone,
+                        bTotal,
+                        0,
+                        location.href || ''
+                      );
+                    }
+                  }
+                }
+                suppressedKeys.forEach(function(sk) {
+                  if (sk.indexOf(lastContextBubbleMid + '|') === 0) {
+                    suppressedKeys.delete(sk);
+                    pausedKeys.delete(sk);
+                    if (window.DragonBrowserBridge && window.DragonBrowserBridge.onTelegramWebUserReclicked) {
+                      window.DragonBrowserBridge.onTelegramWebUserReclicked(sk);
+                    }
+                  }
+                });
+                savePersistedSet('__dragon_tg_suppressed_keys', suppressedKeys);
+                savePersistedSet('__dragon_tg_suppressed_names', suppressedFilenames);
+              }
+            }
+          } catch (e) {}
+        }, true);
+
+        function wasExplicitlyClickedByUser(el, mid, docId, now) {
+          if (userClickedElements && userClickedElements.has(el)) return true;
+          if (mid && userClickedKeys.has('mid:' + mid) && (now - userClickedKeys.get('mid:' + mid)) < 600000) return true;
+          if (docId && userClickedKeys.has('doc:' + docId) && (now - userClickedKeys.get('doc:' + docId)) < 600000) return true;
+          return false;
+        }
+
+        function isElementActuallyVisible(node) {
+          if (!node || !node.isConnected) return false;
+          var cur = node;
+          for (var depth = 0; depth < 4 && cur && cur !== document.body; depth++) {
+            var cls = String(cur.className || '').toLowerCase();
+            if (cls.indexOf('hide') !== -1 || cls.indexOf('hidden') !== -1 || cls.indexOf('is-out') !== -1) {
+              return false;
+            }
+            cur = cur.parentElement;
+          }
+          try {
+            var style = window.getComputedStyle(node);
+            if (!style) return false;
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            if (parseFloat(style.opacity || '1') <= 0.05) return false;
+          } catch (e) {}
+          if (window.innerWidth > 50 && window.innerHeight > 50 && node.getBoundingClientRect) {
+            var rect = node.getBoundingClientRect();
+            return !!(rect && rect.width > 1 && rect.height > 1);
+          }
+          return true;
+        }
+
+        function hasVisibleDownloadSpinner(el) {
+          if (el.classList.contains('downloading') || el.classList.contains('is-downloading')) {
+            return true;
+          }
+          var parentContainer = el.closest ? el.closest('.document-container') : null;
+          if (parentContainer && (parentContainer.classList.contains('downloading') || parentContainer.classList.contains('is-downloading'))) {
+            return true;
+          }
+          var spinners = el.querySelectorAll(
+            '.preloader-circular, .preloader-document, .progress-line, .ProgressSpinner, .file-progress, .document-download-progress, .btn-icon.tgico-close, .preloader-container.is-visible:not(.is-out)'
+          );
+          for (var s = 0; s < spinners.length; s++) {
+            if (isElementActuallyVisible(spinners[s])) return true;
+          }
+          return false;
+        }
+
+        function getVisibleSizeText(el) {
+          var sizeNodes = el.querySelectorAll(
+            '.document-size, .document-size-text, .document-subtitle, .file-subtitle, .file-progress, [class*="document-size"], [class*="file-subtitle"]'
+          );
+          for (var i = 0; i < sizeNodes.length; i++) {
+            var node = sizeNodes[i];
+            if (!isElementActuallyVisible(node)) continue;
+            // innerText excludes CSS-hidden spans (unlike textContent, which reads hidden static "3.25 GB / 3.25 GB" nodes!)
+            var vis = (node.innerText || '').trim();
+            if (vis && (vis.indexOf('/') !== -1 || vis.indexOf('%') !== -1 || /\bof\b/i.test(vis))) {
+              return vis;
+            }
+          }
+          return '';
+        }
+
+        function getStaticTotalBytesHint(el) {
+          var sizeNodes = el.querySelectorAll(
+            '.document-size, .document-size-text, .document-subtitle, .file-subtitle, [class*="document-size"]'
+          );
+          for (var i = 0; i < sizeNodes.length; i++) {
+            var vis = (sizeNodes[i].innerText || sizeNodes[i].textContent || '').trim();
+            var m = /(\d+(?:[.,]\d+)?)\s*(B|KB|KiB|MB|MiB|GB|GiB)\b/i.exec(vis);
+            if (m) {
+              var b = parseByteUnit(m[1], m[2]);
+              if (b > 0) return b;
+            }
+          }
+          return -1;
+        }
+
+        function parseByteUnit(numStr, unitStr) {
+          var n = parseFloat(String(numStr || '0').replace(',', '.'));
+          if (isNaN(n) || n < 0) return -1;
+          var u = String(unitStr || 'B').toUpperCase();
+          if (u.indexOf('G') === 0) return Math.round(n * 1024 * 1024 * 1024);
+          if (u.indexOf('M') === 0) return Math.round(n * 1024 * 1024);
+          if (u.indexOf('K') === 0) return Math.round(n * 1024);
+          return Math.round(n);
+        }
+
+        function parseProgressFromText(text) {
+          if (!text) return null;
+          var fullMatch = /(\d+(?:[.,]\d+)?)\s*(B|KB|KiB|MB|MiB|GB|GiB)?\s*(?:\/|\bof\b)\s*(\d+(?:[.,]\d+)?)\s*(B|KB|KiB|MB|MiB|GB|GiB)/i.exec(text);
+          if (fullMatch) {
+            var totalUnit = fullMatch[4];
+            var doneUnit = fullMatch[2] || totalUnit;
+            var doneB = parseByteUnit(fullMatch[1], doneUnit);
+            var totalB = parseByteUnit(fullMatch[3], totalUnit);
+            if (totalB > 0) {
+              return { done: Math.min(doneB >= 0 ? doneB : 0, totalB), total: totalB };
+            }
+          }
+          var pctMatch = /(\d{1,3})\s*%/.exec(text);
+          if (pctMatch) {
+            var pct = parseInt(pctMatch[1], 10);
+            var sizeMatch = /(\d+(?:[.,]\d+)?)\s*(B|KB|KiB|MB|MiB|GB|GiB)/i.exec(text);
+            var totalOnly = sizeMatch ? parseByteUnit(sizeMatch[1], sizeMatch[2]) : -1;
+            if (pct >= 0 && pct <= 100) {
+              return {
+                done: totalOnly > 0 ? Math.round((totalOnly * pct) / 100) : pct * 1024,
+                total: totalOnly > 0 ? totalOnly : 100 * 1024
+              };
+            }
+          }
+          return null;
+        }
+
+        function normalizeFileNameForMatch(raw) {
+          return String(raw || '')
+            .trim()
+            .toLowerCase()
+            .replace(/\.[a-z0-9]{1,8}$/i, '')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .trim();
+        }
+
+        function isCardCurrentlyDownloading(card) {
+          if (!card || !card.isConnected) return false;
+          if (hasVisibleDownloadSpinner(card)) return true;
+          var parsed = parseProgressFromText(getVisibleSizeText(card));
+          return !!(parsed && parsed.total > 0 && parsed.done < parsed.total);
+        }
+
+        function findCardForKey(targetKey, filenameHint, preferDownloading) {
+          if (targetKey) {
+            var stored = trackedElements.get(targetKey);
+            if (stored && stored.el && stored.el.isConnected) {
+              return stored.el;
+            }
+          }
+          var sep = targetKey ? targetKey.indexOf('|') : -1;
+          var keyPrefix = sep >= 0 ? targetKey.slice(0, sep) : '';
+          var keyName = sep >= 0 ? targetKey.slice(sep + 1) : (targetKey || '');
+          var normKeyName = normalizeFileNameForMatch(keyName);
+          var normHint = normalizeFileNameForMatch(filenameHint);
+          var rawContainers = document.querySelectorAll('.document, .File, .Document, .document-container');
+          var visited = typeof Set === 'function' ? new Set() : null;
+          var exactMatch = null;
+          var nameMatch = null;
+          var fuzzyDownloadingMatch = null;
+          var allDownloadingCards = [];
+
+          for (var i = 0; i < rawContainers.length; i++) {
+            var card = canonicalizeDocCard(rawContainers[i]) || rawContainers[i];
+            if (visited) {
+              if (visited.has(card)) continue;
+              visited.add(card);
+            }
+            var meta = computeKeyForCard(card, i);
+            var active = isCardCurrentlyDownloading(card);
+            if (active) allDownloadingCards.push({ card: card, meta: meta });
+
+            if (targetKey && meta.key === targetKey) {
+              trackedElements.set(targetKey, { el: card, mid: meta.mid, docId: meta.docId, name: meta.name });
+              return card;
+            }
+            if (keyPrefix && keyPrefix !== 'tg' && (meta.mid === keyPrefix || meta.docId === keyPrefix)) {
+              exactMatch = { card: card, meta: meta };
+              if (!preferDownloading || active) break;
+            }
+            var normCardName = normalizeFileNameForMatch(meta.name);
+            var isNameEqual = (keyName && meta.name === keyName) ||
+              (filenameHint && meta.name.toLowerCase() === String(filenameHint).trim().toLowerCase()) ||
+              (normKeyName && normCardName && normCardName === normKeyName) ||
+              (normHint && normCardName && normCardName === normHint);
+            if (isNameEqual) {
+              if (!nameMatch || (preferDownloading && active)) {
+                nameMatch = { card: card, meta: meta };
+              }
+            } else if (active && normCardName && ((normHint && (normCardName.indexOf(normHint) !== -1 || normHint.indexOf(normCardName) !== -1)) ||
+                (normKeyName && (normCardName.indexOf(normKeyName) !== -1 || normKeyName.indexOf(normCardName) !== -1)))) {
+              fuzzyDownloadingMatch = { card: card, meta: meta };
+            }
+          }
+
+          var chosen = exactMatch || nameMatch || fuzzyDownloadingMatch;
+          if (!chosen && preferDownloading && allDownloadingCards.length === 1) {
+            chosen = allDownloadingCards[0];
+          }
+          if (chosen) {
+            var storeKey = targetKey || chosen.meta.key;
+            if (storeKey) {
+              trackedElements.set(storeKey, {
+                el: chosen.card,
+                mid: chosen.meta.mid,
+                docId: chosen.meta.docId,
+                name: chosen.meta.name
+              });
+            }
+            return chosen.card;
+          }
+          return null;
+        }
+
+        function getElementCenterCoords(el) {
+          try {
+            if (el && el.getBoundingClientRect) {
+              var r = el.getBoundingClientRect();
+              if (r && r.width > 0 && r.height > 0) {
+                return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+              }
+            }
+          } catch (e) {}
+          return { x: 24, y: 24 };
+        }
+
+        function dispatchPointerClick(el) {
+          if (!el || !el.isConnected) return false;
+          var pos = getElementCenterCoords(el);
+          var base = {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            view: window,
+            detail: 1,
+            button: 0,
+            buttons: 1,
+            clientX: pos.x,
+            clientY: pos.y,
+            screenX: pos.x,
+            screenY: pos.y
+          };
+          try {
+            if (typeof PointerEvent === 'function') {
+              el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, base)));
+            }
+          } catch (e) {}
+          try { el.dispatchEvent(new MouseEvent('mousedown', base)); } catch (e) {}
+          var upOpts = Object.assign({}, base, { buttons: 0 });
+          try {
+            if (typeof PointerEvent === 'function') {
+              el.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, upOpts)));
+            }
+          } catch (e) {}
+          try { el.dispatchEvent(new MouseEvent('mouseup', upOpts)); } catch (e) {}
+          try {
+            el.dispatchEvent(new MouseEvent('click', upOpts));
+            return true;
+          } catch (e) {
+            if (typeof el.click === 'function') {
+              try { el.click(); return true; } catch (e2) {}
+            }
+          }
+          return false;
+        }
+
+        function dispatchTouchTap(el) {
+          if (!el || !el.isConnected) return false;
+          var pos = getElementCenterCoords(el);
+          var firedTouch = false;
+          try {
+            if (typeof Touch === 'function' && typeof TouchEvent === 'function') {
+              var t = new Touch({
+                identifier: Date.now() % 10000,
+                target: el,
+                clientX: pos.x,
+                clientY: pos.y,
+                pageX: pos.x + (window.scrollX || 0),
+                pageY: pos.y + (window.scrollY || 0),
+                screenX: pos.x,
+                screenY: pos.y,
+                radiusX: 8,
+                radiusY: 8,
+                force: 1
+              });
+              el.dispatchEvent(new TouchEvent('touchstart', {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                touches: [t],
+                targetTouches: [t],
+                changedTouches: [t]
+              }));
+              el.dispatchEvent(new TouchEvent('touchend', {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                touches: [],
+                targetTouches: [],
+                changedTouches: [t]
+              }));
+              firedTouch = true;
+            }
+          } catch (e) {}
+          if (!firedTouch) {
+            return dispatchPointerClick(el);
+          }
+          return true;
+        }
+
+        function pickBestSingleControlTarget(card) {
+          if (!card || !card.isConnected) return null;
+          var prioritySelectors = [
+            '.preloader-container.is-visible:not(.is-out)',
+            '.preloader-container:not(.is-out)',
+            '.preloader-document',
+            '.preloader-circular',
+            '.btn-icon.tgico-close',
+            'button[aria-label*="cancel" i]',
+            'button[title*="cancel" i]',
+            '.ProgressSpinner',
+            '.document-ico',
+            '.file-icon',
+            '.action-icon',
+            '.File__icon'
+          ];
+          for (var i = 0; i < prioritySelectors.length; i++) {
+            try {
+              var found = card.querySelector(prioritySelectors[i]);
+              if (found && isElementActuallyVisible(found)) {
+                return found;
+              }
+            } catch (e) {}
+          }
+          return card;
+        }
+
+        function executeVerifiedCardAction(card, wantDownloading) {
+          if (!card || !card.isConnected) return false;
+          var currentState = isCardCurrentlyDownloading(card);
+          if (currentState === wantDownloading) {
+            return true;
+          }
+          var now = Date.now();
+          if (activeCardCancelWatchUntil) {
+            var cooldownUntil = activeCardCancelWatchUntil.get(card) || 0;
+            if (now < cooldownUntil) return true;
+            // 4.5s cooldown so Telegram Web's 400ms preloader fade-out animation never triggers a 2nd tap (which would restart the download!)
+            activeCardCancelWatchUntil.set(card, now + 4500);
+          }
+
+          var target = pickBestSingleControlTarget(card);
+          if (!target) return false;
+
+          // Single surgical click (never fire multiple taps across parent/child elements on the same card!)
+          dispatchPointerClick(target);
+          return true;
+        }
+
+        function isSuppressedCard(key, name) {
+          if (key && suppressedKeys.has(key)) return true;
+          var norm = normalizeFileNameForMatch(name);
+          if (norm && suppressedFilenames.has(norm)) return true;
+          return false;
+        }
+
+        // Exposed two-way controller invoked from Dragon Download Manager Panel (Pause / Resume / Cancel)
+        window.__dragonControlTelegramDownload = function(webTaskKey, action, filenameHint) {
+          try {
+            var safeKey = String(webTaskKey || '').trim();
+            var safeName = String(filenameHint || '').trim();
+            if (!safeKey && !safeName) return false;
+            var preferDownloading = (action === 'cancel' || action === 'pause');
+            var card = findCardForKey(safeKey, safeName, preferDownloading);
+            var cardMeta = card ? computeKeyForCard(card, 0) : null;
+            var effectiveKey = safeKey || (cardMeta ? cardMeta.key : '');
+            var sep = effectiveKey.indexOf('|');
+            var keyEmbeddedName = sep >= 0 ? effectiveKey.slice(sep + 1) : '';
+            var normTargetName = normalizeFileNameForMatch(safeName || (cardMeta ? cardMeta.name : '') || keyEmbeddedName);
+
+            if (action === 'cancel') {
+              if (effectiveKey) {
+                suppressedKeys.add(effectiveKey);
+                pausedKeys.delete(effectiveKey);
+                trackedDownloads.delete(effectiveKey);
+              }
+              if (cardMeta && cardMeta.key) {
+                suppressedKeys.add(cardMeta.key);
+                pausedKeys.delete(cardMeta.key);
+                trackedDownloads.delete(cardMeta.key);
+              }
+              if (normTargetName) {
+                suppressedFilenames.add(normTargetName);
+              }
+              savePersistedSet('__dragon_tg_suppressed_keys', suppressedKeys);
+              savePersistedSet('__dragon_tg_suppressed_names', suppressedFilenames);
+              var pref = sep >= 0 ? effectiveKey.slice(0, sep) : '';
+              if (pref) {
+                userClickedKeys.delete('mid:' + pref);
+                userClickedKeys.delete('doc:' + pref);
+              }
+              if (cardMeta) {
+                if (cardMeta.mid) userClickedKeys.delete('mid:' + cardMeta.mid);
+                if (cardMeta.docId) userClickedKeys.delete('doc:' + cardMeta.docId);
+              }
+              if (card && userClickedElements && userClickedElements.delete) {
+                userClickedElements.delete(card);
+              }
+              if (card && isCardCurrentlyDownloading(card)) {
+                executeVerifiedCardAction(card, false, false);
+              }
+              syncDownloadWakeLock(trackedDownloads.size);
+              return true;
+            }
+            if (action === 'pause') {
+              if (effectiveKey) pausedKeys.add(effectiveKey);
+              if (cardMeta && cardMeta.key) pausedKeys.add(cardMeta.key);
+              if (card && isCardCurrentlyDownloading(card)) {
+                executeVerifiedCardAction(card, false, false);
+              }
+              return true;
+            }
+            if (action === 'resume') {
+              if (effectiveKey) {
+                pausedKeys.delete(effectiveKey);
+                suppressedKeys.delete(effectiveKey);
+              }
+              if (cardMeta && cardMeta.key) {
+                pausedKeys.delete(cardMeta.key);
+                suppressedKeys.delete(cardMeta.key);
+              }
+              if (normTargetName) {
+                suppressedFilenames.delete(normTargetName);
+              }
+              savePersistedSet('__dragon_tg_suppressed_keys', suppressedKeys);
+              savePersistedSet('__dragon_tg_suppressed_names', suppressedFilenames);
+              if (!card) {
+                if (effectiveKey && window.DragonBrowserBridge && window.DragonBrowserBridge.onTelegramWebResumeUnavailable) {
+                  window.DragonBrowserBridge.onTelegramWebResumeUnavailable(effectiveKey);
+                }
+                return false;
+              }
+              var now = Date.now();
+              if (userClickedElements) userClickedElements.add(card);
+              if (cardMeta) {
+                if (cardMeta.mid) userClickedKeys.set('mid:' + cardMeta.mid, now);
+                if (cardMeta.docId) userClickedKeys.set('doc:' + cardMeta.docId, now);
+              }
+              if (!isCardCurrentlyDownloading(card)) {
+                executeVerifiedCardAction(card, true, false);
+              }
+              return true;
+            }
+          } catch (e) {}
+          return false;
+        };
+
+        setInterval(function() {
+          try {
+            var bridge = window.DragonBrowserBridge;
+            if (!bridge || !bridge.onTelegramWebDownloadProgress) return;
+            var now = Date.now();
+            var seenKeys = new Set();
+            var visitedCards = typeof Set === 'function' ? new Set() : null;
+
+            var rawContainers = document.querySelectorAll('.document, .File, .Document, .document-container');
+            for (var i = 0; i < rawContainers.length; i++) {
+              var el = canonicalizeDocCard(rawContainers[i]) || rawContainers[i];
+              if (visitedCards) {
+                if (visitedCards.has(el)) continue;
+                visitedCards.add(el);
+              }
+
+              var meta = computeKeyForCard(el, i);
+              var mid = meta.mid;
+              var docId = meta.docId;
+              var name = meta.name;
+              var key = meta.key;
+
+              // Never report cancelled or paused tasks back as active — and NEVER auto-click a card from the polling loop!
+              if (isSuppressedCard(key, name) || pausedKeys.has(key)) {
+                continue;
+              }
+
+              var alreadyTracked = trackedDownloads.has(key);
+
+              // STRICT GATE 1: Must have been explicitly clicked by the user (or already tracked from that click)
+              if (!alreadyTracked && !wasExplicitlyClickedByUser(el, mid, docId, now)) {
+                continue;
+              }
+
+              // STRICT GATE 2: Must be visibly downloading right now (visible "done / total" or visible active spinner on this clicked card)
+              var visibleSizeText = getVisibleSizeText(el);
+              var parsed = parseProgressFromText(visibleSizeText);
+              var visibleSpinner = hasVisibleDownloadSpinner(el);
+
+              if (!parsed && !visibleSpinner) continue;
+              // Never start tracking a brand-new file whose text already reads 100% (done >= total) — that's an idle/static card!
+              if (!alreadyTracked && parsed && parsed.total > 0 && parsed.done >= parsed.total) {
+                continue;
+              }
+
+              if (seenKeys.has(key)) continue;
+              seenKeys.add(key);
+              trackedElements.set(key, { el: el, mid: mid, docId: docId, name: name });
+
+              var prev = trackedDownloads.get(key);
+              var doneBytes = parsed ? parsed.done : (prev ? prev.lastBytes : 0);
+              if (prev && doneBytes <= 0 && prev.lastBytes > 0) {
+                doneBytes = prev.lastBytes;
+              }
+              var totalBytes = (parsed && parsed.total > 0) ? parsed.total : (prev && prev.totalBytes > 0 ? prev.totalBytes : getStaticTotalBytesHint(el));
+              var speedBps = 0;
+              var lastChangeBytes = prev ? prev.lastChangeBytes : doneBytes;
+              var lastChangeTs = prev ? prev.lastChangeTs : now;
+              if (prev) {
+                if (doneBytes > prev.lastChangeBytes) {
+                  var dtSec = Math.max((now - prev.lastChangeTs) / 1000.0, 0.25);
+                  var instantSpeed = (doneBytes - prev.lastChangeBytes) / dtSec;
+                  speedBps = prev.lastSpeed > 0
+                    ? Math.round(instantSpeed * 0.65 + prev.lastSpeed * 0.35)
+                    : Math.round(instantSpeed);
+                  lastChangeBytes = doneBytes;
+                  lastChangeTs = now;
+                } else {
+                  var stallSec = (now - prev.lastChangeTs) / 1000.0;
+                  speedBps = stallSec < 8.0 ? (prev.lastSpeed || 0) : 0;
+                }
+              }
+              trackedDownloads.set(key, {
+                name: name,
+                lastBytes: doneBytes,
+                lastChangeBytes: lastChangeBytes,
+                lastChangeTs: lastChangeTs,
+                totalBytes: totalBytes,
+                lastSpeed: speedBps,
+                lastTs: now,
+                missedCount: 0
+              });
+              bridge.onTelegramWebDownloadProgress(
+                key,
+                name,
+                doneBytes,
+                totalBytes,
+                speedBps,
+                location.href || ''
+              );
+            }
+
+            syncDownloadWakeLock(seenKeys.size);
+
+            // Detect completed or user-cancelled in-page Telegram Web downloads (skipping paused/suppressed tasks)
+            trackedDownloads.forEach(function(info, key) {
+              if (seenKeys.has(key) || pausedKeys.has(key) || suppressedKeys.has(key)) return;
+              info.missedCount = (info.missedCount || 0) + 1;
+              if (info.missedCount < 3) return;
+              trackedDownloads.delete(key);
+              var ratio = (info.totalBytes > 0) ? (info.lastBytes / info.totalBytes) : 0;
+              if (ratio >= 0.85) {
+                if (bridge.onTelegramWebDownloadCached) {
+                  bridge.onTelegramWebDownloadCached(key, info.name, info.totalBytes > 0 ? info.totalBytes : info.lastBytes);
+                }
+              } else {
+                if (bridge.onTelegramWebDownloadCancelled) {
+                  bridge.onTelegramWebDownloadCancelled(key);
+                }
+              }
+            });
+          } catch (e) {}
+        }, 400);
+      } catch (e) {}
+    })();
   } catch (e) {}
 })();
 """
+
+private data class ActiveNativeBlobStream(
+    val streamId: String,
+    val taskId: String,
+    val sourceUrl: String,
+    val isTelegramOrigin: Boolean,
+    var cleanName: String,
+    var resolvedExt: String,
+    var resolvedMime: String,
+    var subFolder: String,
+    var isAudioOnly: Boolean,
+    var isGenericFile: Boolean,
+    val totalBytes: Long,
+    val activeConnections: Int,
+    val tempFile: java.io.File,
+    val outputStream: java.io.BufferedOutputStream,
+    val startedAtMs: Long,
+    var lastProgressEmitMs: Long = 0L,
+    var writtenBytes: Long = 0L,
+    var headerInspected: Boolean = false,
+    var aborted: Boolean = false
+)
+
+private fun buildAcceleratedWebStreamJs(
+    safeTargetUrl: String,
+    safeName: String,
+    safeMime: String,
+    totalHintBytes: Long,
+    isTelegramStream: Boolean,
+    maxConnections: Int = 16
+): String {
+    val tgParallelWorkers = maxConnections.coerceIn(12, 16)
+    if (!isTelegramStream) {
+        return """
+        (function(){
+          try {
+            var bridge = window.DragonBrowserBridge;
+            if (!bridge) return;
+            window.__dragonStreamControllers = window.__dragonStreamControllers || new Map();
+            if (!window.__dragonControlStream) {
+              window.__dragonControlStream = function(sid, action) {
+                var ctrl = window.__dragonStreamControllers.get(sid);
+                if (!ctrl) return false;
+                if (action === 'cancel') {
+                  ctrl.aborted = true;
+                  ctrl.paused = false;
+                  if (ctrl.abortControllers) {
+                    ctrl.abortControllers.forEach(function(ac) { try { ac.abort(); } catch(e) {} });
+                  }
+                  if (ctrl.resumeResolvers) {
+                    ctrl.resumeResolvers.forEach(function(r) { try { r(); } catch(e) {} });
+                    ctrl.resumeResolvers = [];
+                  }
+                  return true;
+                }
+                if (action === 'pause') {
+                  ctrl.paused = true;
+                  return true;
+                }
+                if (action === 'resume') {
+                  ctrl.paused = false;
+                  if (ctrl.resumeResolvers) {
+                    ctrl.resumeResolvers.forEach(function(r) { try { r(); } catch(e) {} });
+                    ctrl.resumeResolvers = [];
+                  }
+                  return true;
+                }
+                return false;
+              };
+            }
+            var targetUrl = $safeTargetUrl;
+            var cached = (window.__dragonBlobRegistry && window.__dragonBlobRegistry.get) ? window.__dragonBlobRegistry.get(targetUrl) : null;
+            function sendBlob(b, onDone) {
+              var resolvedMime = (b && b.type) || $safeMime;
+              if (bridge.onBlobStreamStart && bridge.onBlobStreamChunk && bridge.onBlobStreamFinish) {
+                var streamId = 'blob_' + Date.now() + '_' + Math.floor(Math.random() * 100000);
+                var ctrl = { aborted: false, paused: false, resumeResolvers: [], abortControllers: new Set() };
+                window.__dragonStreamControllers.set(streamId, ctrl);
+                bridge.onBlobStreamStart(streamId, $safeName, resolvedMime, b.size || $totalHintBytes, false);
+                var chunkSize = 768 * 1024;
+                var offset = 0;
+                function pump() {
+                  if (ctrl.aborted) {
+                    window.__dragonStreamControllers.delete(streamId);
+                    if (onDone) onDone();
+                    return;
+                  }
+                  if (ctrl.paused) {
+                    ctrl.resumeResolvers.push(pump);
+                    return;
+                  }
+                  if (offset >= b.size) {
+                    window.__dragonStreamControllers.delete(streamId);
+                    bridge.onBlobStreamFinish(streamId);
+                    if (onDone) onDone();
+                    return;
+                  }
+                  var slice = b.slice(offset, Math.min(offset + chunkSize, b.size));
+                  var reader = new FileReader();
+                  reader.onloadend = function() {
+                    if (ctrl.aborted) {
+                      window.__dragonStreamControllers.delete(streamId);
+                      if (onDone) onDone();
+                      return;
+                    }
+                    if (reader.result) {
+                      var str = String(reader.result);
+                      var idx = str.indexOf('base64,');
+                      bridge.onBlobStreamChunk(streamId, idx >= 0 ? str.slice(idx + 7) : str);
+                    }
+                    offset += chunkSize;
+                    pump();
+                  };
+                  reader.onerror = function() {
+                    window.__dragonStreamControllers.delete(streamId);
+                    if (!ctrl.aborted && bridge.onBlobStreamAbort) bridge.onBlobStreamAbort(streamId, 'Blob read failed');
+                    if (onDone) onDone();
+                  };
+                  reader.readAsDataURL(slice);
+                }
+                pump();
+                return;
+              }
+              var reader = new FileReader();
+              reader.onloadend = function(){
+                if (bridge && reader.result) {
+                  bridge.onBlobDownloadBase64(reader.result, $safeName, resolvedMime);
+                }
+                if (onDone) onDone();
+              };
+              reader.readAsDataURL(b);
+            }
+            if (cached && cached.blob) {
+              cached.pinned = true;
+              sendBlob(cached.blob, function() { cached.pinned = false; });
+              return;
+            }
+            fetch(targetUrl).then(function(r){ return r.blob(); }).then(function(b){
+              sendBlob(b, null);
+            }).catch(function(err) {
+              if (bridge.onBlobStreamStart && bridge.onBlobStreamAbort) {
+                var errId = 'blob_err_' + Date.now();
+                bridge.onBlobStreamStart(errId, $safeName, $safeMime, -1, false);
+                bridge.onBlobStreamAbort(errId, (err && err.message) ? err.message : 'Blob fetch failed');
+              }
+            });
+          } catch(e) {}
+        })();
+        """.trimIndent()
+    }
+
+    return """
+    (async function(){
+      var bridge = window.DragonBrowserBridge;
+      if (!bridge || !bridge.onBlobStreamStart || !bridge.onBlobStreamChunk || !bridge.onBlobStreamFinish) return;
+      window.__dragonStreamControllers = window.__dragonStreamControllers || new Map();
+      if (!window.__dragonControlStream) {
+        window.__dragonControlStream = function(sid, action) {
+          var c = window.__dragonStreamControllers.get(sid);
+          if (!c) return false;
+          if (action === 'cancel') {
+            c.aborted = true;
+            c.paused = false;
+            if (c.abortControllers) {
+              c.abortControllers.forEach(function(ac) { try { ac.abort(); } catch(e) {} });
+            }
+            if (c.resumeResolvers) {
+              c.resumeResolvers.forEach(function(r) { try { r(); } catch(e) {} });
+              c.resumeResolvers = [];
+            }
+            return true;
+          }
+          if (action === 'pause') {
+            c.paused = true;
+            return true;
+          }
+          if (action === 'resume') {
+            c.paused = false;
+            if (c.resumeResolvers) {
+              c.resumeResolvers.forEach(function(r) { try { r(); } catch(e) {} });
+              c.resumeResolvers = [];
+            }
+            return true;
+          }
+          return false;
+        };
+      }
+
+      var targetUrl = $safeTargetUrl;
+      var fallbackName = $safeName;
+      var fallbackMime = $safeMime;
+      var streamId = 'tg_' + Date.now() + '_' + Math.floor(Math.random() * 100000);
+      var ctrl = { aborted: false, paused: false, resumeResolvers: [], abortControllers: new Set() };
+      window.__dragonStreamControllers.set(streamId, ctrl);
+      var started = false;
+
+      async function waitIfPaused() {
+        while (ctrl.paused && !ctrl.aborted) {
+          await new Promise(function(resolve) {
+            ctrl.resumeResolvers.push(resolve);
+          });
+        }
+      }
+
+      function trackedFetch(url, opts) {
+        var ac = typeof AbortController === 'function' ? new AbortController() : null;
+        if (ac) {
+          ctrl.abortControllers.add(ac);
+          opts = Object.assign({}, opts || {}, { signal: ac.signal });
+        }
+        return fetch(url, opts).finally(function() {
+          if (ac) ctrl.abortControllers.delete(ac);
+        });
+      }
+
+      function bytesToBase64(u8) {
+        var bin = '';
+        var step = 32768;
+        for (var i = 0; i < u8.length; i += step) {
+          var sub = u8.subarray(i, Math.min(i + step, u8.length));
+          bin += String.fromCharCode.apply(null, sub);
+        }
+        return btoa(bin);
+      }
+
+      function parseFilenameFromDisposition(cd) {
+        if (!cd) return '';
+        var mStar = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(cd);
+        if (mStar && mStar[1]) {
+          try { return decodeURIComponent(mStar[1].trim()); } catch(e) {}
+        }
+        var m = /filename\s*=\s*"?([^";]+)"?/i.exec(cd);
+        return (m && m[1]) ? m[1].trim() : '';
+      }
+
+      async function pipeResponseBody(res, resolvedName, resolvedMime, totalHint) {
+        var seqTotal = parseInt(res.headers.get('Content-Length') || '-1', 10);
+        if (!(seqTotal > 0)) seqTotal = totalHint > 0 ? totalHint : -1;
+        var PIPE_CHUNK = 1024 * 1024;
+        bridge.onBlobStreamStart(streamId, resolvedName, res.headers.get('Content-Type') || resolvedMime, seqTotal, false);
+        started = true;
+        if (res.body && res.body.getReader) {
+          var reader = res.body.getReader();
+          var pending = [];
+          var pendingLen = 0;
+          function emitPending() {
+            if (pendingLen === 0 || ctrl.aborted) return;
+            var merged = new Uint8Array(pendingLen);
+            var pos = 0;
+            for (var i = 0; i < pending.length; i++) {
+              merged.set(pending[i], pos);
+              pos += pending[i].length;
+            }
+            pending = [];
+            pendingLen = 0;
+            bridge.onBlobStreamChunk(streamId, bytesToBase64(merged));
+          }
+          while (true) {
+            await waitIfPaused();
+            if (ctrl.aborted) {
+              try { await reader.cancel(); } catch(e) {}
+              return;
+            }
+            var step = await reader.read();
+            if (step.done) break;
+            if (ctrl.aborted) {
+              try { await reader.cancel(); } catch(e) {}
+              return;
+            }
+            if (step.value && step.value.length > 0) {
+              pending.push(step.value);
+              pendingLen += step.value.length;
+              if (pendingLen >= PIPE_CHUNK) {
+                emitPending();
+              }
+            }
+          }
+          if (ctrl.aborted) return;
+          emitPending();
+          bridge.onBlobStreamFinish(streamId);
+        } else {
+          var fullBuf = new Uint8Array(await res.arrayBuffer());
+          for (var off = 0; off < fullBuf.length; off += PIPE_CHUNK) {
+            await waitIfPaused();
+            if (ctrl.aborted) return;
+            bridge.onBlobStreamChunk(streamId, bytesToBase64(fullBuf.subarray(off, Math.min(off + PIPE_CHUNK, fullBuf.length))));
+          }
+          if (!ctrl.aborted) bridge.onBlobStreamFinish(streamId);
+        }
+      }
+
+      try {
+        var lowerTarget = targetUrl.toLowerCase();
+        var activeUrl = targetUrl;
+        var isOneShotDownloadEndpoint = lowerTarget.indexOf('/d/') !== -1 || lowerTarget.indexOf('/download/') !== -1;
+
+        // Smart Uncapped Turbo Upgrade: If Telegram Web K /d/<json> carries doc location JSON, probe /stream/<json>
+        // for HTTP 206 Range support so we can run 16x parallel 2 MB workers instead of a single throttled stream!
+        if (isOneShotDownloadEndpoint && lowerTarget.indexOf('/d/') !== -1) {
+          try {
+            var afterD = targetUrl.split('/d/')[1] || '';
+            var decodedSeg = decodeURIComponent(afterD.split('?')[0]);
+            if (decodedSeg.indexOf('{') === 0 && decodedSeg.indexOf('location') !== -1) {
+              var candidateStreamUrl = targetUrl.replace('/d/', '/stream/');
+              var upgradeProbe = await trackedFetch(candidateStreamUrl, {
+                credentials: 'include',
+                headers: { 'Range': 'bytes=0-0' }
+              });
+              if (upgradeProbe && upgradeProbe.status === 206) {
+                try { if (upgradeProbe.body && upgradeProbe.body.cancel) await upgradeProbe.body.cancel(); } catch(e) {}
+                activeUrl = candidateStreamUrl;
+                isOneShotDownloadEndpoint = false;
+              }
+            }
+          } catch (e) {}
+        }
+
+        if (isOneShotDownloadEndpoint) {
+          var oneShotRes = await trackedFetch(activeUrl, { credentials: 'include' });
+          if (!oneShotRes.ok) throw new Error('Telegram SW HTTP ' + oneShotRes.status);
+          var osMime = oneShotRes.headers.get('Content-Type') || fallbackMime;
+          var osName = parseFilenameFromDisposition(oneShotRes.headers.get('Content-Disposition')) || fallbackName;
+          await pipeResponseBody(oneShotRes, osName, osMime, $totalHintBytes);
+          window.__dragonStreamControllers.delete(streamId);
+          return;
+        }
+
+        // Range-capable Telegram Web /stream/ and /progressive/ endpoints: probe total size then run UNCAPPED 16x parallel 2 MB Range workers
+        var probeRes = await trackedFetch(activeUrl, {
+          credentials: 'include',
+          headers: { 'Range': 'bytes=0-0' }
+        });
+        if (!probeRes.ok && probeRes.status !== 206) {
+          throw new Error('HTTP ' + probeRes.status);
+        }
+        var contentRange = probeRes.headers.get('Content-Range') || '';
+        var resolvedMime = probeRes.headers.get('Content-Type') || fallbackMime;
+        var dispName = parseFilenameFromDisposition(probeRes.headers.get('Content-Disposition'));
+        var resolvedName = dispName || fallbackName;
+        var totalBytes = -1;
+        var crMatch = /\/(\d+)\s*$/.exec(contentRange);
+        if (crMatch && crMatch[1]) {
+          totalBytes = parseInt(crMatch[1], 10);
+        } else {
+          var cl = parseInt(probeRes.headers.get('Content-Length') || '-1', 10);
+          if (probeRes.status === 200 && cl > 0) totalBytes = cl;
+        }
+        if (totalBytes <= 0 && $totalHintBytes > 0) {
+          totalBytes = $totalHintBytes;
+        }
+
+        if (probeRes.status === 200) {
+          await pipeResponseBody(probeRes, resolvedName, resolvedMime, totalBytes);
+          window.__dragonStreamControllers.delete(streamId);
+          return;
+        }
+
+        try { if (probeRes.body && probeRes.body.cancel) await probeRes.body.cancel(); } catch(e) {}
+
+        var CHUNK_SIZE = totalBytes >= (16 * 1024 * 1024) ? (2 * 1024 * 1024) : (1024 * 1024);
+        if (probeRes.status === 206 && totalBytes >= (512 * 1024)) {
+          bridge.onBlobStreamStart(streamId, resolvedName, resolvedMime, totalBytes, true);
+          started = true;
+          var totalChunks = Math.ceil(totalBytes / CHUNK_SIZE);
+          var CONCURRENCY = Math.min($tgParallelWorkers, totalChunks);
+          var MAX_BUFFER_AHEAD = Math.max(CONCURRENCY * 2, 32);
+          var nextFetchIdx = 0;
+          var nextCommitIdx = 0;
+          var completedMap = new Map();
+          var failed = false;
+          var failError = '';
+
+          function flushOrdered() {
+            while (!ctrl.aborted && completedMap.has(nextCommitIdx)) {
+              var buf = completedMap.get(nextCommitIdx);
+              completedMap.delete(nextCommitIdx);
+              if (buf && buf.length > 0) {
+                var SUB_BLOCK = 1024 * 1024;
+                for (var s = 0; s < buf.length && !ctrl.aborted; s += SUB_BLOCK) {
+                  bridge.onBlobStreamChunk(streamId, bytesToBase64(buf.subarray(s, Math.min(s + SUB_BLOCK, buf.length))));
+                }
+              }
+              nextCommitIdx++;
+            }
+          }
+
+          async function fetchChunkWithRetry(idx) {
+            var start = idx * CHUNK_SIZE;
+            var end = Math.min(start + CHUNK_SIZE - 1, totalBytes - 1);
+            var expectedLen = end - start + 1;
+            var lastErr = null;
+            for (var attempt = 0; attempt < 4; attempt++) {
+              await waitIfPaused();
+              if (ctrl.aborted) throw new Error('Cancelled');
+              try {
+                var r = await trackedFetch(activeUrl, {
+                  credentials: 'include',
+                  headers: { 'Range': 'bytes=' + start + '-' + end }
+                });
+                if (!r.ok && r.status !== 206) {
+                  throw new Error('Chunk HTTP ' + r.status);
+                }
+                var arrBuf = await r.arrayBuffer();
+                var u8 = new Uint8Array(arrBuf);
+                if (u8.length > expectedLen) {
+                  u8 = u8.subarray(0, expectedLen);
+                }
+                if (u8.length === 0) {
+                  throw new Error('Empty chunk');
+                }
+                return u8;
+              } catch (err) {
+                if (ctrl.aborted) throw err;
+                lastErr = err;
+                await new Promise(function(res){ setTimeout(res, 200 * (attempt + 1)); });
+              }
+            }
+            throw lastErr || new Error('Chunk failed');
+          }
+
+          async function workerLoop() {
+            while (!failed && !ctrl.aborted) {
+              await waitIfPaused();
+              if (ctrl.aborted || nextFetchIdx >= totalChunks) break;
+              if (nextFetchIdx - nextCommitIdx >= MAX_BUFFER_AHEAD) {
+                await new Promise(function(res){ setTimeout(res, 25); });
+                continue;
+              }
+              var myIdx = nextFetchIdx++;
+              try {
+                var data = await fetchChunkWithRetry(myIdx);
+                if (ctrl.aborted) break;
+                completedMap.set(myIdx, data);
+                flushOrdered();
+              } catch (err) {
+                if (ctrl.aborted) break;
+                failed = true;
+                failError = (err && err.message) ? err.message : 'Parallel fetch failed';
+                break;
+              }
+            }
+          }
+
+          var workers = [];
+          for (var w = 0; w < CONCURRENCY; w++) {
+            workers.push(workerLoop());
+          }
+          await Promise.all(workers);
+          if (ctrl.aborted) {
+            window.__dragonStreamControllers.delete(streamId);
+            return;
+          }
+          flushOrdered();
+
+          if (failed || nextCommitIdx < totalChunks) {
+            window.__dragonStreamControllers.delete(streamId);
+            if (!ctrl.aborted && bridge.onBlobStreamAbort) {
+              bridge.onBlobStreamAbort(streamId, failError || 'Incomplete stream');
+            }
+            return;
+          }
+          window.__dragonStreamControllers.delete(streamId);
+          bridge.onBlobStreamFinish(streamId);
+          return;
+        }
+
+        var seqRes = await trackedFetch(targetUrl, { credentials: 'include' });
+        if (!seqRes.ok) throw new Error('HTTP ' + seqRes.status);
+        await pipeResponseBody(seqRes, resolvedName, resolvedMime, totalBytes);
+        window.__dragonStreamControllers.delete(streamId);
+      } catch (e) {
+        window.__dragonStreamControllers.delete(streamId);
+        if (ctrl.aborted) return;
+        if (!started) {
+          bridge.onBlobStreamStart(streamId, fallbackName, fallbackMime, -1, false);
+        }
+        if (bridge.onBlobStreamAbort) {
+          bridge.onBlobStreamAbort(streamId, (e && e.message) ? e.message : 'Telegram stream error');
+        }
+      }
+    })();
+    """.trimIndent()
+}
 
 @Composable
 private fun BrowserOAuthPopupDialog(

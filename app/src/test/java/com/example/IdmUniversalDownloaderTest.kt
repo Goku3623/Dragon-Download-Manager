@@ -540,5 +540,228 @@ class IdmUniversalDownloaderTest {
             workDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun test8xParallelDownloadAdaptsInPlaceWhenServerCapsAt4ConnectionsWithoutLosingBytes() = runBlocking {
+        // 8 MB payload (> 6 MB micro-chunking threshold) at 8x concurrency
+        val payload = buildDeterministicBytes(8 * 1024 * 1024)
+        val inFlight = AtomicInteger(0)
+        val rejected503Count = AtomicInteger(0)
+
+        val interceptor = Interceptor { chain ->
+            val req = chain.request()
+            if (req.method == "HEAD") {
+                return@Interceptor Response.Builder()
+                    .request(req).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                    .header("Accept-Ranges", "bytes")
+                    .header("Content-Length", payload.size.toString())
+                    .header("Content-Type", "application/zip")
+                    .body(ByteArray(0).toResponseBody("application/zip".toMediaType()))
+                    .build()
+            }
+
+            val concurrent = inFlight.incrementAndGet()
+            try {
+                if (concurrent > 4) {
+                    rejected503Count.incrementAndGet()
+                    Thread.sleep(25L)
+                    return@Interceptor Response.Builder()
+                        .request(req).protocol(Protocol.HTTP_1_1).code(503).message("Connection Limit")
+                        .body(ByteArray(0).toResponseBody("text/plain".toMediaType()))
+                        .build()
+                }
+                Thread.sleep(20L)
+                val rangeHeader = req.header("Range") ?: "bytes=0-${payload.size - 1}"
+                val spec = rangeHeader.removePrefix("bytes=").split("-")
+                val start = spec[0].toInt()
+                val end = spec.getOrNull(1)?.toIntOrNull() ?: (payload.size - 1)
+                val slice = payload.copyOfRange(start, end + 1)
+                Response.Builder()
+                    .request(req).protocol(Protocol.HTTP_1_1).code(206).message("Partial Content")
+                    .header("Accept-Ranges", "bytes")
+                    .header("Content-Range", "bytes $start-$end/${payload.size}")
+                    .header("Content-Length", slice.size.toString())
+                    .header("Content-Type", "application/zip")
+                    .body(slice.toResponseBody("application/zip".toMediaType()))
+                    .build()
+            } finally {
+                inFlight.decrementAndGet()
+            }
+        }
+
+        val client = OkHttpClient.Builder().addInterceptor(interceptor).build()
+        val idm = IdmAcceleratedDownloader(client)
+        val workDir = File.createTempFile("idm_8x_cap4", "").apply {
+            delete()
+            mkdirs()
+        }
+        val destFile = File(workDir, "game_8mb.zip")
+        val reportedDownloaded = mutableListOf<Long>()
+
+        try {
+            val outcome = idm.downloadWithAcceleration(
+                url = "https://cdn.example.org/game_8mb.zip",
+                destFile = destFile,
+                workDir = workDir,
+                maxConnections = 8,
+                knownTotalBytes = payload.size.toLong(),
+                rejectHtml = true,
+                requestHeadersProvider = { emptyMap() },
+                isPausedOrCancelled = { false },
+                onProgress = { upd ->
+                    synchronized(reportedDownloaded) {
+                        reportedDownloaded.add(upd.downloadedBytes)
+                    }
+                }
+            )
+
+            assertTrue(outcome is IdmAcceleratedDownloader.DownloadOutcome.Completed)
+            val completed = outcome as IdmAcceleratedDownloader.DownloadOutcome.Completed
+            assertEquals(payload.size.toLong(), completed.downloadedBytes)
+            assertArrayEquals(payload, destFile.readBytes())
+            // Verify downloaded bytes NEVER reset backward to 0 during concurrency adaptation
+            var maxSeen = 0L
+            for (bytes in reportedDownloaded) {
+                assertTrue(
+                    "Downloaded bytes regressed from $maxSeen down to $bytes!",
+                    bytes >= maxSeen
+                )
+                if (bytes > maxSeen) maxSeen = bytes
+            }
+            assertFalse(IdmAcceleratedDownloader.chunkDirFor(workDir, destFile).exists())
+        } finally {
+            workDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun test8xPauseAndResumeStepDownPreserves100PercentOfDownloadedBytes() = runBlocking {
+        val payload = buildDeterministicBytes(7 * 1024 * 1024)
+        val shouldPause = java.util.concurrent.atomic.AtomicBoolean(false)
+        val servedChunks = AtomicInteger(0)
+
+        val interceptor = Interceptor { chain ->
+            val req = chain.request()
+            if (req.method == "HEAD") {
+                return@Interceptor Response.Builder()
+                    .request(req).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                    .header("Accept-Ranges", "bytes")
+                    .header("Content-Length", payload.size.toString())
+                    .header("Content-Type", "application/zip")
+                    .body(ByteArray(0).toResponseBody("application/zip".toMediaType()))
+                    .build()
+            }
+            val rangeHeader = req.header("Range") ?: "bytes=0-${payload.size - 1}"
+            val spec = rangeHeader.removePrefix("bytes=").split("-")
+            val start = spec[0].toInt()
+            val end = spec.getOrNull(1)?.toIntOrNull() ?: (payload.size - 1)
+            val slice = payload.copyOfRange(start, end + 1)
+            if (servedChunks.incrementAndGet() >= 2) {
+                shouldPause.set(true)
+            }
+            Thread.sleep(15L)
+            Response.Builder()
+                .request(req).protocol(Protocol.HTTP_1_1).code(206).message("Partial Content")
+                .header("Accept-Ranges", "bytes")
+                .header("Content-Range", "bytes $start-$end/${payload.size}")
+                .header("Content-Length", slice.size.toString())
+                .header("Content-Type", "application/zip")
+                .body(slice.toResponseBody("application/zip".toMediaType()))
+                .build()
+        }
+
+        val client = OkHttpClient.Builder().addInterceptor(interceptor).build()
+        val idm = IdmAcceleratedDownloader(client)
+        val workDir = File.createTempFile("idm_8x_pause_resume", "").apply {
+            delete()
+            mkdirs()
+        }
+        val destFile = File(workDir, "large_archive.zip")
+
+        try {
+            // Phase 1: Start at 8x and pause mid-download
+            var pausedCleanly = false
+            try {
+                idm.downloadWithAcceleration(
+                    url = "https://cdn.example.org/large_archive.zip",
+                    destFile = destFile,
+                    workDir = workDir,
+                    maxConnections = 8,
+                    knownTotalBytes = payload.size.toLong(),
+                    rejectHtml = true,
+                    requestHeadersProvider = { emptyMap() },
+                    isPausedOrCancelled = { shouldPause.get() },
+                    onProgress = {}
+                )
+            } catch (_: CancellationException) {
+                pausedCleanly = true
+            }
+            assertTrue("Expected pause CancellationException", pausedCleanly)
+
+            val chunkDir = IdmAcceleratedDownloader.chunkDirFor(workDir, destFile)
+            assertTrue("chunkDir must persist across pause", chunkDir.exists())
+            assertTrue("payload.part must persist across pause", File(chunkDir, "payload.part").exists())
+            assertTrue("progress.bin must persist across pause", File(chunkDir, "progress.bin").exists())
+
+            // Phase 2: Resume at 4x (stepped down) and verify initial reported bytes > 0 (never wiped!)
+            shouldPause.set(false)
+            val resumeProgress = mutableListOf<Long>()
+            val outcome = idm.downloadWithAcceleration(
+                url = "https://cdn.example.org/large_archive.zip",
+                destFile = destFile,
+                workDir = workDir,
+                maxConnections = 4,
+                knownTotalBytes = payload.size.toLong(),
+                rejectHtml = true,
+                requestHeadersProvider = { emptyMap() },
+                isPausedOrCancelled = { false },
+                onProgress = { upd ->
+                    synchronized(resumeProgress) { resumeProgress.add(upd.downloadedBytes) }
+                }
+            )
+
+            assertTrue(outcome is IdmAcceleratedDownloader.DownloadOutcome.Completed)
+            assertTrue(
+                "First resumed progress report must preserve prior downloaded bytes (>0), got ${resumeProgress.firstOrNull()}",
+                (resumeProgress.firstOrNull() ?: 0L) > 0L
+            )
+            assertArrayEquals(payload, destFile.readBytes())
+        } finally {
+            workDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun testSmartCacheMaintenanceNeverDeletesActiveDownloaderWork() {
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val taskId = "active_test_task_8x"
+        val workDir = File(context.cacheDir, "downloader_work/$taskId/idm_chunks_game.zip").apply { mkdirs() }
+        val payloadPart = File(workDir, "payload.part").apply { writeBytes(ByteArray(4096) { 9 }) }
+
+        try {
+            com.example.data.cache.DragonSmartCacheController.markDownloadWorkActive(taskId)
+
+            // 1. Simulate ApkInstallerReceiver calling maintenance with empty tasks + preserveDownloaderWork=true
+            com.example.data.cache.DragonSmartCacheController.performSmartCacheMaintenanceSync(
+                context = context,
+                tasks = emptyList(),
+                aggressive = false,
+                preserveDownloaderWork = true
+            )
+            assertTrue("Active payload.part must survive ApkInstallerReceiver sweep", payloadPart.exists())
+
+            // 2. Even aggressive maintenance with empty tasks must NEVER delete active protected download work
+            com.example.data.cache.DragonSmartCacheController.performSmartCacheMaintenanceSync(
+                context = context,
+                tasks = emptyList(),
+                aggressive = true
+            )
+            assertTrue("Active payload.part must survive aggressive maintenance", payloadPart.exists())
+        } finally {
+            com.example.data.cache.DragonSmartCacheController.unmarkDownloadWorkActive(taskId)
+            File(context.cacheDir, "downloader_work/$taskId").deleteRecursively()
+        }
+    }
 }
+
 

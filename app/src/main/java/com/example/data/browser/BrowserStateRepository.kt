@@ -2,10 +2,14 @@ package com.example.data.browser
 
 import android.content.Context
 import com.example.data.security.MalwareProtectionEngine
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
@@ -62,8 +66,58 @@ data class GrabbedMediaCandidate(
     val title: String,
     val kind: GrabbedMediaKind,
     val containerExt: String,
-    val sourceLabel: String
-)
+    val sourceLabel: String,
+    val mimeType: String = "",
+    val contentLengthBytes: Long = -1L,
+    val filenameConfidence: Int = 0
+) {
+    val isPureStreamManifest: Boolean
+        get() {
+            val ext = containerExt.lowercase(Locale.US)
+            val lowerUrl = url.lowercase(Locale.US)
+            val lowerMime = mimeType.lowercase(Locale.US)
+            return ext in STREAM_MANIFEST_EXTENSIONS ||
+                lowerMime.contains("mpegurl") ||
+                lowerMime.contains("dash+xml") ||
+                lowerMime.contains("vnd.apple.mpegurl") ||
+                lowerMime.contains("f4m") ||
+                lowerMime.contains("smoothstream") ||
+                lowerUrl.contains(".m3u8") ||
+                lowerUrl.contains(".mpd") ||
+                lowerUrl.contains(".ism/manifest") ||
+                lowerUrl.contains(".isml/manifest") ||
+                lowerUrl.contains("format=m3u8") ||
+                lowerUrl.contains("type=m3u8") ||
+                lowerUrl.contains("stream.mux.com/")
+        }
+
+    val isVideoStreamingCandidate: Boolean
+        get() {
+            if (isPureStreamManifest) return true
+            if (kind == GrabbedMediaKind.VIDEO) return true
+            val ext = containerExt.lowercase(Locale.US)
+            val lowerMime = mimeType.lowercase(Locale.US)
+            val lowerUrl = url.lowercase(Locale.US)
+            return ext in VIDEO_STREAM_EXTENSIONS ||
+                lowerMime.startsWith("video/") ||
+                (lowerUrl.contains("videoplayback?") && !lowerUrl.contains("mime=audio"))
+        }
+
+    val isDownloadableFileCandidate: Boolean
+        get() {
+            // File grabber captures downloadable media files (videos, audio, archives, APKs, docs, etc.)
+            // Pure adaptive stream manifests (.m3u8 / .mpd) are streaming links rather than standalone file downloads.
+            return !isPureStreamManifest
+        }
+
+    companion object {
+        val STREAM_MANIFEST_EXTENSIONS = setOf("m3u8", "m3u", "mpd", "ism", "isml", "f4m")
+        val VIDEO_STREAM_EXTENSIONS = setOf(
+            "m3u8", "m3u", "mpd", "ism", "isml", "f4m",
+            "mp4", "m4v", "webm", "mkv", "mov", "avi", "flv", "3gp", "ogv", "wmv", "ts"
+        )
+    }
+}
 
 data class WebConsoleLogEntry(
     val id: String = UUID.randomUUID().toString(),
@@ -113,8 +167,9 @@ data class DownloadedSyncImportResult(
 class BrowserStateRepository(context: Context) {
 
     private val appContext = context.applicationContext
+    private val repoIoScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val prefs = appContext.getSharedPreferences("dragon_browser_state", Context.MODE_PRIVATE)
-    private val vaultsDir = java.io.File(appContext.filesDir, "google_account_vaults").apply { mkdirs() }
+    private val vaultsDir = java.io.File(appContext.filesDir, "google_account_vaults")
 
     val extensionEngine = BrowserExtensionEngine(context)
 
@@ -144,7 +199,20 @@ class BrowserStateRepository(context: Context) {
     private val _networkLogsByTabFlow = MutableStateFlow<Map<String, List<WebNetworkLogEntry>>>(emptyMap())
     val networkLogsByTabFlow: StateFlow<Map<String, List<WebNetworkLogEntry>>> = _networkLogsByTabFlow.asStateFlow()
 
-    private val _mediaGrabberEnabledFlow = MutableStateFlow(prefs.getBoolean("media_grabber_enabled", true))
+    private val initialMasterGrabberEnabled = prefs.getBoolean("media_grabber_enabled", true)
+    private val _streamingLinkGrabberEnabledFlow = MutableStateFlow(
+        prefs.getBoolean("streaming_link_grabber_enabled", initialMasterGrabberEnabled)
+    )
+    val streamingLinkGrabberEnabledFlow: StateFlow<Boolean> = _streamingLinkGrabberEnabledFlow.asStateFlow()
+
+    private val _fileGrabberEnabledFlow = MutableStateFlow(
+        prefs.getBoolean("file_grabber_enabled", initialMasterGrabberEnabled)
+    )
+    val fileGrabberEnabledFlow: StateFlow<Boolean> = _fileGrabberEnabledFlow.asStateFlow()
+
+    private val _mediaGrabberEnabledFlow = MutableStateFlow(
+        _streamingLinkGrabberEnabledFlow.value || _fileGrabberEnabledFlow.value
+    )
     val mediaGrabberEnabledFlow: StateFlow<Boolean> = _mediaGrabberEnabledFlow.asStateFlow()
 
     private val _pageInspectorEnabledFlow = MutableStateFlow(prefs.getBoolean("page_inspector_enabled", false))
@@ -169,7 +237,7 @@ class BrowserStateRepository(context: Context) {
         get() = googleSyncManager.syncStateFlow
 
     init {
-        MalwareProtectionEngine.ensureInitialized(appContext)
+        loadTabs()
         passkeyManager = BrowserPasskeyManager(appContext) { entry ->
             addOrUpdateSavedPassword(
                 url = entry.url,
@@ -179,10 +247,6 @@ class BrowserStateRepository(context: Context) {
                 source = entry.importedFrom
             )
         }
-        loadHistory()
-        loadBookmarks()
-        loadSavedPasswords()
-        loadProxyState()
         googleSyncManager = BrowserGoogleSyncManager(
             context = appContext,
             onRemotePasswordsReceived = { remotePasswords ->
@@ -193,7 +257,17 @@ class BrowserStateRepository(context: Context) {
                 syncAccountVaultNow()
             }
         )
-        syncAccountVaultNow()
+        // Hydrate all persisted browser datasets & malware/vault engines on Dispatchers.IO
+        // so Dragon Browser renders Frame 1 instantaneously with zero UI-thread stall.
+        repoIoScope.launch {
+            runCatching { vaultsDir.mkdirs() }
+            runCatching { MalwareProtectionEngine.ensureInitialized(appContext) }
+            runCatching { loadHistory() }
+            runCatching { loadBookmarks() }
+            runCatching { loadSavedPasswords() }
+            runCatching { loadProxyState() }
+            runCatching { syncAccountVaultNow() }
+        }
     }
 
     fun getActiveTab(): BrowserTab {
@@ -211,14 +285,17 @@ class BrowserStateRepository(context: Context) {
             title = if (isIncognito) "Incognito • Google" else "Google",
             isIncognito = isIncognito
         )
-        _tabsFlow.value = _tabsFlow.value + tab
+        val updated = _tabsFlow.value + tab
+        _tabsFlow.value = updated
         _activeTabIdFlow.value = tab.id
+        persistTabs(updated, tab.id)
         return tab
     }
 
     fun selectTab(tabId: String) {
         if (_tabsFlow.value.any { it.id == tabId }) {
             _activeTabIdFlow.value = tabId
+            persistTabs(_tabsFlow.value, tabId)
         }
     }
 
@@ -237,13 +314,16 @@ class BrowserStateRepository(context: Context) {
 
         if (remaining.isEmpty()) {
             val fresh = BrowserTab(url = DEFAULT_HOME_URL, title = "Google", isIncognito = false)
-            _tabsFlow.value = listOf(fresh)
+            val updated = listOf(fresh)
+            _tabsFlow.value = updated
             _activeTabIdFlow.value = fresh.id
+            persistTabs(updated, fresh.id)
         } else {
             _tabsFlow.value = remaining
             if (_activeTabIdFlow.value == tabId) {
                 _activeTabIdFlow.value = remaining.last().id
             }
+            persistTabs(remaining, _activeTabIdFlow.value)
         }
         val wasLastIncognito = closingTab?.isIncognito == true && _tabsFlow.value.none { it.isIncognito }
         return wasLastIncognito
@@ -254,14 +334,38 @@ class BrowserStateRepository(context: Context) {
         _consoleLogsByTabFlow.value = emptyMap()
         _networkLogsByTabFlow.value = emptyMap()
         val fresh = BrowserTab(url = DEFAULT_HOME_URL, title = "Google", isIncognito = false)
-        _tabsFlow.value = listOf(fresh)
+        val updated = listOf(fresh)
+        _tabsFlow.value = updated
         _activeTabIdFlow.value = fresh.id
+        persistTabs(updated, fresh.id)
     }
 
     fun updateTabState(tabId: String, updater: (BrowserTab) -> BrowserTab) {
-        _tabsFlow.value = _tabsFlow.value.map { tab ->
-            if (tab.id == tabId) updater(tab) else tab
+        var persistentFieldChanged = false
+        val updated = _tabsFlow.value.map { tab ->
+            if (tab.id == tabId) {
+                val next = updater(tab)
+                if (
+                    next.url != tab.url ||
+                    next.title != tab.title ||
+                    next.isIncognito != tab.isIncognito ||
+                    next.desktopMode != tab.desktopMode
+                ) {
+                    persistentFieldChanged = true
+                }
+                next
+            } else {
+                tab
+            }
         }
+        _tabsFlow.value = updated
+        if (persistentFieldChanged) {
+            persistTabs(updated, _activeTabIdFlow.value)
+        }
+    }
+
+    fun persistTabsNow() {
+        persistTabs(_tabsFlow.value, _activeTabIdFlow.value)
     }
 
     fun toggleCurrentTabIncognito(): BrowserTab {
@@ -380,9 +484,58 @@ class BrowserStateRepository(context: Context) {
         persistBookmarks(updated)
     }
 
+    fun isCandidateAllowedByGrabberToggles(candidate: GrabbedMediaCandidate): Boolean {
+        val streamOn = _streamingLinkGrabberEnabledFlow.value
+        val fileOn = _fileGrabberEnabledFlow.value
+        if (!streamOn && !fileOn) return false
+        return (streamOn && candidate.isVideoStreamingCandidate) ||
+            (fileOn && candidate.isDownloadableFileCandidate)
+    }
+
+    private fun pruneDisallowedGrabbedMedia() {
+        val streamOn = _streamingLinkGrabberEnabledFlow.value
+        val fileOn = _fileGrabberEnabledFlow.value
+        if (!streamOn && !fileOn) {
+            _grabbedMediaByTabFlow.value = emptyMap()
+            return
+        }
+        val filtered = _grabbedMediaByTabFlow.value.mapValues { (_, list) ->
+            list.filter { isCandidateAllowedByGrabberToggles(it) }
+        }.filterValues { it.isNotEmpty() }
+        _grabbedMediaByTabFlow.value = filtered
+    }
+
+    fun setStreamingLinkGrabberEnabled(enabled: Boolean) {
+        _streamingLinkGrabberEnabledFlow.value = enabled
+        val anyEnabled = enabled || _fileGrabberEnabledFlow.value
+        _mediaGrabberEnabledFlow.value = anyEnabled
+        prefs.edit()
+            .putBoolean("streaming_link_grabber_enabled", enabled)
+            .putBoolean("media_grabber_enabled", anyEnabled)
+            .apply()
+        pruneDisallowedGrabbedMedia()
+    }
+
+    fun setFileGrabberEnabled(enabled: Boolean) {
+        _fileGrabberEnabledFlow.value = enabled
+        val anyEnabled = _streamingLinkGrabberEnabledFlow.value || enabled
+        _mediaGrabberEnabledFlow.value = anyEnabled
+        prefs.edit()
+            .putBoolean("file_grabber_enabled", enabled)
+            .putBoolean("media_grabber_enabled", anyEnabled)
+            .apply()
+        pruneDisallowedGrabbedMedia()
+    }
+
     fun setMediaGrabberEnabled(enabled: Boolean) {
+        _streamingLinkGrabberEnabledFlow.value = enabled
+        _fileGrabberEnabledFlow.value = enabled
         _mediaGrabberEnabledFlow.value = enabled
-        prefs.edit().putBoolean("media_grabber_enabled", enabled).apply()
+        prefs.edit()
+            .putBoolean("streaming_link_grabber_enabled", enabled)
+            .putBoolean("file_grabber_enabled", enabled)
+            .putBoolean("media_grabber_enabled", enabled)
+            .apply()
         if (!enabled) {
             _grabbedMediaByTabFlow.value = emptyMap()
         }
@@ -398,10 +551,68 @@ class BrowserStateRepository(context: Context) {
     }
 
     fun recordGrabbedMedia(tabId: String, candidate: GrabbedMediaCandidate) {
-        if (!_mediaGrabberEnabledFlow.value) return
+        if (!isCandidateAllowedByGrabberToggles(candidate)) return
         val existing = _grabbedMediaByTabFlow.value[tabId].orEmpty()
-        if (existing.any { it.url == candidate.url }) return
-        val updated = (listOf(candidate) + existing).take(40)
+        val matchIdx = existing.indexOfFirst { it.url == candidate.url }
+        if (matchIdx >= 0) {
+            val prev = existing[matchIdx]
+            val shouldUpgradeTitle = candidate.title.isNotBlank() && (
+                candidate.filenameConfidence > prev.filenameConfidence ||
+                    (candidate.filenameConfidence == prev.filenameConfidence &&
+                        prev.title.lowercase(Locale.US) in setOf("", "media", "video player", "media element", "file", "download") &&
+                        candidate.title.lowercase(Locale.US) !in setOf("media", "video player", "media element", "file", "download"))
+                )
+            val prevExtGeneric = prev.containerExt.isBlank() || prev.containerExt.equals("bin", ignoreCase = true)
+            val newExtValid = candidate.containerExt.isNotBlank() && !candidate.containerExt.equals("bin", ignoreCase = true)
+            val prevMimeGeneric = prev.mimeType.isBlank() || prev.mimeType.equals("application/octet-stream", ignoreCase = true)
+            val newMimeValid = candidate.mimeType.isNotBlank() && !candidate.mimeType.equals("application/octet-stream", ignoreCase = true)
+
+            val merged = prev.copy(
+                title = if (shouldUpgradeTitle) candidate.title else prev.title,
+                kind = if (prevExtGeneric && newExtValid) candidate.kind else prev.kind,
+                containerExt = if (prevExtGeneric && newExtValid) candidate.containerExt else prev.containerExt,
+                mimeType = if (prevMimeGeneric && newMimeValid) candidate.mimeType else prev.mimeType,
+                contentLengthBytes = if (candidate.contentLengthBytes > 0L) candidate.contentLengthBytes else prev.contentLengthBytes,
+                filenameConfidence = maxOf(prev.filenameConfidence, candidate.filenameConfidence)
+            )
+            if (merged == prev) return
+            val updated = existing.toMutableList().apply { this[matchIdx] = merged }
+            _grabbedMediaByTabFlow.value = _grabbedMediaByTabFlow.value + (tabId to updated)
+            return
+        }
+        val updated = (listOf(candidate) + existing).take(50)
+        _grabbedMediaByTabFlow.value = _grabbedMediaByTabFlow.value + (tabId to updated)
+    }
+
+    fun updateGrabbedMediaMetadata(
+        tabId: String,
+        url: String,
+        title: String? = null,
+        kind: GrabbedMediaKind? = null,
+        containerExt: String? = null,
+        mimeType: String? = null,
+        contentLengthBytes: Long = -1L,
+        filenameConfidence: Int = 0
+    ) {
+        val existing = _grabbedMediaByTabFlow.value[tabId].orEmpty()
+        val idx = existing.indexOfFirst { it.url == url }
+        if (idx < 0) return
+        val prev = existing[idx]
+        val upgradeTitle = !title.isNullOrBlank() && filenameConfidence >= prev.filenameConfidence
+        val upgradeExt = !containerExt.isNullOrBlank() &&
+            (!containerExt.equals("bin", ignoreCase = true) || prev.containerExt.isBlank())
+        val upgradeMime = !mimeType.isNullOrBlank() &&
+            (!mimeType.equals("application/octet-stream", ignoreCase = true) || prev.mimeType.isBlank())
+        val merged = prev.copy(
+            title = if (upgradeTitle) title!! else prev.title,
+            kind = kind ?: prev.kind,
+            containerExt = if (upgradeExt) containerExt!! else prev.containerExt,
+            mimeType = if (upgradeMime) mimeType!! else prev.mimeType,
+            contentLengthBytes = if (contentLengthBytes > 0L) contentLengthBytes else prev.contentLengthBytes,
+            filenameConfidence = maxOf(prev.filenameConfidence, filenameConfidence)
+        )
+        if (merged == prev) return
+        val updated = existing.toMutableList().apply { this[idx] = merged }
         _grabbedMediaByTabFlow.value = _grabbedMediaByTabFlow.value + (tabId to updated)
     }
 
@@ -1192,6 +1403,59 @@ class BrowserStateRepository(context: Context) {
 
     fun clearNetworkLogs(tabId: String) {
         _networkLogsByTabFlow.update { it - tabId }
+    }
+
+    private fun persistTabs(tabs: List<BrowserTab>, activeTabId: String) {
+        try {
+            val arr = JSONArray()
+            tabs.forEach { tab ->
+                arr.put(JSONObject().apply {
+                    put("id", tab.id)
+                    put("url", tab.url)
+                    put("title", tab.title)
+                    put("isIncognito", tab.isIncognito)
+                    put("desktopMode", tab.desktopMode)
+                })
+            }
+            prefs.edit()
+                .putString("browser_tabs_v1", arr.toString())
+                .putString("browser_active_tab_id_v1", activeTabId)
+                .apply()
+        } catch (_: Exception) {}
+    }
+
+    private fun loadTabs() {
+        try {
+            val raw = prefs.getString("browser_tabs_v1", null) ?: return
+            val arr = JSONArray(raw)
+            val list = mutableListOf<BrowserTab>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val id = obj.optString("id", "").ifBlank { UUID.randomUUID().toString() }
+                val url = obj.optString("url", DEFAULT_HOME_URL).ifBlank { DEFAULT_HOME_URL }
+                val title = obj.optString("title", "Google").ifBlank { "Google" }
+                val isIncognito = obj.optBoolean("isIncognito", false)
+                val desktopMode = obj.optBoolean("desktopMode", false)
+                list.add(
+                    BrowserTab(
+                        id = id,
+                        url = url,
+                        title = title,
+                        isIncognito = isIncognito,
+                        desktopMode = desktopMode
+                    )
+                )
+            }
+            if (list.isNotEmpty()) {
+                _tabsFlow.value = list
+                val savedActive = prefs.getString("browser_active_tab_id_v1", null)
+                _activeTabIdFlow.value = if (savedActive != null && list.any { it.id == savedActive }) {
+                    savedActive
+                } else {
+                    list.first().id
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     private fun persistHistory(entries: List<BrowserHistoryEntry>) {

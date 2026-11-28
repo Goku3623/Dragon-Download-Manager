@@ -10,6 +10,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.content.ContextCompat
 import com.example.data.downloader.DownloadNotificationController
+import com.example.data.filemanager.DragonFileManagerTaskEngine
 import com.example.data.model.BatchSession
 import com.example.data.model.DownloaderTask
 import com.example.data.repository.KernelRepository
@@ -23,11 +24,8 @@ import kotlinx.coroutines.launch
 
 /**
  * Foreground Service keeping active Dragon Download Manager (DDM) downloads, multi-connection
- * byte-range transfers, stream muxing, and batch queues alive even after the user exits or
- * removes the app from Recents.
- *
- * Uses [DownloadNotificationController.NOTIFICATION_ID_DOWNLOAD_PANEL] so only a single unified
- * Download Notification Panel is displayed in the system shade.
+ * byte-range transfers, stream muxing, batch queues, AND Dragon Pro File Manager background
+ * tasks alive even after the user switches screens, exits the app, or removes it from Recents.
  */
 class DragonDownloadService : Service() {
 
@@ -35,6 +33,8 @@ class DragonDownloadService : Service() {
     private var watcherJob: Job? = null
     private var downloadWakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    @Volatile
+    private var currentForegroundNotifId: Int = -1
 
     override fun onCreate() {
         super.onCreate()
@@ -74,13 +74,31 @@ class DragonDownloadService : Service() {
         dm.ensurePersistedTasksLoaded()
         val currentTasks = dm.tasksFlow.value
         val currentBatch = dm.activeBatchSessionFlow.value
+        val hasDdmDownloadWork = hasActiveDownloadWork(currentTasks, currentBatch)
+        val fmTask = DragonFileManagerTaskEngine.activeTaskFlow.value
 
-        // Synchronously promote to Foreground immediately inside onStartCommand to avoid Android FGS timeouts
-        promoteToForeground(dm.notificationController.buildForegroundDownloadNotification(currentTasks))
+        // Synchronously promote to Foreground immediately inside onStartCommand to avoid Android FGS timeouts.
+        // If only a File Manager task is active, promote using its separate persistent notification (ID 7740).
+        // If DDM downloads are active, promote using the DDM panel (ID 4010) while File Manager task posts separately on ID 7740.
+        if (!hasDdmDownloadWork && fmTask != null) {
+            promoteToForeground(
+                notifId = DragonFileManagerTaskEngine.NOTIFICATION_ID_FILE_MANAGER_TASK,
+                notification = DragonFileManagerTaskEngine.buildRunningTaskNotification(applicationContext, fmTask)
+            )
+        } else {
+            promoteToForeground(
+                notifId = DownloadNotificationController.NOTIFICATION_ID_DOWNLOAD_PANEL,
+                notification = dm.notificationController.buildForegroundDownloadNotification(currentTasks)
+            )
+        }
 
         if (!hasActiveWork(currentTasks, currentBatch)) {
             releaseLocks()
+            val isFmFg = currentForegroundNotifId == DragonFileManagerTaskEngine.NOTIFICATION_ID_FILE_MANAGER_TASK
             stopForegroundCompat(removeNotification = false)
+            if (isFmFg) {
+                DragonFileManagerTaskEngine.repostTerminalNotificationIfNeeded(applicationContext)
+            }
             stopSelf()
             return START_NOT_STICKY
         }
@@ -94,22 +112,33 @@ class DragonDownloadService : Service() {
         if (watcherJob?.isActive == true) return
         watcherJob = serviceScope.launch {
             val dm = KernelRepository.getInstance(applicationContext).downloadManager
-            combine(dm.tasksFlow, dm.activeBatchSessionFlow) { tasks, batch ->
-                hasActiveWork(tasks, batch)
+            combine(
+                dm.tasksFlow,
+                dm.activeBatchSessionFlow,
+                DragonFileManagerTaskEngine.activeTaskFlow
+            ) { tasks, batch, fmTask ->
+                hasActiveDownloadWork(tasks, batch) || fmTask != null
             }.collect { active ->
                 if (active) {
                     acquireLocks()
                 } else {
                     releaseLocks()
+                    val isFmFg = currentForegroundNotifId == DragonFileManagerTaskEngine.NOTIFICATION_ID_FILE_MANAGER_TASK
                     stopForegroundCompat(removeNotification = false)
+                    if (isFmFg) {
+                        DragonFileManagerTaskEngine.repostTerminalNotificationIfNeeded(applicationContext)
+                    }
                     stopSelf()
                 }
             }
         }
     }
 
-    private fun promoteToForeground(notification: android.app.Notification) {
-        val notifId = DownloadNotificationController.NOTIFICATION_ID_DOWNLOAD_PANEL
+    private fun promoteToForeground(
+        notifId: Int,
+        notification: android.app.Notification
+    ) {
+        currentForegroundNotifId = notifId
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
@@ -171,7 +200,7 @@ class DragonDownloadService : Service() {
         try {
             val dm = KernelRepository.getInstance(applicationContext).downloadManager
             dm.persistTasksCheckpoint()
-            if (hasActiveWork(dm.tasksFlow.value, dm.activeBatchSessionFlow.value)) {
+            if (hasActiveDownloadWork(dm.tasksFlow.value, dm.activeBatchSessionFlow.value)) {
                 dm.notificationController.syncTasks(dm.tasksFlow.value, force = true)
             }
         } catch (_: Exception) {}
@@ -188,10 +217,14 @@ class DragonDownloadService : Service() {
         const val ACTION_START_DOWNLOAD_SERVICE = "com.example.ddm.ACTION_START_DOWNLOAD_SERVICE"
         const val ACTION_STOP_DOWNLOAD_SERVICE = "com.example.ddm.ACTION_STOP_DOWNLOAD_SERVICE"
 
-        fun hasActiveWork(tasks: List<DownloaderTask>, batch: BatchSession?): Boolean {
+        fun hasActiveDownloadWork(tasks: List<DownloaderTask>, batch: BatchSession?): Boolean {
             val hasActiveTask = tasks.any { it.stage.isActive || it.isSmartRetrying }
             val hasActiveBatch = batch != null && !batch.isFinished && !batch.isCancelled && !batch.isPaused
             return hasActiveTask || hasActiveBatch
+        }
+
+        fun hasActiveWork(tasks: List<DownloaderTask>, batch: BatchSession?): Boolean {
+            return hasActiveDownloadWork(tasks, batch) || DragonFileManagerTaskEngine.hasActiveTask()
         }
 
         fun startForegroundDownloads(context: Context) {

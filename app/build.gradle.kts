@@ -16,8 +16,8 @@ android {
     applicationId = "com.android.ddm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 23
-    versionName = "2.3"
+    versionCode = 40
+    versionName = "4.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -127,6 +127,10 @@ dependencies {
   implementation(libs.okhttp)
   // implementation(libs.play.services.location)
   implementation(libs.retrofit)
+  implementation(libs.commons.compress)
+  implementation(libs.tukaani.xz)
+  implementation("com.github.luben:zstd-jni:1.5.6-4@aar")
+  implementation(libs.junrar)
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)

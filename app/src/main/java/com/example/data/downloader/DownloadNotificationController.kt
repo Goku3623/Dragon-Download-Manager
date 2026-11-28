@@ -344,6 +344,7 @@ class DownloadNotificationController(
         val isPersistent = activeCount > 0 || pausedCount > 0 || isStandby
         val pct = when {
             isStandby -> 0
+            primaryTask.stage == DownloadStateStage.FAILED -> 0
             primaryTask.progress >= 0f -> (primaryTask.progress.coerceIn(0f, 1f) * 100f).toInt()
             else -> 50
         }
@@ -500,6 +501,16 @@ class DownloadNotificationController(
             }
 
             else -> {
+                val isInstallablePkg = ApkPackageInstaller.isInstallablePackageTask(primaryTask)
+                val pkgSummary = if (isInstallablePkg) {
+                    runCatching { ApkPackageInstaller.inspectTaskPackage(context, primaryTask) }.getOrNull()
+                } else null
+                val pkgActionText = when {
+                    !isInstallablePkg -> "📂 OPEN"
+                    pkgSummary?.isDowngrade == true -> "⬇ DOWNGRADE"
+                    pkgSummary?.isAlreadyInstalled == true -> "🔄 UPDATE"
+                    else -> "📲 INSTALL"
+                }
                 primaryBtnIntent = buildReceiverPendingIntent(
                     action = DownloadNotificationReceiver.ACTION_OPEN_TASK,
                     taskId = primaryTask.id,
@@ -511,8 +522,8 @@ class DownloadNotificationController(
                     taskId = primaryTask.id,
                     requestCode = 403
                 )
-                primaryBtnTextCollapsed = "📂 OPEN"
-                primaryBtnTextExpanded = "📂 OPEN"
+                primaryBtnTextCollapsed = pkgActionText
+                primaryBtnTextExpanded = pkgActionText
                 secondaryBtnTextExpanded = null
                 cancelBtnTextCollapsed = "✓"
                 cancelBtnTextExpanded = "✓ DONE"
@@ -609,7 +620,12 @@ class DownloadNotificationController(
         collapsedView.setTextViewText(R.id.tv_dl_collapsed_title, primaryTask.filename)
         collapsedView.setTextColor(R.id.tv_dl_collapsed_title, titleColor)
         collapsedView.setProgressBar(R.id.pb_dl_collapsed, 100, pct, isIndeterminate)
-        collapsedView.setTextViewText(R.id.tv_dl_collapsed_sub, "$pct% • $telemetryLine")
+        val collapsedSub = when {
+            primaryTask.stage == DownloadStateStage.FAILED -> "FAILED • $telemetryLine"
+            isStandby -> telemetryLine
+            else -> "$pct% • $telemetryLine"
+        }
+        collapsedView.setTextViewText(R.id.tv_dl_collapsed_sub, collapsedSub)
         collapsedView.setTextColor(R.id.tv_dl_collapsed_sub, bodyColor)
 
         collapsedView.setInt(R.id.btn_dl_collapsed_primary, "setBackgroundResource", btnRes)

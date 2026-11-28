@@ -7,6 +7,7 @@ import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.JsResult
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -14,6 +15,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.example.data.browser.WebViewRendererGuard
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
@@ -1516,13 +1518,13 @@ fun BrowserExtensionPopupDialog(
                                             setSupportZoom(true)
                                             builtInZoomControls = true
                                             displayZoomControls = false
-                                            allowFileAccess = true
-                                            allowContentAccess = true
+                                            allowFileAccess = false
+                                            allowContentAccess = false
                                             @Suppress("DEPRECATION")
-                                            allowFileAccessFromFileURLs = true
+                                            allowFileAccessFromFileURLs = false
                                             @Suppress("DEPRECATION")
-                                            allowUniversalAccessFromFileURLs = true
-                                            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                                            allowUniversalAccessFromFileURLs = false
+                                            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
                                             javaScriptCanOpenWindowsAutomatically = true
                                             userAgentString = buildGoogleSignInCompatibleUserAgent(userAgentString, desktopMode = false)
                                         }
@@ -1544,6 +1546,23 @@ fun BrowserExtensionPopupDialog(
                                                 @JavascriptInterface
                                                 fun storageClear(extId: String) {
                                                     extensionEngine.clearExtensionStorage(extId)
+                                                }
+
+                                                @JavascriptInterface
+                                                fun proxyGet(extId: String): String =
+                                                    extensionEngine.getExtensionProxySettingsJson(extId)
+
+                                                @JavascriptInterface
+                                                fun proxySet(extId: String, detailsJson: String): String =
+                                                    extensionEngine.applyExtensionProxySettings(extId, detailsJson)
+
+                                                @JavascriptInterface
+                                                fun proxyClear(extId: String): String =
+                                                    extensionEngine.clearExtensionProxySettings(extId)
+
+                                                @JavascriptInterface
+                                                fun proxyAuthSet(extId: String, username: String, password: String) {
+                                                    extensionEngine.setExtensionProxyAuth(extId, username, password)
                                                 }
 
                                                 @JavascriptInterface
@@ -1808,6 +1827,25 @@ fun BrowserExtensionPopupDialog(
                                                 }
                                                 super.onReceivedHttpError(view, request, errorResponse)
                                             }
+
+                                            override fun onRenderProcessGone(
+                                                view: WebView?,
+                                                detail: RenderProcessGoneDetail?
+                                            ): Boolean {
+                                                return WebViewRendererGuard.handleRenderProcessGone(
+                                                    view = view ?: popupWebViewRef,
+                                                    detail = detail,
+                                                    trackerKey = "ext_popup_${extension.id}"
+                                                ) {
+                                                    if (popupWebViewRef === view) {
+                                                        popupWebViewRef = null
+                                                    }
+                                                    isPopupLoading = false
+                                                    if (popupErrorMessage.isNullOrBlank()) {
+                                                        popupErrorMessage = "Extension panel renderer reset — tap Reload to continue"
+                                                    }
+                                                }
+                                            }
                                         }
 
                                         val loadKey = "${extension.id}|$baseUrl|$reloadNonce"
@@ -1816,6 +1854,7 @@ fun BrowserExtensionPopupDialog(
                                     }
                                 },
                                 update = { wv ->
+                                    if (WebViewRendererGuard.isDestroyed(wv)) return@AndroidView
                                     val loadKey = "${extension.id}|$baseUrl|$reloadNonce"
                                     if (wv.tag != loadKey) {
                                         wv.tag = loadKey
@@ -1826,11 +1865,7 @@ fun BrowserExtensionPopupDialog(
                                     if (popupWebViewRef === wv) {
                                         popupWebViewRef = null
                                     }
-                                    runCatching {
-                                        wv.stopLoading()
-                                        wv.loadUrl("about:blank")
-                                        wv.destroy()
-                                    }
+                                    WebViewRendererGuard.destroyWebViewSafely(wv)
                                 }
                             )
                         }
@@ -2100,7 +2135,7 @@ fun BrowserDnsSettingsDialog(
                             OutlinedTextField(
                                 value = customName,
                                 onValueChange = { customName = it },
-                                label = { Text("DNS Name (e.g. Quad9 / NextDNS)", fontSize = 10.5.sp) },
+                                label = { Text("DNS Name (e.g. Quad9 / Control D)", fontSize = 10.5.sp) },
                                 singleLine = true,
                                 textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
                                 modifier = Modifier

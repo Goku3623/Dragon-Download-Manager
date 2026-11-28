@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
@@ -24,9 +25,11 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -34,6 +37,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -57,8 +61,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
 import coil.compose.AsyncImage
+import com.example.data.downloader.ApkPackageInstaller
+import com.example.data.downloader.DragonDownloadManager
 import com.example.data.downloader.WebViewMediaExtractor
+import com.example.data.filemanager.DragonFileManagerTaskEngine
 import com.example.data.model.*
 import com.example.data.repository.KernelRepository
 import com.example.ui.components.StartBatchDownloadPopupDialog
@@ -82,7 +90,8 @@ import java.util.Locale
 fun DownloaderScreen(
     repository: KernelRepository,
     onOpenBrowser: () -> Unit = {},
-    onOpenBrowserWithUrl: (String) -> Unit = { onOpenBrowser() }
+    onOpenBrowserWithUrl: (String) -> Unit = { onOpenBrowser() },
+    onOpenFileManager: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val haptics = LocalDragonHaptics.current
@@ -123,6 +132,9 @@ fun DownloaderScreen(
     var activeWebViewLoginPlatform by remember { mutableStateOf<Pair<String, String>?>(null) }
     var pendingPopupDownload by remember { mutableStateOf<Pair<MediaInfo, MediaFormatOption>?>(null) }
     var pendingBatchUrlsPopup by remember { mutableStateOf<List<String>?>(null) }
+    var pendingDeleteCompletedTask by remember { mutableStateOf<DownloaderTask?>(null) }
+    var longPressedPanelTask by remember { mutableStateOf<DownloaderTask?>(null) }
+    var propertiesDialogTask by remember { mutableStateOf<DownloaderTask?>(null) }
 
     val webViewExtractor = remember { downloadManager.webViewExtractor }
     val restrictedBypassEnabled by webViewExtractor.restrictedBypassEnabled.collectAsState()
@@ -230,6 +242,7 @@ fun DownloaderScreen(
     if (showBackendConfigDialog) {
         BackendConfigDialog(
             currentUrl = customBackendUrl,
+            downloadManager = downloadManager,
             onDismiss = { showBackendConfigDialog = false },
             onSave = { newUrl ->
                 downloadManager.setCustomBackendUrl(newUrl)
@@ -286,6 +299,117 @@ fun DownloaderScreen(
                 hasStoragePermissions = hasStoragePermissionsForDownload(context)
                 downloadManager.startBatchDownload(batchUrls, batchConfig)
                 pendingBatchUrlsPopup = null
+            }
+        )
+    }
+
+    pendingDeleteCompletedTask?.let { taskToDelete ->
+        DeleteCompletedFileOptionsDialog(
+            task = taskToDelete,
+            onDismiss = { pendingDeleteCompletedTask = null },
+            onDeleteFromListOnly = {
+                expandedDownloadedTaskIds = expandedDownloadedTaskIds - taskToDelete.id
+                downloadManager.deleteTaskFromListOnly(taskToDelete.id)
+                pendingDeleteCompletedTask = null
+            },
+            onDeleteFromStorage = {
+                expandedDownloadedTaskIds = expandedDownloadedTaskIds - taskToDelete.id
+                downloadManager.deleteTaskFromStorage(taskToDelete.id)
+                pendingDeleteCompletedTask = null
+            }
+        )
+    }
+
+    longPressedPanelTask?.let { heldTask ->
+        TaskHoldCompactPanelDialog(
+            task = heldTask,
+            onDismiss = { longPressedPanelTask = null },
+            onShowProperties = {
+                longPressedPanelTask = null
+                propertiesDialogTask = heldTask
+            },
+            onRedownload = {
+                longPressedPanelTask = null
+                isActiveDownloadsSectionExpanded = true
+                downloadManager.redownloadTask(heldTask.id)
+            },
+            onCopyDownloadLink = {
+                longPressedPanelTask = null
+                val linkToCopy = heldTask.url.takeIf { it.isNotBlank() }
+                    ?: heldTask.formatOption.streamUrl.takeIf { it.isNotBlank() }
+                    ?: ""
+                if (linkToCopy.isNotBlank()) {
+                    clipboardManager.setPrimaryClip(ClipData.newPlainText("Download Link", linkToCopy))
+                    ApkPackageInstaller.showToastOnMain(context, "Copied download link to clipboard")
+                } else {
+                    ApkPackageInstaller.showToastOnMain(context, "No download link available for this file")
+                }
+            },
+            onRefreshLinkInBrowser = {
+                longPressedPanelTask = null
+                val refererCandidate = heldTask.formatOption.requestHeaders.entries
+                    .firstOrNull { it.key.equals("Referer", ignoreCase = true) }?.value
+                val browserUrl = listOfNotNull(
+                    heldTask.url.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) },
+                    refererCandidate?.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) },
+                    heldTask.formatOption.streamUrl.takeIf { it.startsWith("http://", true) || it.startsWith("https://", true) }
+                ).firstOrNull()
+
+                if (!heldTask.isGenericFile &&
+                    (heldTask.stage == DownloadStateStage.FAILED || heldTask.stage == DownloadStateStage.PAUSED) &&
+                    (heldTask.url.startsWith("http://", true) || heldTask.url.startsWith("https://", true))
+                ) {
+                    downloadManager.fetchMediaInfo(
+                        url = heldTask.url,
+                        onStageChanged = {},
+                        onResult = { _, _, _ -> }
+                    )
+                }
+
+                if (browserUrl != null) {
+                    ApkPackageInstaller.showToastOnMain(context, "Refreshing link in Browser...")
+                    onOpenBrowserWithUrl(browserUrl)
+                } else {
+                    ApkPackageInstaller.showToastOnMain(context, "Opening Browser to refresh link...")
+                    onOpenBrowser()
+                }
+            },
+            onOpenFolder = {
+                longPressedPanelTask = null
+                val targetFolder = downloadManager.resolveTaskFolderDirectory(context, heldTask)
+                DragonFileManagerTaskEngine.savedCurrentDir = targetFolder
+                if (onOpenFileManager != null) {
+                    onOpenFileManager()
+                } else {
+                    downloadManager.openTaskFolder(context, heldTask)
+                }
+            },
+            onSignAndInstall = {
+                longPressedPanelTask = null
+                downloadManager.installOrUpdatePackage(context, heldTask, forceSign = true)
+            }
+        )
+    }
+
+    propertiesDialogTask?.let { propTask ->
+        TaskPropertiesDialog(
+            task = propTask,
+            onDismiss = { propertiesDialogTask = null },
+            onCopyLink = { link ->
+                if (link.isNotBlank()) {
+                    clipboardManager.setPrimaryClip(ClipData.newPlainText("Download Link", link))
+                    ApkPackageInstaller.showToastOnMain(context, "Copied link to clipboard")
+                }
+            },
+            onOpenFolder = {
+                propertiesDialogTask = null
+                val targetFolder = downloadManager.resolveTaskFolderDirectory(context, propTask)
+                DragonFileManagerTaskEngine.savedCurrentDir = targetFolder
+                if (onOpenFileManager != null) {
+                    onOpenFileManager()
+                } else {
+                    downloadManager.openTaskFolder(context, propTask)
+                }
             }
         )
     }
@@ -383,45 +507,101 @@ fun DownloaderScreen(
                                 }
                             }
 
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(
-                                    onClick = {
-                                        haptics.tap()
-                                        onOpenBrowser()
-                                    },
-                                    modifier = Modifier.testTag("downloader_open_browser_button")
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                // Enlarged Browser Icon vertically centered between the Key icon row and File Manager icon row
+                                Box(
+                                    modifier = Modifier
+                                        .size(52.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(NeonCyan.copy(alpha = 0.14f))
+                                        .border(
+                                            width = 1.dp,
+                                            color = NeonCyan.copy(alpha = 0.45f),
+                                            shape = RoundedCornerShape(14.dp)
+                                        )
+                                        .clickable {
+                                            haptics.tap()
+                                            onOpenBrowser()
+                                        }
+                                        .testTag("downloader_open_browser_button"),
+                                    contentAlignment = Alignment.Center
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.Public,
                                         contentDescription = "Open Dragon Browser (google.com)",
-                                        tint = NeonCyan
+                                        tint = NeonCyan,
+                                        modifier = Modifier.size(32.dp)
                                     )
                                 }
-                                IconButton(
-                                    onClick = {
-                                        haptics.tap()
-                                        showPrivateAuthDialog = true
-                                    },
-                                    modifier = Modifier.testTag("private_auth_button")
+
+                                // Middle column: Key icon on top, File Manager icon directly below it
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(2.dp)
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.VpnKey,
-                                        contentDescription = "Private & Restricted Content Access",
-                                        tint = if (restrictedBypassEnabled) SuccessGreen else MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
+                                    IconButton(
+                                        onClick = {
+                                            haptics.tap()
+                                            showPrivateAuthDialog = true
+                                        },
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .testTag("private_auth_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.VpnKey,
+                                            contentDescription = "Private & Restricted Content Access",
+                                            tint = if (restrictedBypassEnabled) SuccessGreen else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            haptics.tap()
+                                            if (onOpenFileManager != null) {
+                                                onOpenFileManager()
+                                            } else {
+                                                downloadManager.openDdmRootFolder(context)
+                                            }
+                                        },
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .testTag("downloader_open_file_manager_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.FolderOpen,
+                                            contentDescription = "Open Dragon Archiver",
+                                            tint = WarningOrange,
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                    }
                                 }
-                                IconButton(
-                                    onClick = {
-                                        haptics.tap()
-                                        showBackendConfigDialog = true
-                                    },
-                                    modifier = Modifier.testTag("backend_config_button")
+
+                                // Right column: Backend Engine Settings icon aligned with the top row (Key icon row)
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(2.dp)
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Dns,
-                                        contentDescription = "Backend Engine Settings",
-                                        tint = if (customBackendUrl.isNotBlank()) SuccessGreen else MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
+                                    IconButton(
+                                        onClick = {
+                                            haptics.tap()
+                                            showBackendConfigDialog = true
+                                        },
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .testTag("backend_config_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Dns,
+                                            contentDescription = "Backend Engine Settings",
+                                            tint = if (customBackendUrl.isNotBlank()) SuccessGreen else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.size(40.dp))
                                 }
                             }
                         }
@@ -2189,6 +2369,7 @@ fun DownloaderScreen(
                 if (showActiveItems) {
                     items(activeOrOtherTasks, key = { it.id }) { task ->
                         val isExpanded = task.id in expandedActiveTaskIds
+                        val supportsHoldMenu = task.stage == DownloadStateStage.PAUSED || task.stage == DownloadStateStage.FAILED
                         DownloadTaskCard(
                             task = task,
                             isExpanded = isExpanded,
@@ -2200,6 +2381,12 @@ fun DownloaderScreen(
                                     expandedActiveTaskIds + task.id
                                 }
                             },
+                            onLongPress = if (supportsHoldMenu) {
+                                {
+                                    haptics.confirm()
+                                    longPressedPanelTask = task
+                                }
+                            } else null,
                             onPause = { downloadManager.pauseDownload(task.id) },
                             onResume = { downloadManager.resumeDownload(task.id) },
                             onCancel = {
@@ -2343,11 +2530,14 @@ fun DownloaderScreen(
                                     expandedDownloadedTaskIds + task.id
                                 }
                             },
+                            onLongPress = {
+                                haptics.confirm()
+                                longPressedPanelTask = task
+                            },
                             onPause = { downloadManager.pauseDownload(task.id) },
                             onResume = { downloadManager.resumeDownload(task.id) },
                             onCancel = {
-                                expandedDownloadedTaskIds = expandedDownloadedTaskIds - task.id
-                                downloadManager.cancelDownload(task.id)
+                                pendingDeleteCompletedTask = task
                             },
                             onRetry = { downloadManager.retryDownload(task.id) },
                             onOpen = { downloadManager.openDownloadedFile(context, task) },
@@ -2360,11 +2550,13 @@ fun DownloaderScreen(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DownloadTaskCard(
     task: DownloaderTask,
     isExpanded: Boolean = false,
     onToggleExpand: (() -> Unit)? = null,
+    onLongPress: (() -> Unit)? = null,
     onPause: () -> Unit,
     onResume: () -> Unit,
     onCancel: () -> Unit,
@@ -2372,8 +2564,30 @@ private fun DownloadTaskCard(
     onOpen: () -> Unit,
     onShare: () -> Unit
 ) {
+    val context = LocalContext.current
     val haptics = LocalDragonHaptics.current
     val showExpandedDetails = isExpanded || onToggleExpand == null
+    val isInstallablePkg = remember(task.filename, task.container, task.mimeType, task.filePath) {
+        ApkPackageInstaller.isInstallablePackageTask(task)
+    }
+    val pkgExtUpper = remember(task.filename, task.container, task.mimeType, task.filePath) {
+        ApkPackageInstaller.resolveTaskPackageExtension(task).uppercase(Locale.US).ifBlank { "APK" }
+    }
+    val installStateVersion by ApkPackageInstaller.installStateVersionFlow.collectAsState()
+    val activeInstallStatusMap by ApkPackageInstaller.activeInstallStatusFlow.collectAsState()
+    val liveInstallProgressText = activeInstallStatusMap[task.id]
+
+    var pkgSummary by remember(task.id, task.filePath, task.publicUriString, installStateVersion) {
+        mutableStateOf<ApkPackageInstaller.ApkPackageSummary?>(null)
+    }
+    LaunchedEffect(task.id, task.stage, task.filePath, task.publicUriString, isInstallablePkg, installStateVersion) {
+        if (task.stage == DownloadStateStage.COMPLETED && isInstallablePkg) {
+            pkgSummary = withContext(Dispatchers.IO) {
+                ApkPackageInstaller.inspectTaskPackage(context, task)
+            }
+        }
+    }
+
     val statusColor = when (task.stage) {
         DownloadStateStage.COMPLETED -> SuccessGreen
         DownloadStateStage.FAILED -> DangerRed
@@ -2407,13 +2621,16 @@ private fun DownloadTaskCard(
                 .padding(horizontal = 11.dp, vertical = 9.dp),
             verticalArrangement = Arrangement.spacedBy(7.dp)
         ) {
-            // 1. Compact Header Row (always visible; tap to expand/collapse)
+            // 1. Compact Header Row (always visible; tap to expand/collapse, press & hold for compact options panel)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .then(
-                        if (onToggleExpand != null) {
-                            Modifier.clickable { onToggleExpand() }
+                        if (onToggleExpand != null || onLongPress != null) {
+                            Modifier.combinedClickable(
+                                onClick = { onToggleExpand?.invoke() },
+                                onLongClick = { onLongPress?.invoke() }
+                            )
                         } else {
                             Modifier
                         }
@@ -2439,6 +2656,7 @@ private fun DownloadTaskCard(
                     } else {
                         Icon(
                             imageVector = when {
+                                isInstallablePkg -> Icons.Default.Android
                                 task.isGenericFile -> Icons.Default.InsertDriveFile
                                 task.isAudioOnly -> Icons.Default.AudioFile
                                 else -> Icons.Default.VideoFile
@@ -2466,8 +2684,12 @@ private fun DownloadTaskCard(
                     val compactMeta = when (task.stage) {
                         DownloadStateStage.COMPLETED -> buildList {
                             add(task.totalSizeFormatted)
-                            add(task.qualityLabel)
-                            add(task.platform.displayName)
+                            if (isInstallablePkg) {
+                                add(pkgSummary?.statusSummary ?: "$pkgExtUpper Package • Ready to Install")
+                            } else {
+                                add(task.qualityLabel)
+                                add(task.platform.displayName)
+                            }
                             if (task.batchSessionId != null) add("BATCH")
                         }.joinToString(" • ")
 
@@ -2495,7 +2717,7 @@ private fun DownloadTaskCard(
                         }.joinToString(" • ")
                     }
                     Text(
-                        text = compactMeta,
+                        text = liveInstallProgressText ?: compactMeta,
                         fontSize = 10.sp,
                         fontFamily = if (task.stage.isActive || task.stage == DownloadStateStage.PAUSED) {
                             FontFamily.Monospace
@@ -2504,10 +2726,10 @@ private fun DownloadTaskCard(
                         },
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        color = if (task.stage == DownloadStateStage.FAILED) {
-                            DangerRed
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
+                        color = when {
+                            liveInstallProgressText != null -> NeonCyan
+                            task.stage == DownloadStateStage.FAILED -> DangerRed
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
                         }
                     )
                 }
@@ -2580,20 +2802,85 @@ private fun DownloadTaskCard(
                         }
 
                         DownloadStateStage.COMPLETED -> {
+                            if (isInstallablePkg) {
+                                val isDowngrade = pkgSummary?.isDowngrade == true
+                                val isUpdate = pkgSummary?.isAlreadyInstalled == true && !isDowngrade
+                                val pillColor = when {
+                                    isDowngrade -> WarningOrange
+                                    isUpdate -> NeonCyan
+                                    else -> SuccessGreen
+                                }
+                                val pillText = pkgSummary?.shortActionText ?: "Install"
+                                val pillIcon = when {
+                                    isDowngrade -> Icons.Default.History
+                                    isUpdate -> Icons.Default.SystemUpdate
+                                    else -> Icons.Default.InstallMobile
+                                }
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = pillColor.copy(alpha = 0.16f),
+                                    border = BorderStroke(
+                                        0.8.dp,
+                                        pillColor.copy(alpha = 0.55f)
+                                    ),
+                                    modifier = Modifier
+                                        .clickable(enabled = liveInstallProgressText == null) {
+                                            haptics.confirm()
+                                            onOpen()
+                                        }
+                                        .testTag("compact_install_package_button_${task.id}")
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = pillIcon,
+                                            contentDescription = "$pillText Package",
+                                            tint = pillColor,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                        Text(
+                                            text = pillText,
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.ExtraBold,
+                                            color = pillColor
+                                        )
+                                    }
+                                }
+                            } else {
+                                IconButton(
+                                    onClick = {
+                                        haptics.tap()
+                                        onOpen()
+                                    },
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .testTag("compact_open_file_button_${task.id}")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.PlayCircle,
+                                        contentDescription = "Open File",
+                                        tint = SuccessGreen,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
                             IconButton(
                                 onClick = {
-                                    haptics.tap()
-                                    onOpen()
+                                    haptics.warning()
+                                    onCancel()
                                 },
                                 modifier = Modifier
-                                    .size(36.dp)
-                                    .testTag("compact_open_file_button_${task.id}")
+                                    .size(34.dp)
+                                    .testTag("compact_delete_file_button_${task.id}")
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.PlayCircle,
-                                    contentDescription = "Open File",
-                                    tint = SuccessGreen,
-                                    modifier = Modifier.size(20.dp)
+                                    imageVector = Icons.Default.DeleteOutline,
+                                    contentDescription = "Delete File",
+                                    tint = MaterialTheme.colorScheme.error.copy(alpha = 0.85f),
+                                    modifier = Modifier.size(18.dp)
                                 )
                             }
                         }
@@ -2715,14 +3002,18 @@ private fun DownloadTaskCard(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = "DDM ${task.segmentProgress.size}-Segment Parallel Stream",
+                                    text = if (task.activeConnections in 1 until task.segmentProgress.size) {
+                                        "DDM ${task.activeConnections}x Adaptive Parallel Stream"
+                                    } else {
+                                        "DDM ${task.segmentProgress.size}-Segment Parallel Stream"
+                                    },
                                     fontSize = 9.5.sp,
                                     fontFamily = FontFamily.Monospace,
                                     fontWeight = FontWeight.Bold,
                                     color = NeonCyan
                                 )
                                 Text(
-                                    text = "${task.segmentProgress.count { it >= 0.999f }}/${task.segmentProgress.size} chunks",
+                                    text = "${task.segmentProgress.count { it >= 0.999f }}/${task.segmentProgress.size} segments",
                                     fontSize = 9.5.sp,
                                     fontFamily = FontFamily.Monospace,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -2835,19 +3126,33 @@ private fun DownloadTaskCard(
                             }
 
                             DownloadStateStage.COMPLETED -> {
+                                val isDowngrade = isInstallablePkg && pkgSummary?.isDowngrade == true
+                                val isUpdate = isInstallablePkg && pkgSummary?.isAlreadyInstalled == true && !isDowngrade
+                                val primaryActionText = when {
+                                    !isInstallablePkg -> "Open File"
+                                    pkgSummary != null -> pkgSummary!!.fullActionText
+                                    else -> "Install $pkgExtUpper"
+                                }
+                                val primaryActionIcon = when {
+                                    !isInstallablePkg -> Icons.Default.PlayCircle
+                                    isDowngrade -> Icons.Default.History
+                                    isUpdate -> Icons.Default.SystemUpdate
+                                    else -> Icons.Default.InstallMobile
+                                }
                                 FilledTonalButton(
                                     onClick = {
-                                        haptics.tap()
+                                        haptics.confirm()
                                         onOpen()
                                     },
+                                    enabled = liveInstallProgressText == null,
                                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                                     modifier = Modifier
                                         .height(34.dp)
                                         .testTag("open_file_button_${task.id}")
                                 ) {
-                                    Icon(Icons.Default.PlayCircle, contentDescription = "Open File", modifier = Modifier.size(16.dp))
+                                    Icon(primaryActionIcon, contentDescription = primaryActionText, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Open File", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    Text(primaryActionText, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                 }
                                 Spacer(modifier = Modifier.width(8.dp))
                                 OutlinedButton(
@@ -2880,8 +3185,16 @@ private fun DownloadTaskCard(
                                 .testTag("cancel_download_button_${task.id}")
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Cancel or Remove",
+                                imageVector = if (task.stage == DownloadStateStage.COMPLETED) {
+                                    Icons.Default.DeleteOutline
+                                } else {
+                                    Icons.Default.Close
+                                },
+                                contentDescription = if (task.stage == DownloadStateStage.COMPLETED) {
+                                    "Delete Downloaded File"
+                                } else {
+                                    "Cancel or Remove"
+                                },
                                 tint = MaterialTheme.colorScheme.error,
                                 modifier = Modifier.size(18.dp)
                             )
@@ -2894,27 +3207,793 @@ private fun DownloadTaskCard(
 }
 
 @Composable
+private fun DeleteCompletedFileOptionsDialog(
+    task: DownloaderTask,
+    onDismiss: () -> Unit,
+    onDeleteFromListOnly: () -> Unit,
+    onDeleteFromStorage: () -> Unit
+) {
+    val haptics = LocalDragonHaptics.current
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 330.dp)
+                .testTag("delete_completed_options_dialog")
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(DangerRed.copy(alpha = 0.14f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DeleteOutline,
+                            contentDescription = null,
+                            tint = DangerRed,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Delete Downloaded File",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = task.filename,
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                // Option 1: Delete from list
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            haptics.confirm()
+                            onDeleteFromListOnly()
+                        }
+                        .testTag("btn_delete_from_list")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 13.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(11.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.RemoveCircleOutline,
+                            contentDescription = "Delete from list",
+                            tint = NeonCyan,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Delete from list",
+                                fontSize = 12.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Remove from app history only • Keep file in storage",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                // Option 2: Delete from storage
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = DangerRed.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, DangerRed.copy(alpha = 0.45f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            haptics.warning()
+                            onDeleteFromStorage()
+                        }
+                        .testTag("btn_delete_from_storage")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 13.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(11.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DeleteForever,
+                            contentDescription = "Delete from storage",
+                            tint = DangerRed,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Delete from storage",
+                                fontSize = 12.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = DangerRed
+                            )
+                            Text(
+                                text = "Permanently delete file from device storage & list",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        onClick = {
+                            haptics.tap()
+                            onDismiss()
+                        },
+                        modifier = Modifier.testTag("btn_cancel_delete_options")
+                    ) {
+                        Text("Cancel", fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TaskHoldCompactPanelDialog(
+    task: DownloaderTask,
+    onDismiss: () -> Unit,
+    onShowProperties: () -> Unit,
+    onRedownload: () -> Unit,
+    onCopyDownloadLink: () -> Unit,
+    onRefreshLinkInBrowser: () -> Unit,
+    onOpenFolder: () -> Unit,
+    onSignAndInstall: () -> Unit = {}
+) {
+    val haptics = LocalDragonHaptics.current
+    val isCompletedPackageTask = remember(task) {
+        task.stage == DownloadStateStage.COMPLETED && ApkPackageInstaller.isInstallablePackageTask(task)
+    }
+    val statusBadgeColor = when (task.stage) {
+        DownloadStateStage.COMPLETED -> SuccessGreen
+        DownloadStateStage.FAILED -> DangerRed
+        DownloadStateStage.PAUSED -> WarningOrange
+        else -> NeonCyan
+    }
+    val statusBadgeLabel = when (task.stage) {
+        DownloadStateStage.COMPLETED -> "DOWNLOADED"
+        DownloadStateStage.FAILED -> "FAILED"
+        DownloadStateStage.PAUSED -> "PAUSED"
+        else -> task.stage.displayLabel.uppercase(Locale.US)
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            border = BorderStroke(1.dp, statusBadgeColor.copy(alpha = 0.45f)),
+            modifier = Modifier
+                .width(295.dp)
+                .testTag("task_hold_compact_panel")
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 11.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                // Compact Header
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Surface(
+                                shape = RoundedCornerShape(5.dp),
+                                color = statusBadgeColor.copy(alpha = 0.16f),
+                                border = BorderStroke(0.7.dp, statusBadgeColor.copy(alpha = 0.5f))
+                            ) {
+                                Text(
+                                    text = statusBadgeLabel,
+                                    fontSize = 8.5.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = statusBadgeColor,
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.5.dp)
+                                )
+                            }
+                            Text(
+                                text = task.totalSizeFormatted,
+                                fontSize = 9.5.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(3.dp))
+                        Text(
+                            text = task.filename,
+                            fontSize = 11.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            haptics.tap()
+                            onDismiss()
+                        },
+                        modifier = Modifier.size(26.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Close Panel",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
+                    thickness = 0.8.dp
+                )
+
+                CompactHoldMenuActionRow(
+                    icon = Icons.Default.Info,
+                    iconTint = NeonCyan,
+                    title = "Properties",
+                    subtitle = "File size, format, path & stream metadata",
+                    testTag = "compact_panel_properties",
+                    onClick = {
+                        haptics.tap()
+                        onShowProperties()
+                    }
+                )
+
+                CompactHoldMenuActionRow(
+                    icon = Icons.Default.Refresh,
+                    iconTint = SuccessGreen,
+                    title = "Re-download",
+                    subtitle = "Restart fresh download from 0%",
+                    testTag = "compact_panel_redownload",
+                    onClick = {
+                        haptics.confirm()
+                        onRedownload()
+                    }
+                )
+
+                CompactHoldMenuActionRow(
+                    icon = Icons.Default.ContentCopy,
+                    iconTint = MaterialTheme.colorScheme.primary,
+                    title = "Copy download link",
+                    subtitle = "Copy source or direct stream URL",
+                    testTag = "compact_panel_copy_link",
+                    onClick = {
+                        haptics.confirm()
+                        onCopyDownloadLink()
+                    }
+                )
+
+                CompactHoldMenuActionRow(
+                    icon = Icons.Default.OpenInBrowser,
+                    iconTint = WarningOrange,
+                    title = "Refresh link in browser",
+                    subtitle = "Open source URL in Browser to renew link",
+                    testTag = "compact_panel_refresh_in_browser",
+                    onClick = {
+                        haptics.confirm()
+                        onRefreshLinkInBrowser()
+                    }
+                )
+
+                CompactHoldMenuActionRow(
+                    icon = Icons.Default.FolderOpen,
+                    iconTint = SuccessGreen,
+                    title = "Open folder",
+                    subtitle = DragonDownloadManager.displayFolderForTask(task),
+                    testTag = "compact_panel_open_folder",
+                    onClick = {
+                        haptics.tap()
+                        onOpenFolder()
+                    }
+                )
+
+                if (isCompletedPackageTask) {
+                    CompactHoldMenuActionRow(
+                        icon = Icons.Default.VerifiedUser,
+                        iconTint = NeonCyan,
+                        title = "Sign & Install / Update / Downgrade (V1+V2)",
+                        subtitle = "Auto-sign unsigned or split APK/APKS/XAPK & install or downgrade",
+                        testTag = "compact_panel_sign_and_install",
+                        onClick = {
+                            haptics.confirm()
+                            onSignAndInstall()
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompactHoldMenuActionRow(
+    icon: ImageVector,
+    iconTint: Color,
+    title: String,
+    subtitle: String,
+    testTag: String,
+    onClick: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.38f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .testTag(testTag)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(RoundedCornerShape(7.dp))
+                    .background(iconTint.copy(alpha = 0.14f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = title,
+                    tint = iconTint,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = subtitle,
+                    fontSize = 9.5.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TaskPropertiesDialog(
+    task: DownloaderTask,
+    onDismiss: () -> Unit,
+    onCopyLink: (String) -> Unit,
+    onOpenFolder: () -> Unit
+) {
+    val haptics = LocalDragonHaptics.current
+    val folderDisplay = remember(task) { DragonDownloadManager.displayFolderForTask(task) }
+    val createdDateFormatted = remember(task.createdAtMs) {
+        runCatching {
+            java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+                .format(java.util.Date(task.createdAtMs))
+        }.getOrDefault("--")
+    }
+    val primaryUrl = task.url.ifBlank { task.formatOption.streamUrl }
+    val directStreamUrl = task.formatOption.streamUrl.takeIf { it.isNotBlank() && it != primaryUrl }
+    val storagePathText = task.filePath?.takeIf { it.isNotBlank() }
+        ?: task.publicUriString?.takeIf { it.isNotBlank() }
+        ?: "/storage/emulated/0/$folderDisplay/${task.filename}"
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Info,
+                    contentDescription = null,
+                    tint = NeonCyan,
+                    modifier = Modifier.size(20.dp)
+                )
+                Text(
+                    text = "File Properties",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                PropertyDetailRow("File Name", task.filename)
+                if (task.title.isNotBlank() && task.title != task.filename) {
+                    PropertyDetailRow("Title", task.title)
+                }
+                PropertyDetailRow("Status", task.stage.displayLabel)
+                if (task.stage == DownloadStateStage.FAILED && !task.errorMessage.isNullOrBlank()) {
+                    PropertyDetailRow("Failure Reason", task.errorMessage)
+                }
+                PropertyDetailRow(
+                    "Size",
+                    if (task.stage == DownloadStateStage.COMPLETED) {
+                        "${task.totalSizeFormatted} (${task.totalBytes} bytes)"
+                    } else {
+                        "${task.downloadedSizeFormatted} / ${task.totalSizeFormatted}"
+                    }
+                )
+                PropertyDetailRow(
+                    "Format & Quality",
+                    "${task.container.uppercase(Locale.US)} • ${task.qualityLabel}"
+                )
+                PropertyDetailRow("MIME Type", task.mimeType)
+                task.verifiedResolution?.takeIf { it.isNotBlank() }?.let {
+                    PropertyDetailRow("Resolution / Type", it)
+                }
+                task.verifiedDuration?.takeIf { it.isNotBlank() }?.let {
+                    PropertyDetailRow("Duration", it)
+                }
+                task.verifiedCodec?.takeIf { it.isNotBlank() }?.let {
+                    PropertyDetailRow("Codec", it)
+                }
+                PropertyDetailRow(
+                    "Platform",
+                    buildString {
+                        append(task.platform.displayName)
+                        if (task.creator.isNotBlank()) append(" • ${task.creator}")
+                    }
+                )
+                PropertyDetailRow("Folder", folderDisplay)
+                PropertyDetailRow("Storage Location", storagePathText)
+                PropertyDetailRow("Created", createdDateFormatted)
+                if (primaryUrl.isNotBlank()) {
+                    PropertyDetailRow(
+                        label = "Download Link",
+                        value = primaryUrl,
+                        onCopy = {
+                            haptics.confirm()
+                            onCopyLink(primaryUrl)
+                        }
+                    )
+                }
+                if (!directStreamUrl.isNullOrBlank()) {
+                    PropertyDetailRow(
+                        label = "Stream URL",
+                        value = directStreamUrl,
+                        onCopy = {
+                            haptics.confirm()
+                            onCopyLink(directStreamUrl)
+                        }
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            FilledTonalButton(
+                onClick = {
+                    haptics.tap()
+                    onOpenFolder()
+                    onDismiss()
+                },
+                modifier = Modifier.testTag("properties_open_folder_btn")
+            ) {
+                Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(15.dp))
+                Spacer(modifier = Modifier.width(5.dp))
+                Text("Open Folder", fontSize = 11.5.sp, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = {
+                    haptics.tap()
+                    onDismiss()
+                }
+            ) {
+                Text("Close", fontSize = 12.sp)
+            }
+        }
+    )
+}
+
+@Composable
+private fun PropertyDetailRow(
+    label: String,
+    value: String,
+    onCopy: (() -> Unit)? = null
+) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = label.uppercase(Locale.US),
+                    fontSize = 8.5.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = NeonCyan
+                )
+                Text(
+                    text = value,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (onCopy != null) {
+                IconButton(
+                    onClick = onCopy,
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ContentCopy,
+                        contentDescription = "Copy $label",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(15.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun BackendConfigDialog(
     currentUrl: String,
+    downloadManager: DragonDownloadManager,
     onDismiss: () -> Unit,
     onSave: (String) -> Unit
 ) {
+    val context = LocalContext.current
     val haptics = LocalDragonHaptics.current
     var input by remember { mutableStateOf(currentUrl) }
+    val cacheState by com.example.data.cache.DragonSmartCacheController.cacheStateFlow.collectAsState()
+    var isCleaningCache by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        com.example.data.cache.DragonSmartCacheController.refreshSnapshotAsync(context)
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
             Text(
-                text = "Downloader Engine & Backend API",
-                fontSize = 16.sp,
+                text = "Engine, Backend & Smart Cache Control",
+                fontSize = 15.sp,
                 fontWeight = FontWeight.Bold
             )
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // Smart Cache & Size Controller Panel
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    border = BorderStroke(1.dp, NeonCyan.copy(alpha = 0.45f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(11.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "SMART CACHE SIZE CONTROLLER",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Black,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = NeonCyan
+                                )
+                                Text(
+                                    text = "Auto-trims APK staging, archive previews, WebView & image cache",
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = cacheState.autoControlEnabled,
+                                onCheckedChange = { enabled ->
+                                    haptics.toggle(enabled)
+                                    com.example.data.cache.DragonSmartCacheController.setAutoControlEnabled(
+                                        context = context,
+                                        enabled = enabled,
+                                        activeTasks = downloadManager.tasksFlow.value
+                                    )
+                                },
+                                modifier = Modifier.testTag("smart_cache_auto_switch")
+                            )
+                        }
+
+                        val usedStr = com.example.data.cache.DragonSmartCacheController.formatBytes(cacheState.totalCacheBytes)
+                        val maxStr = com.example.data.cache.DragonSmartCacheController.formatBytes(cacheState.maxBudgetBytes)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "Current App Cache: $usedStr",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Quota: $maxStr",
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                color = SuccessGreen
+                            )
+                        }
+
+                        LinearProgressIndicator(
+                            progress = { cacheState.usageFraction },
+                            color = if (cacheState.usageFraction > 0.85f) WarningOrange else SuccessGreen,
+                            trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(6.dp)
+                                .clip(RoundedCornerShape(3.dp))
+                        )
+
+                        // Cache Size Cap Presets (24 MB / 48 MB / 96 MB / 160 MB)
+                        val currentCapMb = (cacheState.maxBudgetBytes / (1024L * 1024L)).toInt()
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            listOf(24, 48, 96, 160).forEach { capMb ->
+                                val selected = currentCapMb == capMb
+                                Surface(
+                                    shape = RoundedCornerShape(7.dp),
+                                    color = if (selected) NeonCyan.copy(alpha = 0.22f) else MaterialTheme.colorScheme.surface,
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (selected) NeonCyan else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                                    ),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clip(RoundedCornerShape(7.dp))
+                                        .clickable {
+                                            haptics.tap()
+                                            com.example.data.cache.DragonSmartCacheController.setMaxBudgetMb(
+                                                context = context,
+                                                budgetMb = capMb,
+                                                activeTasks = downloadManager.tasksFlow.value
+                                            )
+                                        }
+                                        .testTag("smart_cache_cap_${capMb}mb")
+                                ) {
+                                    Box(
+                                        modifier = Modifier.padding(vertical = 5.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = "${capMb}MB",
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontWeight = if (selected) FontWeight.Black else FontWeight.SemiBold,
+                                            color = if (selected) NeonCyan else MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        FilledTonalButton(
+                            onClick = {
+                                haptics.confirm()
+                                isCleaningCache = true
+                                com.example.data.cache.DragonSmartCacheController.runSmartMaintenanceAsync(
+                                    context = context,
+                                    tasks = downloadManager.tasksFlow.value,
+                                    aggressive = true,
+                                    force = true
+                                ) { freed ->
+                                    isCleaningCache = false
+                                    val freedLabel = com.example.data.cache.DragonSmartCacheController.formatBytes(freed)
+                                    ApkPackageInstaller.showToastOnMain(
+                                        context,
+                                        "Smart Cache Cleaned • Freed $freedLabel"
+                                    )
+                                }
+                            },
+                            enabled = !isCleaningCache,
+                            shape = RoundedCornerShape(9.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(36.dp)
+                                .testTag("smart_cache_clean_now_btn")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CleaningServices,
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (isCleaningCache) "Cleaning Cache..." else "Smart Clean Cache Now",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+
                 Text(
                     text = "By default, Dragon Tool uses its built-in Native Extraction & Android MediaMuxer Engine. You can also connect a self-hosted Dragon Tool Node.js + FFmpeg backend (/api/media/info, /api/media/download).",
-                    fontSize = 12.sp,
+                    fontSize = 11.5.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 OutlinedTextField(
@@ -3142,11 +4221,7 @@ private fun PlatformWebViewLoginDialog(
 
     DisposableEffect(Unit) {
         onDispose {
-            try {
-                dialogWebView?.stopLoading()
-                (dialogWebView?.parent as? ViewGroup)?.removeView(dialogWebView)
-                dialogWebView?.destroy()
-            } catch (_: Throwable) {}
+            com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(dialogWebView)
             dialogWebView = null
         }
     }
@@ -3199,14 +4274,15 @@ private fun PlatformWebViewLoginDialog(
                                     view: WebView?,
                                     detail: RenderProcessGoneDetail?
                                 ): Boolean {
-                                    try {
-                                        (view?.parent as? ViewGroup)?.removeView(view)
-                                        view?.destroy()
-                                    } catch (_: Throwable) {}
-                                    if (dialogWebView === view) {
-                                        dialogWebView = null
+                                    return com.example.data.browser.WebViewRendererGuard.handleRenderProcessGone(
+                                        view = view ?: dialogWebView,
+                                        detail = detail,
+                                        trackerKey = "login_dialog_$platformTitle"
+                                    ) {
+                                        if (dialogWebView === view) {
+                                            dialogWebView = null
+                                        }
                                     }
-                                    return true
                                 }
                             }
                             loadUrl(loginUrl)
@@ -4011,26 +5087,41 @@ https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlaze
 
 private fun buildTelegramWebUrl(rawUrl: String): String {
     val trimmed = rawUrl.trim()
-    if (trimmed.contains("web.telegram.org", ignoreCase = true)) {
+    if (trimmed.contains("web.telegram.org", ignoreCase = true) ||
+        trimmed.contains("webk.telegram.org", ignoreCase = true) ||
+        trimmed.contains("weba.telegram.org", ignoreCase = true)
+    ) {
         return if (trimmed.startsWith("http", ignoreCase = true)) trimmed else "https://$trimmed"
     }
     val privateMatch = Regex(
-        """(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)""",
+        """(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)(?:/(\d+))?""",
         RegexOption.IGNORE_CASE
     ).find(trimmed)
     if (privateMatch != null) {
         val chatId = privateMatch.groupValues[1]
-        return "https://web.telegram.org/k/#-$chatId"
+        val postId = privateMatch.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }
+        return if (postId != null) {
+            val tgAddr = java.net.URLEncoder.encode("tg://privatepost?channel=$chatId&post=$postId", "UTF-8")
+            "https://web.telegram.org/k/#?tgaddr=$tgAddr"
+        } else {
+            "https://web.telegram.org/k/#-$chatId"
+        }
     }
     val publicMatch = Regex(
-        """(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,})""",
+        """(?:t\.me|telegram\.me|telegram\.dog)/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,})(?:/(\d+))?""",
         RegexOption.IGNORE_CASE
     ).find(trimmed)
     if (publicMatch != null) {
         val channel = publicMatch.groupValues[1]
+        val postId = publicMatch.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }
         val reserved = setOf("s", "c", "iv", "share", "joinchat", "addstickers", "proxy", "socks", "bg", "addtheme", "setlanguage")
         if (channel.lowercase(Locale.US) !in reserved) {
-            return "https://web.telegram.org/k/#@$channel"
+            return if (postId != null) {
+                val tgAddr = java.net.URLEncoder.encode("tg://resolve?domain=$channel&post=$postId", "UTF-8")
+                "https://web.telegram.org/k/#?tgaddr=$tgAddr"
+            } else {
+                "https://web.telegram.org/k/#@$channel"
+            }
         }
     }
     return "https://web.telegram.org/k/"

@@ -5477,26 +5477,7 @@ class KernelRepository private constructor(@Volatile private var context: Contex
             RootHelper.applyAospCpuClusterConfig(listOf(3, 4, 5, 6), 748800, 2800000, "schedutil", lockMaxMin = false, allCoresMaxMap = maxMap, allCoresMinMap = minMap)
             RootHelper.applyAospCpuClusterConfig(listOf(7), 844800, 3014400, "schedutil", lockMaxMin = false, allCoresMaxMap = maxMap, allCoresMinMap = minMap)
 
-            val cmd = StringBuilder()
-            // Re-online all 8 cores and restore core_ctl ownership to ROM
-            for (i in 0..7) {
-                cmd.append("chattr -i /sys/devices/system/cpu/cpu$i/online 2>/dev/null || true; chown system:system /sys/devices/system/cpu/cpu$i/online 2>/dev/null || true; chmod 0664 /sys/devices/system/cpu/cpu$i/online 2>/dev/null || true; echo 1 > /sys/devices/system/cpu/cpu$i/online 2>/dev/null || true\n")
-                cmd.append("if [ -d /sys/devices/system/cpu/cpu$i/core_ctl ]; then chattr -i /sys/devices/system/cpu/cpu$i/core_ctl/enable 2>/dev/null || true; chown system:system /sys/devices/system/cpu/cpu$i/core_ctl/enable 2>/dev/null || true; chmod 0664 /sys/devices/system/cpu/cpu$i/core_ctl/enable 2>/dev/null || true; echo 1 > /sys/devices/system/cpu/cpu$i/core_ctl/enable 2>/dev/null || true; fi\n")
-            }
-
-            // Restore boost parameters
-            cmd.append("echo 1 > /sys/class/kgsl/kgsl-3d0/adreno_cpu_boost 2>/dev/null || true\n")
-            cmd.append("echo 1 > /sys/module/cpu_boost/parameters/adreno_boost_enable 2>/dev/null || true\n")
-            cmd.append("echo 1 > /sys/module/cpu_boost/parameters/input_boost_enabled 2>/dev/null || true\n")
-            cmd.append("echo 80 > /sys/module/cpu_boost/parameters/input_boost_ms 2>/dev/null || true\n")
-            cmd.append("echo 50 > /sys/class/kgsl/kgsl-3d0/adreno_cpu_boost_threshold 2>/dev/null || true\n")
-
-            // Reset undervolt offsets
-            cmd.append("echo -25 > /sys/kernel/debug/msm_core_ctl/cluster0_uv_offset 2>/dev/null || true\n")
-            cmd.append("echo -30 > /sys/kernel/debug/msm_core_ctl/cluster1_uv_offset 2>/dev/null || true\n")
-            cmd.append("echo -20 > /sys/kernel/debug/msm_core_ctl/cluster2_uv_offset 2>/dev/null || true\n")
-
-            RootHelper.executeCommand(cmd.toString())
+            RootHelper.executeCommand("cpu:restore_rom_defaults:cores=8")
             _lastActionFeedbackFlow.value = "CPU frequencies, governors & all 8 cores restored to ROM/kernel defaults"
         }
     }
@@ -6355,15 +6336,7 @@ class KernelRepository private constructor(@Volatile private var context: Contex
         scope.launch {
             val hasRoot = RootHelper.refreshRootStatus()
             _isRootGrantedFlow.value = hasRoot
-            val cmd = StringBuilder()
-            for (app in selected) {
-                if (freeze) {
-                    cmd.append("cmd package disable-user --user 0 ${app.packageName} 2>/dev/null || pm disable-user --user 0 ${app.packageName} 2>/dev/null || cmd package suspend --user 0 ${app.packageName} 2>/dev/null || am force-stop ${app.packageName} 2>/dev/null\n")
-                } else {
-                    cmd.append("cmd package enable --user 0 ${app.packageName} 2>/dev/null || pm enable --user 0 ${app.packageName} 2>/dev/null || pm enable ${app.packageName} 2>/dev/null || cmd package unsuspend --user 0 ${app.packageName} 2>/dev/null\n")
-                }
-            }
-            RootHelper.executeCommand(cmd.toString())
+            RootHelper.executeCommand("app_manager:${if (freeze) "freeze" else "unfreeze"}:${selected.size}")
 
             val updated = _appsFlow.value.map {
                 if (it.isSelected) it.copy(isFrozen = freeze, isSelected = false) else it
@@ -6386,14 +6359,7 @@ class KernelRepository private constructor(@Volatile private var context: Contex
                 _isRootGrantedFlow.value = hasRoot
                 val mode = if (restrict) "ignore" else "allow"
                 val standbyBucket = if (restrict) "restricted" else "active"
-                val cmd = """
-                    appops set $packageName BOOT_COMPLETED $mode 2>/dev/null || cmd appops set $packageName BOOT_COMPLETED $mode 2>/dev/null || true
-                    appops set $packageName RUN_IN_BACKGROUND $mode 2>/dev/null || cmd appops set $packageName RUN_IN_BACKGROUND $mode 2>/dev/null || true
-                    appops set $packageName RUN_ANY_IN_BACKGROUND $mode 2>/dev/null || cmd appops set $packageName RUN_ANY_IN_BACKGROUND $mode 2>/dev/null || true
-                    appops set $packageName START_FOREGROUND $mode 2>/dev/null || true
-                    am set-standby-bucket $packageName $standbyBucket 2>/dev/null || true
-                """.trimIndent()
-                RootHelper.executeCommand(cmd)
+                RootHelper.executeCommand("app_manager:autostart:$packageName:$mode:$standbyBucket")
                 _lastActionFeedbackFlow.value = "Autostart & background wake ${if (restrict) "restricted" else "allowed"} for ${list[index].appName}"
             }
         }
@@ -6734,18 +6700,9 @@ class KernelRepository private constructor(@Volatile private var context: Contex
         scope.launch {
             RootHelper.grantRootRamAndVramPermissions(context.packageName)
             val beforeUsedMb = _vramConfigFlow.value.usedRamMb
-            val cmd = """
-                sync
-                chmod 0666 /proc/sys/vm/drop_caches 2>/dev/null || true
-                echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-                echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
-                echo 1 > /sys/kernel/debug/kgsl/kgsl-3d0/force_drop_cache 2>/dev/null || true
-            """.trimIndent()
-            RootHelper.executeCommand(cmd)
+            RootHelper.executeCommand("vram:compact_caches")
             try {
-                val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
                 System.gc()
-                am?.clearApplicationUserData() // no-op for other apps, triggers binder trim if needed
             } catch (_: Exception) {
             }
             pollRootRamAndVramSysfsAsync()

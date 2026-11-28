@@ -59,6 +59,7 @@ data class BrowserProxyProfile(
     val bypassRules: List<String> = DEFAULT_BYPASS_RULES,
     val reverseBypass: Boolean = false,
     val applyToDownloads: Boolean = true,
+    val fallbackProxies: List<BrowserProxyProfile> = emptyList(),
     val createdAtMs: Long = System.currentTimeMillis()
 ) {
     fun hasAuth(): Boolean = username.isNotBlank()
@@ -154,7 +155,10 @@ object BrowserProxyManager {
     private val localProxyServer: LocalBrowserProxyServer by lazy {
         LocalBrowserProxyServer(
             dnsProvider = { activeWarpDns },
-            proxyProvider = { activeNetworkProxy }
+            proxyProvider = { activeNetworkProxy },
+            malwareValidator = { url, _ ->
+                runCatching { MalwareProtectionEngine.inspectUrl(url).isBlocked }.getOrDefault(false)
+            }
         )
     }
 
@@ -233,9 +237,28 @@ object BrowserProxyManager {
         return count
     }
 
+    @Volatile
+    private var extensionManagedProxyProfile: BrowserProxyProfile? = null
+
+    @Volatile
+    private var extensionManagedProxyOwnerId: String? = null
+
+    @Volatile
+    private var lastUserProxyEnabled: Boolean = false
+
+    @Volatile
+    private var lastUserProxyProfile: BrowserProxyProfile? = null
+
     fun syncNetworkProxyState(enabled: Boolean, profile: BrowserProxyProfile?) {
-        val effective = if (enabled && profile != null) profile else null
+        lastUserProxyEnabled = enabled
+        lastUserProxyProfile = profile
+        val userEffective = if (enabled && profile != null) profile else null
+        val effective = extensionManagedProxyProfile ?: userEffective
         activeNetworkProxy = effective
+        updateDefaultJavaAuthenticator(effective)
+    }
+
+    private fun updateDefaultJavaAuthenticator(effective: BrowserProxyProfile?) {
         runCatching {
             if (effective != null && effective.hasAuth()) {
                 java.net.Authenticator.setDefault(object : java.net.Authenticator() {
@@ -261,6 +284,53 @@ object BrowserProxyManager {
     }
 
     /**
+     * Applies a proxy configuration requested dynamically by a WebExtension via `chrome.proxy.settings.set(...)`
+     * or `browser.proxy.onRequest`, routing all WebView and downloader traffic through the VPN extension's proxy server.
+     */
+    fun applyExtensionProxyProfile(
+        context: Context,
+        extensionId: String,
+        profile: BrowserProxyProfile,
+        onCompleted: (applied: Boolean, statusMessage: String) -> Unit = { _, _ -> }
+    ) {
+        extensionManagedProxyOwnerId = extensionId
+        extensionManagedProxyProfile = profile
+        configureWebViewNetworkRouting(
+            context = context,
+            proxyEnabled = lastUserProxyEnabled,
+            proxyProfile = lastUserProxyProfile,
+            warpDns = activeWarpDns,
+            onCompleted = onCompleted
+        )
+    }
+
+    /**
+     * Clears any proxy configuration previously applied by a WebExtension via `chrome.proxy.settings.clear(...)`
+     * or when the VPN extension is disabled/disconnected, restoring user proxy settings or direct connection.
+     */
+    fun clearExtensionProxyProfile(
+        context: Context,
+        extensionId: String? = null,
+        onCompleted: (applied: Boolean, statusMessage: String) -> Unit = { _, _ -> }
+    ) {
+        if (extensionId == null || extensionManagedProxyOwnerId == null || extensionManagedProxyOwnerId == extensionId) {
+            extensionManagedProxyOwnerId = null
+            extensionManagedProxyProfile = null
+            configureWebViewNetworkRouting(
+                context = context,
+                proxyEnabled = lastUserProxyEnabled,
+                proxyProfile = lastUserProxyProfile,
+                warpDns = activeWarpDns,
+                onCompleted = onCompleted
+            )
+        } else {
+            onCompleted(true, "Extension proxy state unchanged")
+        }
+    }
+
+    fun getExtensionManagedProxyProfile(): BrowserProxyProfile? = extensionManagedProxyProfile
+
+    /**
      * Unified network routing controller for WebView:
      * - Whenever ANY Custom DNS (Cloudflare WARP, AdGuard AdBlocker, AdGuard Unfiltered, Custom DNS)
      *   OR ANY Proxy (HTTP, HTTPS, SOCKS5 with/without auth, SOCKS4/4a) is enabled, starts the
@@ -278,22 +348,37 @@ object BrowserProxyManager {
         warpDns: CloudflareWarpDns?,
         onCompleted: (applied: Boolean, statusMessage: String) -> Unit = { _, _ -> }
     ) {
-        activeWarpDns = warpDns
+        if (warpDns != null) {
+            activeWarpDns = warpDns
+        }
         syncNetworkProxyState(proxyEnabled, proxyProfile)
 
-        val effectiveProxy = if (proxyEnabled && proxyProfile != null) proxyProfile else null
-        val customDnsActive = warpDns?.isAnyCustomDnsActive == true
+        val effectiveProxy = activeNetworkProxy
+        val currentWarpDns = activeWarpDns
+        val customDnsActive = currentWarpDns?.isAnyCustomDnsActive == true
 
-        // Register active user-configured Proxy & Custom DNS infrastructure hosts with MalwareProtectionEngine
+        // Register active user-configured & VPN-extension Proxy + Custom DNS infrastructure hosts with MalwareProtectionEngine
         val infraHosts = buildList {
-            if (effectiveProxy != null && effectiveProxy.host.isNotBlank()) {
-                add(effectiveProxy.host)
+            if (effectiveProxy != null) {
+                if (effectiveProxy.host.isNotBlank()) add(effectiveProxy.host)
+                effectiveProxy.fallbackProxies.forEach { fb ->
+                    if (fb.host.isNotBlank()) add(fb.host)
+                }
             }
-            warpDns?.activeCustomDns?.let { custom ->
+            extensionManagedProxyProfile?.let { extP ->
+                if (extP.host.isNotBlank()) add(extP.host)
+                extP.fallbackProxies.forEach { fb ->
+                    if (fb.host.isNotBlank()) add(fb.host)
+                }
+            }
+            lastUserProxyProfile?.let { usrP ->
+                if (usrP.host.isNotBlank()) add(usrP.host)
+            }
+            currentWarpDns?.activeCustomDns?.let { custom ->
                 if (custom.primaryServer.isNotBlank()) add(custom.primaryServer)
                 if (custom.secondaryServer.isNotBlank()) add(custom.secondaryServer)
             }
-        }
+        }.distinct()
         MalwareProtectionEngine.setInfrastructureHosts(infraHosts)
 
         val needsLocalTunnel = (effectiveProxy != null) || customDnsActive

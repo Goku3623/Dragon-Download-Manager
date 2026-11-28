@@ -5495,6 +5495,17 @@ class MediaExtractionEngine(
         resolvedUrl: String
     ): MediaInfo {
         val cleanUrl = resolvedUrl.trim()
+        val lowerClean = cleanUrl.lowercase(Locale.US)
+        if (lowerClean.contains("://web.telegram.org") ||
+            lowerClean.contains("://webk.telegram.org") ||
+            lowerClean.contains("://weba.telegram.org") ||
+            lowerClean.contains("://webz.telegram.org")
+        ) {
+            throw ExtractorException(
+                DownloaderErrorType.UNSUPPORTED_MEDIA,
+                "Telegram Web links require your logged-in Telegram Web session. Tap \"Open in Telegram Web\" below to download files directly into Dragon Download Manager."
+            )
+        }
         val parsedUri = try {
             URI(cleanUrl)
         } catch (_: Exception) {
@@ -5676,9 +5687,18 @@ class MediaExtractionEngine(
                 }
             }
 
-            // 1) Explicit <video>, <source>, and data-video attributes (includes extensionless telesco.pe URLs)
+            // 1) Explicit <video>, <source>, and any element's data-video attribute (includes extensionless telesco.pe URLs)
             Regex(
                 """<(?:video|source)[^>]+(?:src|data-src|data-video)=["']([^"']+)["']""",
+                RegexOption.IGNORE_CASE
+            ).findAll(targetBlock).forEach { m ->
+                val resolved = resolveUrlAgainstBase(pageUrl, decodeHtmlEntities(m.groupValues[1]).trim())
+                if (resolved.startsWith("http", true)) {
+                    videoUrls.add(resolved)
+                }
+            }
+            Regex(
+                """data-video=["']([^"']+)["']""",
                 RegexOption.IGNORE_CASE
             ).findAll(targetBlock).forEach { m ->
                 val resolved = resolveUrlAgainstBase(pageUrl, decodeHtmlEntities(m.groupValues[1]).trim())
@@ -5700,12 +5720,13 @@ class MediaExtractionEngine(
 
             // 3) Collect non-avatar/non-thumb cdn*.telesco.pe/file/ URLs to probe their real Content-Type
             // Strictly exclude channel avatar (user_photo), video/document/link thumbnails, and photo_wrap!
+            val unescapedBlock = targetBlock.replace("\\/", "/")
             Regex("""https?://cdn\d*\.telesco\.pe/file/[^\s"'<>\\)]+""", RegexOption.IGNORE_CASE)
-                .findAll(targetBlock)
+                .findAll(unescapedBlock)
                 .forEach { m ->
                     val cdnUrl = decodeHtmlEntities(m.value).trimEnd(',', ';', '\'', '"')
                     val startIdx = m.range.first
-                    val surroundingBefore = targetBlock.substring((startIdx - 220).coerceAtLeast(0), startIdx)
+                    val surroundingBefore = unescapedBlock.substring((startIdx - 220).coerceAtLeast(0), startIdx)
                     val isAvatarOrThumb = surroundingBefore.contains("user_photo", ignoreCase = true) ||
                         surroundingBefore.contains("author_photo", ignoreCase = true) ||
                         surroundingBefore.contains("video_thumb", ignoreCase = true) ||
@@ -5803,7 +5824,14 @@ class MediaExtractionEngine(
             } catch (_: Exception) {}
         }
 
-        val mediaHeaders = buildCookieHeaders(cleanUrl, mapOf("Referer" to "https://t.me/"))
+        // Keep User-Agent identical to the t.me embed fetch so signed telesco.pe tokens stay valid!
+        val mediaHeaders = buildCookieHeaders(
+            cleanUrl,
+            mapOf(
+                "Referer" to "https://t.me/",
+                "User-Agent" to DESKTOP_USER_AGENT
+            )
+        )
         val videoFormats = mutableListOf<MediaFormatOption>()
         val audioFormats = mutableListOf<MediaFormatOption>()
         val fileFormats = mutableListOf<MediaFormatOption>()

@@ -1,5 +1,6 @@
 package com.example.data.downloader
 
+import android.app.DownloadManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -9,7 +10,9 @@ import android.os.Build
 import android.os.Environment
 import android.os.StatFs
 import android.os.SystemClock
+import android.provider.DocumentsContract
 import android.provider.MediaStore
+import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
 import com.example.data.model.*
 import kotlinx.coroutines.CancellationException
@@ -118,7 +121,58 @@ class DragonDownloadManager(
         prefs.getStringSet(KEY_DELETED_TASK_IDS, emptySet())?.toMutableSet() ?: mutableSetOf()
     )
 
+    enum class ExternalStreamControlAction { PAUSE, RESUME, CANCEL }
+
+    private val tgWebKeyByTaskId = ConcurrentHashMap<String, String>()
+    private val streamIdByTaskId = ConcurrentHashMap<String, String>()
+    private val cancelledTgWebKeys = ConcurrentHashMap<String, Long>()
+    private val pausedExternalTaskIds = ConcurrentHashMap.newKeySet<String>()
+    private val externalStreamControlListeners =
+        java.util.concurrent.CopyOnWriteArrayList<(taskId: String, webTaskKey: String?, streamId: String?, filename: String?, action: ExternalStreamControlAction) -> Boolean>()
+
+    fun registerExternalStreamControlListener(
+        listener: (taskId: String, webTaskKey: String?, streamId: String?, filename: String?, action: ExternalStreamControlAction) -> Boolean
+    ) {
+        if (!externalStreamControlListeners.contains(listener)) {
+            externalStreamControlListeners.add(listener)
+        }
+    }
+
+    fun unregisterExternalStreamControlListener(
+        listener: (taskId: String, webTaskKey: String?, streamId: String?, filename: String?, action: ExternalStreamControlAction) -> Boolean
+    ) {
+        externalStreamControlListeners.remove(listener)
+    }
+
+    fun isExternalWebManagedTask(taskId: String): Boolean =
+        taskId.startsWith("tgweb_") || taskId.startsWith("stream_")
+
+    fun bindExternalStreamId(taskId: String, streamId: String) {
+        if (taskId.isNotBlank() && streamId.isNotBlank()) {
+            streamIdByTaskId[taskId] = streamId
+        }
+    }
+
+    private fun dispatchExternalStreamControl(
+        taskId: String,
+        action: ExternalStreamControlAction,
+        filenameHint: String? = null
+    ): Boolean {
+        val webKey = tgWebKeyByTaskId[taskId]
+        val streamId = streamIdByTaskId[taskId]
+        val resolvedFilename = filenameHint?.takeIf { it.isNotBlank() }
+            ?: _tasksFlow.value.find { it.id == taskId }?.filename
+        var handled = false
+        for (listener in externalStreamControlListeners) {
+            if (runCatching { listener(taskId, webKey, streamId, resolvedFilename, action) }.getOrDefault(false)) {
+                handled = true
+            }
+        }
+        return handled
+    }
+
     init {
+        com.example.data.cache.DragonSmartCacheController.ensureInitialized(context)
         scope.launch(Dispatchers.IO) {
             ensurePersistedTasksLoaded()
             pruneDeletedCompletedTasks()
@@ -140,10 +194,10 @@ class DragonDownloadManager(
     }
 
     /**
-     * Automatically cleans orphaned temporary download segments, staging files, and redundant
-     * private User Data copies that have already been exported to the public Downloads folder.
+     * Automatically cleans orphaned temporary download segments, staging files, redundant
+     * private User Data copies, and enforces the smart cache size budget via [com.example.data.cache.DragonSmartCacheController].
      */
-    fun cleanTemporaryAndRedundantStorage(): Long {
+    fun cleanTemporaryAndRedundantStorage(aggressive: Boolean = false): Long {
         var bytesFreed = 0L
         try {
             val activeOrPausedIds = _tasksFlow.value
@@ -151,14 +205,18 @@ class DragonDownloadManager(
                 .map { it.id }
                 .toSet()
 
-            // 1. Clean orphaned downloader_work task folders in cacheDir
-            val workRoot = File(context.cacheDir, "downloader_work")
-            if (workRoot.exists()) {
-                workRoot.listFiles()?.forEach { dir ->
-                    if (dir.name !in activeOrPausedIds) {
-                        val size = computeFileOrDirBytes(dir)
-                        if (runCatching { dir.deleteRecursively() }.getOrDefault(false)) {
-                            bytesFreed += size
+            // 1. Clean orphaned downloader_work task folders in both filesDir and legacy cacheDir
+            listOf(
+                File(context.filesDir, "downloader_work"),
+                File(context.cacheDir, "downloader_work")
+            ).forEach { workRoot ->
+                if (workRoot.exists()) {
+                    workRoot.listFiles()?.forEach { dir ->
+                        if (dir.name !in activeOrPausedIds) {
+                            val size = computeFileOrDirBytes(dir)
+                            if (runCatching { dir.deleteRecursively() }.getOrDefault(false)) {
+                                bytesFreed += size
+                            }
                         }
                     }
                 }
@@ -169,7 +227,7 @@ class DragonDownloadManager(
             if (extStaging.exists()) {
                 val now = System.currentTimeMillis()
                 extStaging.listFiles()?.forEach { f ->
-                    if (now - f.lastModified() > 60_000L) {
+                    if (aggressive || now - f.lastModified() > 60_000L) {
                         val size = computeFileOrDirBytes(f)
                         if (runCatching { f.deleteRecursively() }.getOrDefault(false)) {
                             bytesFreed += size
@@ -187,20 +245,22 @@ class DragonDownloadManager(
                 }
             }
 
-            // 4. Remove duplicate downloaded files in private getExternalFilesDir / filesDir
+            // 4. Remove duplicate downloaded files in private getExternalFilesDir / filesDir / cacheDir apk_installer_staging
             // that are already exported to public MediaStore Downloads or no longer referenced.
             val referencedLocalPaths = _tasksFlow.value
                 .mapNotNull { task ->
-                    // If the task already has a valid public MediaStore URI, we do NOT need a duplicate multi-GB file in private User Data!
+                    // If the task already has a valid public MediaStore URI, we do NOT need a duplicate file in private User Data or cacheDir!
                     if (!task.publicUriString.isNullOrBlank() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         val dupPath = task.filePath
                         if (!dupPath.isNullOrBlank()) {
                             val dupFile = File(dupPath)
                             val extBase = context.getExternalFilesDir(null)?.absolutePath
                             val filesBase = context.filesDir.absolutePath
+                            val cacheStagingBase = File(context.cacheDir, "apk_installer_staging").absolutePath
                             if (dupFile.exists() && (
                                     (extBase != null && dupFile.absolutePath.startsWith(extBase)) ||
-                                        dupFile.absolutePath.startsWith(filesBase)
+                                        dupFile.absolutePath.startsWith(filesBase) ||
+                                        dupFile.absolutePath.startsWith(cacheStagingBase)
                                 )
                             ) {
                                 val len = dupFile.length()
@@ -227,6 +287,13 @@ class DragonDownloadManager(
                     }
                 }
             }
+
+            // 5. Run smart cache controller to prune APK staging, archive previews, APK editor temp files, and enforce LRU budget
+            bytesFreed += com.example.data.cache.DragonSmartCacheController.performSmartCacheMaintenanceSync(
+                context = context,
+                tasks = _tasksFlow.value,
+                aggressive = aggressive
+            )
         } catch (_: Exception) {}
         return bytesFreed
     }
@@ -583,6 +650,306 @@ class DragonDownloadManager(
                 platform = task.platform
             )
         }
+
+        data class ResolvedFileType(
+            val filename: String,
+            val extension: String,
+            val mimeType: String,
+            val subFolder: String,
+            val isVideo: Boolean,
+            val isAudio: Boolean,
+            val isGenericFile: Boolean
+        )
+
+        private val GENERIC_PLACEHOLDER_EXTENSIONS = setOf(
+            "", "bin", "tmp", "part", "download", "octet", "file", "dat"
+        )
+
+        fun resolveFileTypeAndName(
+            rawFilename: String,
+            rawMimeType: String?,
+            headerBytes: ByteArray? = null,
+            url: String = "",
+            platform: MediaPlatform? = null
+        ): ResolvedFileType {
+            val trimmedName = rawFilename.trim().ifBlank { "download_${System.currentTimeMillis()}" }
+            val cleanMime = rawMimeType
+                ?.substringBefore(';')
+                ?.trim()
+                ?.lowercase(Locale.US)
+                .orEmpty()
+            val hasDot = trimmedName.contains('.')
+            val rawExt = if (hasDot) {
+                trimmedName.substringAfterLast('.', "").lowercase(Locale.US).takeIf { it.length in 1..8 }.orEmpty()
+            } else ""
+            val hasRealExt = rawExt.isNotEmpty() && rawExt !in GENERIC_PLACEHOLDER_EXTENSIONS
+
+            var resolvedExt = if (hasRealExt) rawExt else ""
+            var resolvedMime = cleanMime
+
+            if (resolvedExt.isEmpty() && cleanMime.isNotEmpty() &&
+                cleanMime != "application/octet-stream" &&
+                cleanMime != "binary/octet-stream" &&
+                cleanMime != "application/force-download"
+            ) {
+                resolvedExt = extensionFromMimeType(cleanMime).orEmpty()
+            }
+
+            if (resolvedExt.isEmpty() && headerBytes != null && headerBytes.size >= 4) {
+                val sniffed = sniffFileTypeFromMagicBytes(headerBytes)
+                if (sniffed != null) {
+                    resolvedExt = sniffed.first
+                    if (resolvedMime.isBlank() || resolvedMime == "application/octet-stream" || resolvedMime == "binary/octet-stream") {
+                        resolvedMime = sniffed.second
+                    }
+                }
+            }
+
+            if (resolvedExt.isEmpty()) {
+                resolvedExt = rawExt.ifBlank { "bin" }
+            }
+
+            if (resolvedMime.isBlank() || resolvedMime == "application/octet-stream" || resolvedMime == "binary/octet-stream") {
+                resolvedMime = mimeTypeFromExtension(resolvedExt) ?: "application/octet-stream"
+            }
+
+            val finalName = if (!hasRealExt && resolvedExt !in GENERIC_PLACEHOLDER_EXTENSIONS) {
+                val baseName = if (hasDot && rawExt in GENERIC_PLACEHOLDER_EXTENSIONS) {
+                    trimmedName.substringBeforeLast('.').ifBlank { "download_${System.currentTimeMillis()}" }
+                } else {
+                    trimmedName
+                }
+                "$baseName.$resolvedExt"
+            } else {
+                trimmedName
+            }
+
+            val dotExt = ".$resolvedExt"
+            val isVideo = resolvedMime.startsWith("video/", ignoreCase = true) ||
+                MediaPlatform.VIDEO_EXTENSIONS.any { it == dotExt }
+            val isAudio = !isVideo && (
+                resolvedMime.startsWith("audio/", ignoreCase = true) ||
+                    MediaPlatform.AUDIO_EXTENSIONS.any { it == dotExt }
+                )
+            val isGeneric = !isVideo && !isAudio
+            val subFolder = subFolderForType(
+                extension = resolvedExt,
+                mimeType = resolvedMime,
+                isAudioOnly = isAudio,
+                isGenericFile = isGeneric,
+                url = url,
+                platform = platform
+            )
+
+            return ResolvedFileType(
+                filename = finalName,
+                extension = resolvedExt,
+                mimeType = resolvedMime,
+                subFolder = subFolder,
+                isVideo = isVideo,
+                isAudio = isAudio,
+                isGenericFile = isGeneric
+            )
+        }
+
+        private fun extensionFromMimeType(mime: String): String? {
+            return when (mime) {
+                "video/mp4" -> "mp4"
+                "video/x-matroska", "video/mkv" -> "mkv"
+                "video/webm" -> "webm"
+                "video/quicktime" -> "mov"
+                "video/x-msvideo", "video/avi" -> "avi"
+                "video/3gpp" -> "3gp"
+                "video/x-flv" -> "flv"
+                "video/mpeg" -> "mpeg"
+                "audio/mpeg", "audio/mp3" -> "mp3"
+                "audio/mp4", "audio/x-m4a", "audio/m4a" -> "m4a"
+                "audio/ogg", "audio/opus" -> "ogg"
+                "audio/flac", "audio/x-flac" -> "flac"
+                "audio/wav", "audio/x-wav" -> "wav"
+                "audio/aac" -> "aac"
+                "image/jpeg", "image/jpg" -> "jpg"
+                "image/png" -> "png"
+                "image/webp" -> "webp"
+                "image/gif" -> "gif"
+                "image/heic", "image/heif" -> "heic"
+                "image/avif" -> "avif"
+                "image/bmp" -> "bmp"
+                "image/svg+xml" -> "svg"
+                "application/pdf" -> "pdf"
+                "application/vnd.android.package-archive" -> "apk"
+                "application/zip", "application/x-zip-compressed" -> "zip"
+                "application/vnd.rar", "application/x-rar-compressed" -> "rar"
+                "application/x-7z-compressed" -> "7z"
+                "application/gzip", "application/x-gzip" -> "gz"
+                "application/x-tar" -> "tar"
+                "application/x-bittorrent" -> "torrent"
+                "application/msword" -> "doc"
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document" -> "docx"
+                "application/vnd.ms-excel" -> "xls"
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" -> "xlsx"
+                "application/vnd.ms-powerpoint" -> "ppt"
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation" -> "pptx"
+                "application/epub+zip" -> "epub"
+                "text/plain" -> "txt"
+                "text/csv" -> "csv"
+                "application/json" -> "json"
+                "text/html" -> "html"
+                "text/vtt" -> "vtt"
+                "application/x-subrip" -> "srt"
+                else -> runCatching {
+                    MimeTypeMap.getSingleton().getExtensionFromMimeType(mime)
+                        ?.lowercase(Locale.US)
+                        ?.takeIf { it.length in 1..8 && it !in GENERIC_PLACEHOLDER_EXTENSIONS }
+                }.getOrNull()
+            }
+        }
+
+        private fun mimeTypeFromExtension(ext: String): String? {
+            return when (ext.lowercase(Locale.US)) {
+                "mp4", "m4v" -> "video/mp4"
+                "mkv" -> "video/x-matroska"
+                "webm" -> "video/webm"
+                "mov" -> "video/quicktime"
+                "avi" -> "video/x-msvideo"
+                "mp3" -> "audio/mpeg"
+                "m4a" -> "audio/mp4"
+                "ogg", "opus" -> "audio/ogg"
+                "flac" -> "audio/flac"
+                "wav" -> "audio/wav"
+                "aac" -> "audio/aac"
+                "jpg", "jpeg" -> "image/jpeg"
+                "png" -> "image/png"
+                "webp" -> "image/webp"
+                "gif" -> "image/gif"
+                "heic" -> "image/heic"
+                "pdf" -> "application/pdf"
+                "apk" -> "application/vnd.android.package-archive"
+                "xapk", "apks", "apkm" -> "application/octet-stream"
+                "zip" -> "application/zip"
+                "rar" -> "application/vnd.rar"
+                "7z" -> "application/x-7z-compressed"
+                "gz", "tgz" -> "application/gzip"
+                "tar" -> "application/x-tar"
+                "torrent" -> "application/x-bittorrent"
+                "srt" -> "application/x-subrip"
+                "vtt" -> "text/vtt"
+                "txt" -> "text/plain"
+                "csv" -> "text/csv"
+                "json" -> "application/json"
+                "html", "htm" -> "text/html"
+                "doc" -> "application/msword"
+                "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                "xls" -> "application/vnd.ms-excel"
+                "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                "ppt" -> "application/vnd.ms-powerpoint"
+                "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                "epub" -> "application/epub+zip"
+                else -> runCatching {
+                    MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext.lowercase(Locale.US))
+                }.getOrNull()
+            }
+        }
+
+        private fun sniffFileTypeFromMagicBytes(bytes: ByteArray): Pair<String, String>? {
+            if (bytes.size < 4) return null
+            val b0 = bytes[0].toInt() and 0xFF
+            val b1 = bytes[1].toInt() and 0xFF
+            val b2 = bytes[2].toInt() and 0xFF
+            val b3 = bytes[3].toInt() and 0xFF
+
+            // ISO Base Media (MP4, M4A, MOV, HEIC, AVIF) -> 'ftyp' at bytes 4..7
+            if (bytes.size >= 12 &&
+                bytes[4] == 'f'.code.toByte() &&
+                bytes[5] == 't'.code.toByte() &&
+                bytes[6] == 'y'.code.toByte() &&
+                bytes[7] == 'p'.code.toByte()
+            ) {
+                val brand = String(bytes, 8, 4, Charsets.US_ASCII).lowercase(Locale.US)
+                return when {
+                    brand.startsWith("m4a") || brand.startsWith("m4b") -> "m4a" to "audio/mp4"
+                    brand == "qt  " -> "mov" to "video/quicktime"
+                    brand == "heic" || brand == "heix" || brand == "mif1" -> "heic" to "image/heic"
+                    brand == "avif" || brand == "avis" -> "avif" to "image/avif"
+                    else -> "mp4" to "video/mp4"
+                }
+            }
+            // Matroska / WebM (EBML header: 1A 45 DF A3)
+            if (b0 == 0x1A && b1 == 0x45 && b2 == 0xDF && b3 == 0xA3) {
+                val ascii = String(bytes, 0, bytes.size.coerceAtMost(64), Charsets.ISO_8859_1).lowercase(Locale.US)
+                return if (ascii.contains("webm")) "webm" to "video/webm" else "mkv" to "video/x-matroska"
+            }
+            // PDF (%PDF)
+            if (b0 == 0x25 && b1 == 0x50 && b2 == 0x44 && b3 == 0x46) {
+                return "pdf" to "application/pdf"
+            }
+            // JPEG (FF D8 FF)
+            if (b0 == 0xFF && b1 == 0xD8 && b2 == 0xFF) {
+                return "jpg" to "image/jpeg"
+            }
+            // PNG (89 50 4E 47)
+            if (b0 == 0x89 && b1 == 0x50 && b2 == 0x4E && b3 == 0x47) {
+                return "png" to "image/png"
+            }
+            // GIF (GIF8)
+            if (b0 == 0x47 && b1 == 0x49 && b2 == 0x46 && b3 == 0x38) {
+                return "gif" to "image/gif"
+            }
+            // RIFF container (WEBP / AVI / WAV)
+            if (bytes.size >= 12 && b0 == 0x52 && b1 == 0x49 && b2 == 0x46 && b3 == 0x46) {
+                val sub = String(bytes, 8, 4, Charsets.US_ASCII)
+                return when (sub) {
+                    "WEBP" -> "webp" to "image/webp"
+                    "AVI " -> "avi" to "video/x-msvideo"
+                    "WAVE" -> "wav" to "audio/wav"
+                    else -> null
+                }
+            }
+            // MP3 (ID3 or MPEG frame sync)
+            if ((b0 == 0x49 && b1 == 0x44 && b2 == 0x33) || (b0 == 0xFF && (b1 and 0xE0) == 0xE0 && (b1 and 0x06) != 0x00)) {
+                return "mp3" to "audio/mpeg"
+            }
+            // OGG / Opus (OggS)
+            if (b0 == 0x4F && b1 == 0x67 && b2 == 0x67 && b3 == 0x53) {
+                return "ogg" to "audio/ogg"
+            }
+            // FLAC (fLaC)
+            if (b0 == 0x66 && b1 == 0x4C && b2 == 0x61 && b3 == 0x43) {
+                return "flac" to "audio/flac"
+            }
+            // RAR (Rar!)
+            if (b0 == 0x52 && b1 == 0x61 && b2 == 0x72 && b3 == 0x21) {
+                return "rar" to "application/vnd.rar"
+            }
+            // 7-Zip (37 7A BC AF 27 1C)
+            if (bytes.size >= 6 && b0 == 0x37 && b1 == 0x7A && b2 == 0xBC && b3 == 0xAF &&
+                (bytes[4].toInt() and 0xFF) == 0x27 && (bytes[5].toInt() and 0xFF) == 0x1C
+            ) {
+                return "7z" to "application/x-7z-compressed"
+            }
+            // GZIP (1F 8B)
+            if (b0 == 0x1F && b1 == 0x8B) {
+                return "gz" to "application/gzip"
+            }
+            // ZIP / APK / Office (PK\x03\x04)
+            if (b0 == 0x50 && b1 == 0x4B && (b2 == 0x03 || b2 == 0x05 || b2 == 0x07)) {
+                val ascii = String(bytes, 0, bytes.size.coerceAtMost(256), Charsets.ISO_8859_1)
+                return when {
+                    ascii.contains("AndroidManifest.xml") || ascii.contains("classes.dex") ->
+                        "apk" to "application/vnd.android.package-archive"
+                    else -> "zip" to "application/zip"
+                }
+            }
+            // Windows PE Executable (MZ)
+            if (b0 == 0x4D && b1 == 0x5A) {
+                return "exe" to "application/vnd.microsoft.portable-executable"
+            }
+            // BitTorrent file (d8:announce)
+            if (bytes.size >= 11 && String(bytes, 0, 11, Charsets.US_ASCII) == "d8:announce") {
+                return "torrent" to "application/x-bittorrent"
+            }
+            return null
+        }
     }
 
     fun ensureDragonToolDirectories() {
@@ -700,17 +1067,40 @@ class DragonDownloadManager(
         return taskId
     }
 
+    /**
+     * Resolves the OS-safe staging work directory for an active/paused download task.
+     * Uses `filesDir/downloader_work/$taskId` so Android's automatic `cacheDir` reaper
+     * never evicts multi-GB segmental chunks mid-download, while seamlessly resuming any
+     * legacy paused task whose chunks already exist in `cacheDir/downloader_work/$taskId`.
+     */
+    private fun resolveDownloadWorkDir(taskId: String): File {
+        val persistentDir = File(context.filesDir, "downloader_work/$taskId")
+        if (persistentDir.exists()) return persistentDir
+        val legacyCacheDir = File(context.cacheDir, "downloader_work/$taskId")
+        if (legacyCacheDir.exists() && !legacyCacheDir.listFiles().isNullOrEmpty()) {
+            return legacyCacheDir
+        }
+        return persistentDir.apply { mkdirs() }
+    }
+
+    private fun deleteDownloadWorkDir(taskId: String) {
+        com.example.data.cache.DragonSmartCacheController.unmarkDownloadWorkActive(taskId)
+        runCatching { File(context.filesDir, "downloader_work/$taskId").deleteRecursively() }
+        runCatching { File(context.cacheDir, "downloader_work/$taskId").deleteRecursively() }
+    }
+
     private fun launchDownloadWorker(task: DownloaderTask) {
         val taskId = task.id
+        com.example.data.cache.DragonSmartCacheController.markDownloadWorkActive(taskId)
         val job = scope.launch(Dispatchers.IO) {
-            val workDir = File(context.cacheDir, "downloader_work/$taskId").apply { mkdirs() }
+            val workDir = resolveDownloadWorkDir(taskId).apply { mkdirs() }
             val tempPrimaryFile = File(workDir, "primary_stream.tmp")
             val tempSecondaryAudioFile = File(workDir, "secondary_audio.tmp")
             val tempProcessedFile = File(workDir, "processed_output.${task.container}")
 
             var activeFormat = task.formatOption
             var smartRetryAttempt = task.retryCount
-            val maxSmartRetries = task.maxRetries.coerceAtLeast(4)
+            val maxSmartRetries = task.maxRetries.coerceAtLeast(6)
 
             try {
                 // Check available storage space (generic files assemble & move in-place without 2x duplication)
@@ -1206,11 +1596,25 @@ class DragonDownloadManager(
                 )
 
                 // Clean up temporary work directory immediately so User Data / Cache never bloats
-                try { workDir.deleteRecursively() } catch (_: Exception) {}
+                deleteDownloadWorkDir(taskId)
 
-                        val finalBytes = savedResult.first.length().takeIf { it > 0L } ?: verifiedFileSize
+                        val savedFile = savedResult.first
+                        val resolvedSavedExt = savedFile.extension.lowercase(Locale.US).ifBlank { task.container }
+                        val resolvedSavedMime = when {
+                            resolvedSavedExt == "apk" -> ApkPackageInstaller.MIME_ANDROID_PACKAGE
+                            ApkPackageInstaller.isInstallableExtension(resolvedSavedExt) -> "application/octet-stream"
+                            else -> task.mimeType
+                        }
+                        val finalBytes = savedFile.length().takeIf { it > 0L } ?: verifiedFileSize
                         updateTask(taskId) {
                             it.copy(
+                                filename = savedFile.name.ifBlank { it.filename },
+                                container = resolvedSavedExt,
+                                mimeType = resolvedSavedMime,
+                                formatOption = it.formatOption.copy(
+                                    container = resolvedSavedExt,
+                                    mimeType = resolvedSavedMime
+                                ),
                                 stage = DownloadStateStage.COMPLETED,
                                 progress = 1.0f,
                                 speedBytesPerSec = 0L,
@@ -1223,20 +1627,24 @@ class DragonDownloadManager(
                                 segmentProgress = emptyList(),
                                 isSmartRetrying = false,
                                 retryStatusText = if (smartRetryAttempt > 0) "Recovered via Smart Retry (#$smartRetryAttempt)" else null,
-                                filePath = savedResult.first.absolutePath,
+                                filePath = savedFile.absolutePath,
                                 publicUriString = savedResult.second?.toString(),
-                                verifiedResolution = if (task.isGenericFile) "${task.container.uppercase(Locale.US)} File" else report.resolutionLabel,
+                                verifiedResolution = if (task.isGenericFile) "${resolvedSavedExt.uppercase(Locale.US)} File" else report.resolutionLabel,
                                 verifiedDuration = report.durationFormatted,
-                                verifiedCodec = if (task.isGenericFile) task.mimeType else report.codecSummary,
+                                verifiedCodec = if (task.isGenericFile) resolvedSavedMime else report.codecSummary,
                                 errorType = null,
                                 errorMessage = null
                             )
                         }
+                        val completedTaskSnapshot = _tasksFlow.value.find { it.id == taskId }
+                        if (completedTaskSnapshot != null && ApkPackageInstaller.isInstallablePackageTask(completedTaskSnapshot)) {
+                            ApkPackageInstaller.inspectTaskPackage(context, completedTaskSnapshot, forceRefresh = true)
+                        }
                         notificationController.syncTasks(_tasksFlow.value, force = true)
                         persistTasks()
                         cleanTemporaryAndRedundantStorage()
-                        val folderLabel = displayFolderForTask(task)
-                        onFeedback("Saved to $folderLabel: ${task.filename} (${formatBytes(finalBytes)})")
+                        val folderLabel = displayFolderForTask(completedTaskSnapshot ?: task)
+                        onFeedback("Saved to $folderLabel: ${(completedTaskSnapshot ?: task).filename} (${formatBytes(finalBytes)})")
                         break
                     } catch (ce: CancellationException) {
                         throw ce
@@ -1269,7 +1677,9 @@ class DragonDownloadManager(
 
                         val reducedThreads = when (smartRetryAttempt) {
                             1 -> _maxConnectionsFlow.value.coerceIn(1, 16)
-                            2 -> (_maxConnectionsFlow.value / 2).coerceIn(2, 8)
+                            2 -> (_maxConnectionsFlow.value / 2).coerceIn(4, 8)
+                            3 -> 4.coerceAtMost(_maxConnectionsFlow.value).coerceAtLeast(1)
+                            4 -> 2.coerceAtMost(_maxConnectionsFlow.value).coerceAtLeast(1)
                             else -> 1
                         }
 
@@ -1353,7 +1763,7 @@ class DragonDownloadManager(
             } catch (ce: CancellationException) {
                 val current = _tasksFlow.value.find { it.id == taskId }
                 if (current == null) {
-                    try { workDir.deleteRecursively() } catch (_: Exception) {}
+                    deleteDownloadWorkDir(taskId)
                 }
                 notificationController.syncTasks(_tasksFlow.value, force = true)
             } catch (e: ExtractorException) {
@@ -1490,7 +1900,7 @@ class DragonDownloadManager(
             }
 
             try {
-                if (index > 0 && destFile.exists()) {
+                if (index > 0 && destFile.exists() && knownTotalBytes <= 0L) {
                     destFile.delete()
                 }
                 val bytes = downloadStreamToFile(
@@ -1500,7 +1910,7 @@ class DragonDownloadManager(
                     destFile = destFile,
                     progressWeightStart = progressWeightStart,
                     progressWeightSpan = progressWeightSpan,
-                    knownTotalBytes = if (index == 0) knownTotalBytes else -1L,
+                    knownTotalBytes = knownTotalBytes,
                     isGenericFile = isGenericFile,
                     customProgressHandler = customProgressHandler
                 )
@@ -1618,7 +2028,7 @@ class DragonDownloadManager(
             )
         }
 
-        val workDir = destFile.parentFile ?: File(context.cacheDir, "downloader_work/$taskId").apply { mkdirs() }
+        val workDir = destFile.parentFile ?: resolveDownloadWorkDir(taskId).apply { mkdirs() }
         val extLower = destFile.extension.lowercase(Locale.US)
         val rejectHtml = !isGenericFile || extLower !in setOf("html", "htm", "xhtml", "svg", "xml")
 
@@ -1628,7 +2038,7 @@ class DragonDownloadManager(
             } else {
                 0.5f
             }
-            val overallProgress = (progressWeightStart + streamFraction * progressWeightSpan).coerceIn(0.02f, 0.98f)
+            val overallProgress = (progressWeightStart + streamFraction * progressWeightSpan).coerceIn(0.0f, 0.99f)
             val remainingBytes = if (upd.totalBytes > upd.downloadedBytes) upd.totalBytes - upd.downloadedBytes else -1L
             val etaSec = if (remainingBytes > 0L && upd.speedBytesPerSec > 0L) remainingBytes / upd.speedBytesPerSec else -1L
             val speedStr = if (upd.activeConnections > 1) {
@@ -2074,7 +2484,7 @@ class DragonDownloadManager(
                     byteRangeLength = s.byteRangeLength
                 )
             }
-            val workerConcurrency = _maxConnectionsFlow.value.coerceIn(1, 8)
+            val workerConcurrency = _maxConnectionsFlow.value.coerceIn(1, 12)
             idmDownloader.downloadHlsSegmentsParallel(
                 segments = segmentSpecs,
                 tempRawFile = tempRawFile,
@@ -2258,6 +2668,28 @@ class DragonDownloadManager(
         onFeedback("Saved to ${DownloadFolderCategory.TORRENT.displayPath}: $displayTitle (${formatBytes(totalLen)})")
     }
 
+    fun exportFileToCategoryDownloads(
+        sourceFile: File,
+        filename: String,
+        mimeType: String,
+        isAudioOnly: Boolean = false,
+        isGenericFile: Boolean = false,
+        extension: String = "",
+        url: String = "",
+        platform: MediaPlatform? = null
+    ): Pair<File, Uri?> {
+        return saveToDragonToolDownloads(
+            sourceFile = sourceFile,
+            filename = filename,
+            mimeType = mimeType,
+            isAudioOnly = isAudioOnly,
+            isGenericFile = isGenericFile,
+            extension = extension,
+            url = url,
+            platform = platform
+        )
+    }
+
     private fun saveToDragonToolDownloads(
         sourceFile: File,
         filename: String,
@@ -2268,12 +2700,65 @@ class DragonDownloadManager(
         url: String = "",
         platform: MediaPlatform? = null
     ): Pair<File, Uri?> {
-        val resolvedExt = extension.ifBlank { filename.substringAfterLast('.', "") }
+        val headerBytes = runCatching {
+            FileInputStream(sourceFile).use { input ->
+                val buf = ByteArray(256)
+                val read = input.read(buf)
+                if (read > 0) buf.copyOf(read) else null
+            }
+        }.getOrNull()
+
+        val initialName = if (extension.isNotBlank() && !filename.contains('.')) {
+            "$filename.${extension.removePrefix(".")}"
+        } else {
+            filename
+        }
+        var resolvedType = resolveFileTypeAndName(
+            rawFilename = initialName,
+            rawMimeType = mimeType,
+            headerBytes = headerBytes,
+            url = url,
+            platform = platform
+        )
+        val rawLowerExt = initialName.substringAfterLast('.', "").lowercase(Locale.US)
+        if (!ApkPackageInstaller.isInstallableExtension(rawLowerExt) &&
+            (resolvedType.extension == "zip" || resolvedType.extension == "bin") &&
+            headerBytes != null && headerBytes.size >= 4 &&
+            (headerBytes[0].toInt() and 0xFF) == 0x50 &&
+            (headerBytes[1].toInt() and 0xFF) == 0x4B
+        ) {
+            val zipPkgType = ApkPackageInstaller.sniffZipArchivePackageType(sourceFile)
+            if (zipPkgType != null && (rawLowerExt != "zip" || zipPkgType.first == "apk" || zipPkgType.first == "xapk")) {
+                val pkgExt = zipPkgType.first
+                val pkgMime = if (pkgExt == "apk") ApkPackageInstaller.MIME_ANDROID_PACKAGE else "application/octet-stream"
+                val baseTitle = resolvedType.filename.substringBeforeLast('.').ifBlank { "Package_${System.currentTimeMillis()}" }
+                val upgradedName = "$baseTitle.$pkgExt"
+                val upgradedSubFolder = subFolderForType(
+                    extension = pkgExt,
+                    mimeType = pkgMime,
+                    isAudioOnly = false,
+                    isGenericFile = true,
+                    url = url,
+                    platform = platform
+                )
+                resolvedType = resolvedType.copy(
+                    filename = upgradedName,
+                    extension = pkgExt,
+                    mimeType = pkgMime,
+                    subFolder = upgradedSubFolder,
+                    isVideo = false,
+                    isAudio = false,
+                    isGenericFile = true
+                )
+            }
+        }
+        val finalFilename = resolvedType.filename
+        val finalMime = resolvedType.mimeType
         val subFolder = subFolderForType(
-            extension = resolvedExt,
-            mimeType = mimeType,
-            isAudioOnly = isAudioOnly,
-            isGenericFile = isGenericFile,
+            extension = resolvedType.extension,
+            mimeType = finalMime,
+            isAudioOnly = isAudioOnly || resolvedType.isAudio,
+            isGenericFile = isGenericFile && resolvedType.isGenericFile,
             url = url,
             platform = platform
         )
@@ -2281,37 +2766,45 @@ class DragonDownloadManager(
         @Suppress("DEPRECATION")
         val publicFileRef = File(
             File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), subFolder),
-            filename
+            finalFilename
         )
 
         var publicUri: Uri? = null
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            try {
-                val resolver = context.contentResolver
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, filename)
-                    put(MediaStore.Downloads.MIME_TYPE, mimeType)
-                    put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/$subFolder")
-                    put(MediaStore.Downloads.IS_PENDING, 1)
-                }
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                if (uri != null) {
-                    resolver.openOutputStream(uri)?.use { out ->
-                        FileInputStream(sourceFile).use { input ->
-                            input.copyTo(out, bufferSize = 64 * 1024)
-                        }
+            fun tryInsertMediaStore(targetMime: String): Uri? {
+                return try {
+                    val resolver = context.contentResolver
+                    val values = ContentValues().apply {
+                        put(MediaStore.Downloads.DISPLAY_NAME, finalFilename)
+                        put(MediaStore.Downloads.MIME_TYPE, targetMime)
+                        put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/$subFolder")
+                        put(MediaStore.Downloads.IS_PENDING, 1)
                     }
-                    values.clear()
-                    values.put(MediaStore.Downloads.IS_PENDING, 0)
-                    resolver.update(uri, values, null, null)
-                    publicUri = uri
+                    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    if (uri != null) {
+                        resolver.openOutputStream(uri)?.use { out ->
+                            FileInputStream(sourceFile).use { input ->
+                                input.copyTo(out, bufferSize = 64 * 1024)
+                            }
+                        }
+                        values.clear()
+                        values.put(MediaStore.Downloads.IS_PENDING, 0)
+                        resolver.update(uri, values, null, null)
+                        uri
+                    } else null
+                } catch (_: Exception) {
+                    null
                 }
-            } catch (_: Exception) {}
+            }
+
+            publicUri = tryInsertMediaStore(finalMime)
+                ?: if (finalMime != "application/octet-stream") tryInsertMediaStore("application/octet-stream") else null
 
             if (publicUri != null) {
-                // Exported to public Download/DDM folder via MediaStore!
-                // Immediately delete the temporary sourceFile so private App User Data size stays 0B!
+                // Exported to public Download/DDM/<Category> folder via MediaStore!
+                // Do NOT keep a duplicate 100MB-2GB copy in cacheDir/apk_installer_staging;
+                // ApkPackageInstaller reads directly from publicFileRef or streams on-demand from publicUri.
                 runCatching { sourceFile.delete() }
                 return publicFileRef to publicUri
             }
@@ -2322,15 +2815,14 @@ class DragonDownloadManager(
                     sourceFile.copyTo(publicFileRef, overwrite = true)
                     runCatching { sourceFile.delete() }
                 }
-                MediaScannerConnection.scanFile(context, arrayOf(publicFileRef.absolutePath), arrayOf(mimeType), null)
+                MediaScannerConnection.scanFile(context, arrayOf(publicFileRef.absolutePath), arrayOf(finalMime), null)
                 return publicFileRef to null
             } catch (_: Exception) {}
         }
 
         // Fallback when MediaStore is unavailable (e.g. local JVM unit tests):
-        // Store in cacheDir/ddm_exports instead of filesDir/getExternalFilesDir so it is counted as cache, not permanent User Data.
         val cacheExportDir = File(context.cacheDir, "ddm_exports/$subFolder").apply { mkdirs() }
-        val targetCacheFile = File(cacheExportDir, filename)
+        val targetCacheFile = File(cacheExportDir, finalFilename)
         if (targetCacheFile.exists()) {
             runCatching { targetCacheFile.delete() }
         }
@@ -2343,6 +2835,10 @@ class DragonDownloadManager(
     }
 
     fun pauseDownload(taskId: String) {
+        val isExternal = isExternalWebManagedTask(taskId)
+        if (isExternal) {
+            pausedExternalTaskIds.add(taskId)
+        }
         updateTask(taskId) {
             if (it.stage.isActive || it.isSmartRetrying) {
                 it.copy(
@@ -2355,6 +2851,9 @@ class DragonDownloadManager(
             } else it
         }
         activeJobs.remove(taskId)?.cancel()
+        if (isExternal) {
+            dispatchExternalStreamControl(taskId, ExternalStreamControlAction.PAUSE)
+        }
         notificationController.syncTasks(_tasksFlow.value, force = true)
         persistTasks()
         syncBackgroundDownloadService()
@@ -2371,6 +2870,39 @@ class DragonDownloadManager(
             task.isAudioOnly -> DownloadStateStage.DOWNLOADING_AUDIO
             else -> DownloadStateStage.DOWNLOADING_VIDEO
         }
+        val isExternal = isExternalWebManagedTask(taskId)
+        if (isExternal) {
+            pausedExternalTaskIds.remove(taskId)
+            tgWebKeyByTaskId[taskId]?.let { cancelledTgWebKeys.remove(it) }
+            val updated = task.copy(
+                stage = resumedStage,
+                speedFormatted = "Resuming...",
+                etaFormatted = "Connecting...",
+                isSmartRetrying = false,
+                errorType = null,
+                errorMessage = null
+            )
+            updateTask(taskId) { updated }
+            notificationController.syncTasks(_tasksFlow.value, force = true)
+            syncBackgroundDownloadService()
+            val handled = dispatchExternalStreamControl(taskId, ExternalStreamControlAction.RESUME)
+            if (!handled) {
+                pausedExternalTaskIds.add(taskId)
+                updateTask(taskId) {
+                    it.copy(
+                        stage = DownloadStateStage.PAUSED,
+                        speedBytesPerSec = 0L,
+                        speedFormatted = "Paused",
+                        etaFormatted = "Open Telegram tab to resume"
+                    )
+                }
+                notificationController.syncTasks(_tasksFlow.value, force = true)
+                syncBackgroundDownloadService()
+                onFeedback("Open the Telegram tab in Browser to resume this file")
+            }
+            return
+        }
+
         val updated = task.copy(
             stage = resumedStage,
             speedFormatted = "Resuming...",
@@ -2385,6 +2917,10 @@ class DragonDownloadManager(
     }
 
     fun retryDownload(taskId: String) {
+        if (isExternalWebManagedTask(taskId)) {
+            resumeDownload(taskId)
+            return
+        }
         val task = _tasksFlow.value.find { it.id == taskId } ?: return
         activeJobs.remove(taskId)?.cancel()
         removeDeletedTaskIds(listOf(taskId))
@@ -2502,8 +3038,22 @@ class DragonDownloadManager(
 
     fun cancelDownload(taskId: String) {
         val task = _tasksFlow.value.find { it.id == taskId }
+        val isExternal = isExternalWebManagedTask(taskId)
         activeJobs.remove(taskId)?.cancel()
         recordDeletedTaskIds(listOf(taskId))
+        if (isExternal) {
+            pausedExternalTaskIds.remove(taskId)
+            tgWebKeyByTaskId[taskId]?.let { key ->
+                cancelledTgWebKeys[key] = System.currentTimeMillis()
+            }
+            dispatchExternalStreamControl(
+                taskId = taskId,
+                action = ExternalStreamControlAction.CANCEL,
+                filenameHint = task?.filename
+            )
+            tgWebKeyByTaskId.remove(taskId)
+            streamIdByTaskId.remove(taskId)
+        }
 
         val customBackendUrl = _backendUrlFlow.value.takeIf { it.isNotBlank() }
         if (customBackendUrl != null && task != null && task.jobId != task.id) {
@@ -2512,8 +3062,7 @@ class DragonDownloadManager(
             }
         }
 
-        val workDir = File(context.cacheDir, "downloader_work/$taskId")
-        try { workDir.deleteRecursively() } catch (_: Exception) {}
+        deleteDownloadWorkDir(taskId)
 
         // Also delete any private cache/app-local copy if the task was cancelled
         task?.filePath?.takeIf { it.isNotBlank() }?.let { path ->
@@ -2532,6 +3081,307 @@ class DragonDownloadManager(
         notificationController.onTaskRemovedOrDeleted(taskId, updatedTasks)
         cleanTemporaryAndRedundantStorage()
         syncBackgroundDownloadService()
+    }
+
+    /**
+     * Removes a downloaded/completed (or any) task from the app's download list and notifications
+     * WITHOUT deleting the saved file from device storage (`Download/DDM/<Category>`).
+     */
+    fun deleteTaskFromListOnly(taskId: String) {
+        val task = _tasksFlow.value.find { it.id == taskId }
+        activeJobs.remove(taskId)?.cancel()
+        recordDeletedTaskIds(listOf(taskId))
+        deleteDownloadWorkDir(taskId)
+
+        // If the task has a public MediaStore copy, we can safely clean any temporary cache staging copy
+        // while keeping the public MediaStore file in Download/DDM untouched.
+        if (!task?.publicUriString.isNullOrBlank()) {
+            task?.filePath?.takeIf { it.isNotBlank() }?.let { path ->
+                val f = File(path)
+                if (f.exists() && f.absolutePath.startsWith(context.cacheDir.absolutePath)) {
+                    runCatching { f.delete() }
+                }
+            }
+        }
+
+        val updatedTasks = _tasksFlow.value.filter { it.id != taskId }
+        _tasksFlow.value = updatedTasks
+        persistTasks(commit = true)
+        notificationController.onTaskRemovedOrDeleted(taskId, updatedTasks)
+        syncBackgroundDownloadService()
+        if (task != null) {
+            onFeedback("Removed \"${task.filename}\" from download list")
+        }
+    }
+
+    /**
+     * Permanently deletes a downloaded file from device storage (MediaStore + local disk + staging cache)
+     * and removes the task from the download list.
+     */
+    fun deleteTaskFromStorage(taskId: String) {
+        val task = _tasksFlow.value.find { it.id == taskId }
+        activeJobs.remove(taskId)?.cancel()
+        recordDeletedTaskIds(listOf(taskId))
+
+        scope.launch(Dispatchers.IO) {
+            try {
+                // 1. Delete from MediaStore if publicUriString is present
+                task?.publicUriString?.takeIf { it.isNotBlank() }?.let { uriStr ->
+                    runCatching {
+                        val pubUri = Uri.parse(uriStr)
+                        context.contentResolver.delete(pubUri, null, null)
+                    }
+                }
+
+                // 2. Delete direct filePath if present
+                task?.filePath?.takeIf { it.isNotBlank() }?.let { path ->
+                    val file = File(path)
+                    if (file.exists()) {
+                        runCatching { file.delete() }
+                    }
+                }
+
+                // 3. Also check public Download/DDM/<Category>/<filename> and cache export/staging paths
+                if (task != null) {
+                    val subFolder = subFolderForType(
+                        extension = task.container,
+                        mimeType = task.mimeType,
+                        isAudioOnly = task.isAudioOnly,
+                        isGenericFile = task.isGenericFile,
+                        url = task.url,
+                        platform = task.platform
+                    )
+                    @Suppress("DEPRECATION")
+                    val publicFile = File(
+                        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), subFolder),
+                        task.filename
+                    )
+                    if (publicFile.exists()) {
+                        runCatching { publicFile.delete() }
+                    }
+                    val cacheExportFile = File(context.cacheDir, "ddm_exports/$subFolder/${task.filename}")
+                    if (cacheExportFile.exists()) {
+                        runCatching { cacheExportFile.delete() }
+                    }
+                    val stagedApkFile = File(context.cacheDir, "apk_installer_staging/${task.filename}")
+                    if (stagedApkFile.exists()) {
+                        runCatching { stagedApkFile.delete() }
+                    }
+                }
+
+                deleteDownloadWorkDir(taskId)
+            } catch (_: Exception) {}
+        }
+
+        val updatedTasks = _tasksFlow.value.filter { it.id != taskId }
+        _tasksFlow.value = updatedTasks
+        persistTasks(commit = true)
+        notificationController.onTaskRemovedOrDeleted(taskId, updatedTasks)
+        cleanTemporaryAndRedundantStorage()
+        syncBackgroundDownloadService()
+        if (task != null) {
+            onFeedback("Deleted \"${task.filename}\" from device storage")
+        }
+    }
+
+    /**
+     * Re-downloads any completed, paused, or failed task from scratch (0% to 100%).
+     */
+    fun redownloadTask(taskId: String) {
+        val task = _tasksFlow.value.find { it.id == taskId } ?: return
+        activeJobs.remove(taskId)?.cancel()
+        removeDeletedTaskIds(listOf(taskId))
+        notificationController.onNewDownloadStarted(taskId)
+
+        // Wipe any partial work folder so re-download starts cleanly from 0%
+        deleteDownloadWorkDir(taskId)
+
+        val resetStage = when {
+            task.isGenericFile -> DownloadStateStage.DOWNLOADING_FILE
+            task.isAudioOnly -> DownloadStateStage.DOWNLOADING_AUDIO
+            else -> DownloadStateStage.DOWNLOADING_VIDEO
+        }
+
+        val streamCandidate = task.formatOption.streamUrl.ifBlank { task.url }
+        val isDirectHttpUrl = streamCandidate.startsWith("http://", ignoreCase = true) ||
+            streamCandidate.startsWith("https://", ignoreCase = true) ||
+            streamCandidate.startsWith("magnet:", ignoreCase = true)
+
+        if (isExternalWebManagedTask(taskId) && (!isDirectHttpUrl || streamCandidate.contains("web.telegram.org", ignoreCase = true))) {
+            pausedExternalTaskIds.remove(taskId)
+            tgWebKeyByTaskId[taskId]?.let { cancelledTgWebKeys.remove(it) }
+            val handled = dispatchExternalStreamControl(taskId, ExternalStreamControlAction.RESUME, task.filename)
+            if (handled) {
+                val restarted = task.copy(
+                    stage = resetStage,
+                    progress = 0.01f,
+                    downloadedBytes = 0L,
+                    speedBytesPerSec = 0L,
+                    speedFormatted = "Re-downloading...",
+                    etaSeconds = -1L,
+                    etaFormatted = "Connecting...",
+                    isSmartRetrying = false,
+                    errorType = null,
+                    errorMessage = null
+                )
+                updateTask(taskId) { restarted }
+                notificationController.syncTasks(_tasksFlow.value, force = true)
+                syncBackgroundDownloadService()
+                onFeedback("Re-downloading \"${task.filename}\"...")
+            } else {
+                onFeedback("Open the source tab in Browser to re-download \"${task.filename}\"")
+            }
+            return
+        }
+
+        val restartedTask = task.copy(
+            stage = resetStage,
+            progress = 0.02f,
+            downloadedBytes = 0L,
+            speedBytesPerSec = 0L,
+            speedFormatted = "Re-downloading...",
+            etaSeconds = -1L,
+            etaFormatted = "Calculating...",
+            segmentProgress = emptyList(),
+            retryCount = 0,
+            isSmartRetrying = false,
+            retryStatusText = null,
+            errorType = null,
+            errorMessage = null,
+            createdAtMs = System.currentTimeMillis()
+        )
+        updateTask(taskId) { restartedTask }
+        notificationController.syncTasks(_tasksFlow.value, force = true)
+        persistTasks()
+        syncBackgroundDownloadService()
+        onFeedback("Re-downloading \"${task.filename}\"...")
+        launchDownloadWorker(restartedTask)
+    }
+
+    /**
+     * Resolves the physical folder on disk containing the downloaded file for opening in the inbuilt Dragon File Manager.
+     */
+    fun resolveTaskFolderDirectory(context: Context, task: DownloaderTask): File {
+        val taskFile = task.filePath?.takeIf { it.isNotBlank() }?.let { File(it) }
+        val existingParent = taskFile?.parentFile?.takeIf { it.exists() && it.isDirectory }
+        if (existingParent != null) {
+            return existingParent
+        }
+
+        val subFolder = subFolderForType(
+            extension = task.container,
+            mimeType = task.mimeType,
+            isAudioOnly = task.isAudioOnly,
+            isGenericFile = task.isGenericFile,
+            url = task.url,
+            platform = task.platform
+        )
+
+        val publicDownloads = runCatching {
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        }.getOrNull()
+
+        if (publicDownloads != null) {
+            val publicSubDir = File(publicDownloads, subFolder)
+            if (publicSubDir.exists() || publicSubDir.mkdirs()) {
+                return publicSubDir
+            }
+            val publicDdmRoot = File(publicDownloads, DRAGON_TOOL_ROOT_FOLDER)
+            if (publicDdmRoot.exists() || publicDdmRoot.mkdirs()) {
+                return publicDdmRoot
+            }
+        }
+
+        val appDownloads = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
+        return File(appDownloads, subFolder).apply { mkdirs() }
+    }
+
+    /**
+     * Opens the device Downloads / DDM category subfolder containing the task in the system File Manager.
+     */
+    fun openTaskFolder(context: Context, task: DownloaderTask) {
+        val subFolder = subFolderForType(
+            extension = task.container,
+            mimeType = task.mimeType,
+            isAudioOnly = task.isAudioOnly,
+            isGenericFile = task.isGenericFile,
+            url = task.url,
+            platform = task.platform
+        )
+        val displayFolder = "Download/$subFolder"
+
+        val candidateDocIds = listOf(
+            "primary:Download/$subFolder",
+            "primary:Download/$DRAGON_TOOL_ROOT_FOLDER",
+            "primary:Download"
+        )
+
+        for (docId in candidateDocIds) {
+            try {
+                val docUri = DocumentsContract.buildDocumentUri(
+                    "com.android.externalstorage.documents",
+                    docId
+                )
+                val folderIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(docUri, DocumentsContract.Document.MIME_TYPE_DIR)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(folderIntent)
+                onFeedback("Opened folder: $displayFolder")
+                return
+            } catch (_: Exception) {}
+        }
+
+        try {
+            val downloadsIntent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(downloadsIntent)
+            onFeedback("Opened Downloads ($displayFolder)")
+            return
+        } catch (_: Exception) {}
+
+        onFeedback("Folder path: /storage/emulated/0/$displayFolder")
+    }
+
+    /**
+     * Opens the main `Download/DDM` directory in the system File Manager.
+     */
+    fun openDdmRootFolder(context: Context) {
+        val displayFolder = "Download/$DRAGON_TOOL_ROOT_FOLDER"
+        val candidateDocIds = listOf(
+            "primary:Download/$DRAGON_TOOL_ROOT_FOLDER",
+            "primary:Download"
+        )
+
+        for (docId in candidateDocIds) {
+            try {
+                val docUri = DocumentsContract.buildDocumentUri(
+                    "com.android.externalstorage.documents",
+                    docId
+                )
+                val folderIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(docUri, DocumentsContract.Document.MIME_TYPE_DIR)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(folderIntent)
+                onFeedback("Opened File Manager: $displayFolder")
+                return
+            } catch (_: Exception) {}
+        }
+
+        try {
+            val downloadsIntent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(downloadsIntent)
+            onFeedback("Opened File Manager ($displayFolder)")
+            return
+        } catch (_: Exception) {}
+
+        onFeedback("File Manager path: /storage/emulated/0/$displayFolder")
     }
 
     private fun resolveTaskContentUri(context: Context, task: DownloaderTask): Uri? {
@@ -2557,10 +3407,70 @@ class DragonDownloadManager(
         return null
     }
 
+    fun installOrUpdatePackage(context: Context, task: DownloaderTask, forceSign: Boolean = false) {
+        ApkPackageInstaller.installOrUpdatePackage(
+            context = context,
+            task = task,
+            scope = scope,
+            forceSign = forceSign,
+            onFeedback = onFeedback
+        )
+    }
+
+    fun resumePendingPackageInstallIfReady(context: Context) {
+        if (!ApkPackageInstaller.hasPendingPermissionInstall()) return
+        if (!ApkPackageInstaller.canRequestPackageInstalls(context)) return
+        val pendingTaskId = ApkPackageInstaller.consumePendingPermissionTaskId() ?: return
+        val task = _tasksFlow.value.find { it.id == pendingTaskId } ?: return
+        if (task.stage == DownloadStateStage.COMPLETED && ApkPackageInstaller.isInstallablePackageTask(task)) {
+            installOrUpdatePackage(context, task)
+        }
+    }
+
     fun openDownloadedFile(context: Context, task: DownloaderTask) {
+        if (ApkPackageInstaller.isInstallablePackageTask(task)) {
+            installOrUpdatePackage(context, task)
+            return
+        }
         val uri = resolveTaskContentUri(context, task)
         if (uri == null) {
             onFeedback("File no longer exists on disk.")
+            return
+        }
+        if (task.isAudioOnly || com.example.data.audio.DragonAudioPlayerEngine.isAudioMimeOrName(task.mimeType, task.filename)) {
+            val completedAudioTasks = tasksFlow.value.filter { candidate ->
+                candidate.stage == DownloadStateStage.COMPLETED &&
+                    (candidate.isAudioOnly || com.example.data.audio.DragonAudioPlayerEngine.isAudioMimeOrName(candidate.mimeType, candidate.filename))
+            }
+            val queue = completedAudioTasks.mapNotNull { candidate ->
+                val localFile = candidate.filePath?.takeIf { it.isNotBlank() }?.let { File(it) }?.takeIf { it.exists() }
+                val candidateUri = if (localFile != null) null else resolveTaskContentUri(context, candidate)
+                if (localFile == null && candidateUri == null) return@mapNotNull null
+                val ext = candidate.filename.substringAfterLast('.', "").uppercase(Locale.US)
+                com.example.data.audio.AudioTrackItem(
+                    id = candidate.id,
+                    title = candidate.title.ifBlank { candidate.filename.substringBeforeLast('.') },
+                    artist = candidate.creator,
+                    file = localFile,
+                    uri = candidateUri,
+                    formatBadge = ext.takeIf { it.length in 2..5 } ?: "AUDIO"
+                )
+            }
+            val idx = queue.indexOfFirst { it.id == task.id }
+            if (queue.isNotEmpty() && idx >= 0) {
+                com.example.data.audio.DragonAudioPlayerEngine.playQueueAt(context, queue, idx)
+                return
+            }
+            val localFile = task.filePath?.takeIf { it.isNotBlank() }?.let { File(it) }?.takeIf { it.exists() }
+            if (localFile != null) {
+                com.example.data.audio.DragonAudioPlayerEngine.playFile(context, localFile)
+            } else {
+                com.example.data.audio.DragonAudioPlayerEngine.playUri(
+                    context = context,
+                    uri = uri,
+                    displayName = task.filename.ifBlank { task.title }
+                )
+            }
             return
         }
         try {
@@ -2734,6 +3644,403 @@ class DragonDownloadManager(
         notificationController.syncTasks(_tasksFlow.value, force = false)
     }
 
+    /**
+     * Registers a live browser-streamed download (e.g., Telegram Web Service Worker / Blob stream)
+     * in DragonDownloadManager so users see real-time progress, speed, notifications, and history.
+     */
+    fun startExternalStreamTask(
+        taskId: String,
+        filename: String,
+        sourceUrl: String,
+        mimeType: String,
+        totalBytes: Long,
+        platform: MediaPlatform,
+        activeConnections: Int = 1,
+        creatorLabel: String = if (platform == MediaPlatform.TELEGRAM) "Telegram Web" else "Dragon Browser"
+    ): String {
+        val resolved = resolveFileTypeAndName(
+            rawFilename = filename,
+            rawMimeType = mimeType,
+            url = sourceUrl,
+            platform = platform
+        )
+        val ext = resolved.extension
+        val isAudio = resolved.isAudio
+        val isGeneric = resolved.isGenericFile
+        val initialStage = when {
+            isGeneric -> DownloadStateStage.DOWNLOADING_FILE
+            isAudio -> DownloadStateStage.DOWNLOADING_AUDIO
+            else -> DownloadStateStage.DOWNLOADING_VIDEO
+        }
+        val extBadge = ext.uppercase(Locale.US).takeIf { it.isNotBlank() && it != "BIN" }
+        val qualityLabel = when {
+            platform == MediaPlatform.TELEGRAM && activeConnections > 1 -> "${extBadge ?: "Telegram"} • ${activeConnections}x"
+            platform == MediaPlatform.TELEGRAM -> extBadge ?: "Telegram File"
+            isGeneric -> ext.uppercase(Locale.US)
+            isAudio -> "Audio"
+            else -> "Video"
+        }
+        val format = MediaFormatOption(
+            id = "ext_stream_$taskId",
+            qualityLabel = qualityLabel,
+            container = ext,
+            mimeType = resolved.mimeType,
+            contentLengthBytes = totalBytes.coerceAtLeast(-1L),
+            isEstimatedSize = totalBytes <= 0L,
+            isAudioOnly = isAudio,
+            streamUrl = sourceUrl,
+            isGenericFile = isGeneric,
+            fileCategoryLabel = creatorLabel
+        )
+        val newTask = DownloaderTask(
+            id = taskId,
+            jobId = taskId,
+            url = sourceUrl,
+            title = resolved.filename.substringBeforeLast('.').ifBlank { resolved.filename },
+            creator = creatorLabel,
+            filename = resolved.filename,
+            thumbnailUrl = "",
+            platform = platform,
+            qualityLabel = qualityLabel,
+            container = ext,
+            mimeType = resolved.mimeType,
+            isAudioOnly = isAudio,
+            formatOption = format,
+            stage = initialStage,
+            progress = 0.01f,
+            downloadedBytes = 0L,
+            totalBytes = totalBytes.coerceAtLeast(0L),
+            isTotalSizeEstimated = totalBytes <= 0L,
+            speedBytesPerSec = 0L,
+            speedFormatted = "Connecting...",
+            etaSeconds = -1L,
+            etaFormatted = "Calculating...",
+            isGenericFile = isGeneric,
+            activeConnections = activeConnections.coerceAtLeast(1)
+        )
+        removeDeletedTaskIds(listOf(taskId))
+        pausedExternalTaskIds.remove(taskId)
+        notificationController.onNewDownloadStarted(taskId)
+        _tasksFlow.value = listOf(newTask) + _tasksFlow.value.filterNot { it.id == taskId }
+        notificationController.syncTasks(_tasksFlow.value, force = true)
+        persistTasks()
+        syncBackgroundDownloadService()
+        return taskId
+    }
+
+    fun updateExternalStreamTaskMetadata(
+        taskId: String,
+        filename: String,
+        extension: String,
+        mimeType: String,
+        isAudioOnly: Boolean,
+        isGenericFile: Boolean
+    ) {
+        updateTask(taskId) {
+            it.copy(
+                title = filename.substringBeforeLast('.').ifBlank { filename },
+                filename = filename,
+                container = extension,
+                mimeType = mimeType,
+                isAudioOnly = isAudioOnly,
+                isGenericFile = isGenericFile,
+                formatOption = it.formatOption.copy(
+                    container = extension,
+                    mimeType = mimeType,
+                    isAudioOnly = isAudioOnly,
+                    isGenericFile = isGenericFile
+                )
+            )
+        }
+    }
+
+    fun updateExternalStreamTaskProgress(
+        taskId: String,
+        downloadedBytes: Long,
+        totalBytes: Long,
+        speedBytesPerSec: Long,
+        activeConnections: Int = 1
+    ) {
+        if (taskId in pausedExternalTaskIds) return
+        val safeTotal = totalBytes.coerceAtLeast(0L)
+        updateTask(taskId) {
+            if (it.stage.isTerminal || it.stage == DownloadStateStage.PAUSED) {
+                it
+            } else {
+                val effectiveDone = if (downloadedBytes <= 0L && it.downloadedBytes > 0L) {
+                    it.downloadedBytes
+                } else {
+                    downloadedBytes.coerceAtLeast(0L)
+                }
+                val effectiveTotal = if (safeTotal > 0L) safeTotal else it.totalBytes
+                val fraction = if (effectiveTotal > 0L) {
+                    (effectiveDone.toFloat() / effectiveTotal.toFloat()).coerceIn(0.01f, 0.99f)
+                } else {
+                    0.25f
+                }
+                val effectiveSpeed = when {
+                    speedBytesPerSec > 0L -> speedBytesPerSec
+                    effectiveDone > 0L && it.speedBytesPerSec > 0L -> it.speedBytesPerSec
+                    else -> 0L
+                }
+                val etaSec = if (effectiveTotal > effectiveDone && effectiveSpeed > 0L) {
+                    (effectiveTotal - effectiveDone) / effectiveSpeed
+                } else -1L
+                val speedText = when {
+                    effectiveSpeed > 0L -> "${formatBytes(effectiveSpeed)}/s"
+                    effectiveDone > 0L -> "Downloading..."
+                    else -> "Connecting..."
+                }
+                it.copy(
+                    downloadedBytes = effectiveDone,
+                    totalBytes = effectiveTotal,
+                    isTotalSizeEstimated = effectiveTotal <= 0L,
+                    progress = fraction,
+                    speedBytesPerSec = effectiveSpeed,
+                    speedFormatted = speedText,
+                    etaSeconds = etaSec,
+                    etaFormatted = if (etaSec >= 0L) formatEtaSeconds(etaSec) else "--",
+                    activeConnections = activeConnections.coerceAtLeast(1)
+                )
+            }
+        }
+    }
+
+    fun completeExternalStreamTask(
+        taskId: String,
+        savedFilePath: String,
+        publicUriString: String?,
+        finalBytes: Long,
+        resolvedFilename: String? = null,
+        resolvedExtension: String? = null,
+        resolvedMimeType: String? = null,
+        isAudioOnly: Boolean? = null,
+        isGenericFile: Boolean? = null
+    ) {
+        pausedExternalTaskIds.remove(taskId)
+        streamIdByTaskId.remove(taskId)
+        tgWebKeyByTaskId.remove(taskId)
+        updateTask(taskId) {
+            val finalName = resolvedFilename?.takeIf { n -> n.isNotBlank() } ?: it.filename
+            val finalExt = resolvedExtension?.takeIf { e -> e.isNotBlank() } ?: it.container
+            val finalMime = resolvedMimeType?.takeIf { m -> m.isNotBlank() } ?: it.mimeType
+            val finalAudio = isAudioOnly ?: it.isAudioOnly
+            val finalGeneric = isGenericFile ?: it.isGenericFile
+            it.copy(
+                title = finalName.substringBeforeLast('.').ifBlank { finalName },
+                filename = finalName,
+                container = finalExt,
+                mimeType = finalMime,
+                isAudioOnly = finalAudio,
+                isGenericFile = finalGeneric,
+                formatOption = it.formatOption.copy(
+                    container = finalExt,
+                    mimeType = finalMime,
+                    isAudioOnly = finalAudio,
+                    isGenericFile = finalGeneric
+                ),
+                stage = DownloadStateStage.COMPLETED,
+                progress = 1.0f,
+                speedBytesPerSec = 0L,
+                speedFormatted = "Completed",
+                downloadedBytes = finalBytes.coerceAtLeast(0L),
+                totalBytes = finalBytes.coerceAtLeast(0L),
+                isTotalSizeEstimated = false,
+                etaSeconds = 0L,
+                etaFormatted = "Done",
+                segmentProgress = emptyList(),
+                filePath = savedFilePath,
+                publicUriString = publicUriString,
+                verifiedResolution = "${finalExt.uppercase(Locale.US)} File",
+                verifiedCodec = finalMime,
+                errorType = null,
+                errorMessage = null
+            )
+        }
+        val completedTaskSnapshot = _tasksFlow.value.find { it.id == taskId }
+        if (completedTaskSnapshot != null && ApkPackageInstaller.isInstallablePackageTask(completedTaskSnapshot)) {
+            scope.launch(Dispatchers.IO) {
+                ApkPackageInstaller.inspectTaskPackage(context, completedTaskSnapshot, forceRefresh = true)
+                notificationController.syncTasks(_tasksFlow.value, force = true)
+            }
+        }
+        notificationController.syncTasks(_tasksFlow.value, force = true)
+        persistTasks()
+        syncBackgroundDownloadService()
+    }
+
+    fun failExternalStreamTask(
+        taskId: String,
+        errorMessage: String
+    ) {
+        pausedExternalTaskIds.remove(taskId)
+        streamIdByTaskId.remove(taskId)
+        updateTask(taskId) {
+            if (it.stage == DownloadStateStage.COMPLETED) {
+                it
+            } else {
+                it.copy(
+                    stage = DownloadStateStage.FAILED,
+                    speedBytesPerSec = 0L,
+                    speedFormatted = "Failed",
+                    etaSeconds = -1L,
+                    etaFormatted = "--",
+                    errorType = DownloaderErrorType.NETWORK_FAILURE,
+                    errorMessage = errorMessage
+                )
+            }
+        }
+        notificationController.syncTasks(_tasksFlow.value, force = true)
+        persistTasks()
+        syncBackgroundDownloadService()
+    }
+
+    fun hasActiveBrowserStreamTasks(): Boolean {
+        return _tasksFlow.value.any { task ->
+            isExternalWebManagedTask(task.id) && task.stage.isActive
+        }
+    }
+
+    fun hasActiveOrPausedBrowserStreamTasks(): Boolean {
+        return _tasksFlow.value.any { task ->
+            isExternalWebManagedTask(task.id) && (task.stage.isActive || task.stage == DownloadStateStage.PAUSED)
+        }
+    }
+
+    fun findActiveTelegramWebTaskIdByName(filename: String): String? {
+        val normTarget = filename.trim().lowercase(Locale.US)
+        val activeTgTasks = _tasksFlow.value.filter { it.id.startsWith("tgweb_") && it.stage.isActive }
+        if (activeTgTasks.isEmpty()) return null
+        return activeTgTasks.firstOrNull { t ->
+            val normTask = t.filename.trim().lowercase(Locale.US)
+            normTask == normTarget ||
+                normTask.substringBeforeLast('.') == normTarget.substringBeforeLast('.')
+        }?.id ?: activeTgTasks.firstOrNull()?.id
+    }
+
+    fun onTelegramWebUserReclicked(webTaskKey: String) {
+        if (webTaskKey.isBlank()) return
+        val safeKey = webTaskKey.hashCode().toUInt().toString(16)
+        val taskId = "tgweb_$safeKey"
+        cancelledTgWebKeys.remove(webTaskKey)
+        pausedExternalTaskIds.remove(taskId)
+        removeDeletedTaskIds(listOf(taskId))
+    }
+
+    fun onTelegramWebResumeUnavailable(webTaskKey: String) {
+        if (webTaskKey.isBlank()) return
+        val safeKey = webTaskKey.hashCode().toUInt().toString(16)
+        val taskId = "tgweb_$safeKey"
+        pausedExternalTaskIds.add(taskId)
+        updateTask(taskId) {
+            if (it.stage.isTerminal) it else it.copy(
+                stage = DownloadStateStage.PAUSED,
+                speedBytesPerSec = 0L,
+                speedFormatted = "Paused",
+                etaFormatted = "Open Telegram chat to resume"
+            )
+        }
+        notificationController.syncTasks(_tasksFlow.value, force = true)
+        syncBackgroundDownloadService()
+        onFeedback("Open the Telegram chat tab to resume this download")
+    }
+
+    fun syncTelegramWebDomTaskProgress(
+        webTaskKey: String,
+        filename: String,
+        downloadedBytes: Long,
+        totalBytes: Long,
+        sourceUrl: String,
+        speedBytesPerSec: Long
+    ): String {
+        val safeKey = webTaskKey.hashCode().toUInt().toString(16)
+        val taskId = "tgweb_$safeKey"
+        // Strict guard: never resurrect a task the user cancelled from Download Panel in this session
+        if (cancelledTgWebKeys.containsKey(webTaskKey)) {
+            return taskId
+        }
+        // Strict guard: never overwrite a task the user paused from Download Panel
+        if (taskId in pausedExternalTaskIds) {
+            return taskId
+        }
+
+        tgWebKeyByTaskId[taskId] = webTaskKey
+        val existing = _tasksFlow.value.find { it.id == taskId }
+        if (existing != null && (existing.stage.isTerminal || existing.stage == DownloadStateStage.PAUSED)) {
+            return taskId
+        }
+        val cleanName = filename.trim().ifBlank { "Telegram_File" }
+        if (existing == null) {
+            // Never create a brand-new live Telegram Web task if it already reports 100% done (idle/static card false positive)
+            if (totalBytes > 0L && downloadedBytes >= totalBytes) {
+                return taskId
+            }
+            val resolved = resolveFileTypeAndName(
+                rawFilename = cleanName,
+                rawMimeType = null,
+                url = sourceUrl,
+                platform = MediaPlatform.TELEGRAM
+            )
+            startExternalStreamTask(
+                taskId = taskId,
+                filename = resolved.filename,
+                sourceUrl = sourceUrl.ifBlank { "https://web.telegram.org/k/" },
+                mimeType = resolved.mimeType,
+                totalBytes = totalBytes,
+                platform = MediaPlatform.TELEGRAM,
+                activeConnections = 1,
+                creatorLabel = "Telegram Web"
+            )
+        }
+        updateExternalStreamTaskProgress(
+            taskId = taskId,
+            downloadedBytes = downloadedBytes.coerceAtLeast(0L),
+            totalBytes = totalBytes.coerceAtLeast(0L),
+            speedBytesPerSec = speedBytesPerSec.coerceAtLeast(0L),
+            activeConnections = existing?.activeConnections ?: 1
+        )
+        return taskId
+    }
+
+    fun markTelegramWebDomTaskCached(
+        webTaskKey: String,
+        filename: String,
+        totalBytes: Long
+    ) {
+        val safeKey = webTaskKey.hashCode().toUInt().toString(16)
+        val taskId = "tgweb_$safeKey"
+        if (cancelledTgWebKeys.containsKey(webTaskKey) || taskId in pausedExternalTaskIds) return
+        val existing = _tasksFlow.value.find { it.id == taskId } ?: return
+        if (existing.stage.isTerminal) return
+        val finalSize = totalBytes.coerceAtLeast(existing.totalBytes).coerceAtLeast(existing.downloadedBytes)
+        updateTask(taskId) {
+            it.copy(
+                downloadedBytes = finalSize,
+                totalBytes = finalSize,
+                progress = 0.96f,
+                speedBytesPerSec = 0L,
+                speedFormatted = "Saving to device...",
+                etaSeconds = 0L,
+                etaFormatted = "Saving..."
+            )
+        }
+        notificationController.syncTasks(_tasksFlow.value, force = true)
+    }
+
+    fun cancelTelegramWebDomTask(webTaskKey: String) {
+        val safeKey = webTaskKey.hashCode().toUInt().toString(16)
+        val taskId = "tgweb_$safeKey"
+        // If user paused this task from the Download Panel, stopping Telegram's active download must NOT delete the paused task!
+        if (taskId in pausedExternalTaskIds) return
+        val existing = _tasksFlow.value.find { it.id == taskId } ?: return
+        if (existing.stage.isTerminal || existing.stage == DownloadStateStage.PAUSED) return
+        tgWebKeyByTaskId.remove(taskId)
+        _tasksFlow.value = _tasksFlow.value.filterNot { it.id == taskId }
+        notificationController.onTaskRemovedOrDeleted(taskId, _tasksFlow.value)
+        persistTasks()
+        syncBackgroundDownloadService()
+    }
+
     private fun recordDeletedTaskIds(ids: Collection<String>) {
         if (ids.isEmpty()) return
         synchronized(deletedTaskIds) {
@@ -2869,6 +4176,16 @@ class DragonDownloadManager(
             val raw = prefs.getString("saved_tasks_v2", null) ?: return
             val arr = JSONArray(raw)
             val loaded = mutableListOf<DownloaderTask>()
+            // Purge any legacy ephemeral tgweb_/stream_ IDs from deletedTaskIds so re-downloading them is never blocked
+            synchronized(deletedTaskIds) {
+                val staleEphemeral = deletedTaskIds.filter { it.startsWith("tgweb_") || it.startsWith("stream_") }
+                if (staleEphemeral.isNotEmpty()) {
+                    deletedTaskIds.removeAll(staleEphemeral.toSet())
+                    runCatching {
+                        prefs.edit().putStringSet(KEY_DELETED_TASK_IDS, deletedTaskIds.toSet()).apply()
+                    }
+                }
+            }
             val deletedSnapshot = synchronized(deletedTaskIds) { deletedTaskIds.toSet() }
             val prunedIds = mutableListOf<String>()
             var didPrune = false
@@ -2885,6 +4202,11 @@ class DragonDownloadManager(
                 val publicUriString = obj.optString("publicUriString", "").ifBlank { null }
                 val stageStr = obj.optString("stage", DownloadStateStage.COMPLETED.name)
                 val stage = DownloadStateStage.values().firstOrNull { it.name == stageStr } ?: DownloadStateStage.COMPLETED
+                if ((id.startsWith("tgweb_") || id.startsWith("stream_")) && stage != DownloadStateStage.COMPLETED) {
+                    // Drop stale incomplete browser streams without blacklisting their IDs in deletedTaskIds
+                    didPrune = true
+                    continue
+                }
                 if (stage == DownloadStateStage.COMPLETED && !doesCompletedTaskFileExist(publicUriString, filePath)) {
                     prunedIds.add(id)
                     didPrune = true

@@ -3,18 +3,37 @@ package com.example.receiver
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import com.example.data.filemanager.DragonFileManagerTaskEngine
 import com.example.data.repository.KernelRepository
 
 /**
  * Handles interactive button clicks from the persistent Dragon DDM Download Notification Panel
- * (Pause, Resume, Smart Retry, Cancel, Pause All, Resume All, Retry All Failed, Open File, Share).
+ * (Pause, Resume, Smart Retry, Cancel, Pause All, Resume All, Retry All Failed, Open File, Share)
+ * AND the persistent Material 3 Dragon File Manager Task Notification Panel (Pause, Resume, Cancel).
  */
 class DownloadNotificationReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent?) {
         val action = intent?.action ?: return
-        val taskId = intent.getStringExtra(EXTRA_TASK_ID).orEmpty()
         val appContext = context.applicationContext
+
+        // Handle Dragon File Manager persistent notification actions immediately
+        when (action) {
+            ACTION_FM_PAUSE_TASK -> {
+                DragonFileManagerTaskEngine.pauseActiveTask(appContext)
+                return
+            }
+            ACTION_FM_RESUME_TASK -> {
+                DragonFileManagerTaskEngine.resumeActiveTask(appContext)
+                return
+            }
+            ACTION_FM_CANCEL_TASK -> {
+                DragonFileManagerTaskEngine.cancelActiveTask(appContext)
+                return
+            }
+        }
+
+        val taskId = intent.getStringExtra(EXTRA_TASK_ID).orEmpty()
         val downloadManager = KernelRepository.getInstance(appContext).downloadManager
         downloadManager.ensurePersistedTasksLoaded()
 
@@ -80,5 +99,10 @@ class DownloadNotificationReceiver : BroadcastReceiver() {
         const val ACTION_OPEN_TASK = "com.example.ddm.ACTION_OPEN_TASK"
         const val ACTION_SHARE_TASK = "com.example.ddm.ACTION_SHARE_TASK"
         const val ACTION_DISMISS_PANEL = "com.example.ddm.ACTION_DISMISS_PANEL"
+
+        // Dragon File Manager Persistent Task Notification Controls
+        const val ACTION_FM_PAUSE_TASK = "com.example.ddm.ACTION_FM_PAUSE_TASK"
+        const val ACTION_FM_RESUME_TASK = "com.example.ddm.ACTION_FM_RESUME_TASK"
+        const val ACTION_FM_CANCEL_TASK = "com.example.ddm.ACTION_FM_CANCEL_TASK"
     }
 }

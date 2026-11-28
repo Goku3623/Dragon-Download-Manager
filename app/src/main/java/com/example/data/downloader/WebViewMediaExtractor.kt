@@ -303,10 +303,9 @@ class WebViewMediaExtractor(private val context: Context) {
                         if (completed) return
                         completed = true
                         val cookies = getCookiesForUrl(targetUrl)
-                        try {
-                            webView?.stopLoading()
-                            webView?.destroy()
-                        } catch (_: Exception) {}
+                        val wvToDestroy = webView
+                        webView = null
+                        com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(wvToDestroy)
                         if (cont.isActive) {
                             cont.resume(
                                 WebViewExtractedMedia(
@@ -328,11 +327,12 @@ class WebViewMediaExtractor(private val context: Context) {
                         val wv = WebView(context.applicationContext)
                         webView = wv
                         wv.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            runCatching {
-                                wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_WAIVED, true)
-                            }
-                        }
+                        // Use BOUND instead of WAIVED so LMKD does not immediately kill the shared WebView renderer mid-extraction
+                        com.example.data.browser.WebViewRendererGuard.applyRendererPrioritySafely(
+                            wv,
+                            WebView.RENDERER_PRIORITY_BOUND,
+                            true
+                        )
                         val cm = CookieManager.getInstance()
                         cm.setAcceptCookie(true)
                         cm.setAcceptThirdPartyCookies(wv, true)
@@ -340,8 +340,10 @@ class WebViewMediaExtractor(private val context: Context) {
                         wv.settings.apply {
                             javaScriptEnabled = true
                             domStorageEnabled = true
+                            allowFileAccess = false
+                            allowContentAccess = false
                             mediaPlaybackRequiresUserGesture = false
-                            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
                             userAgentString = MediaExtractionEngine.MOBILE_USER_AGENT
                         }
 
@@ -350,8 +352,13 @@ class WebViewMediaExtractor(private val context: Context) {
                                 view: WebView?,
                                 detail: RenderProcessGoneDetail?
                             ): Boolean {
-                                finish(null, null, null, 0L)
-                                return true
+                                return com.example.data.browser.WebViewRendererGuard.handleRenderProcessGone(
+                                    view = view ?: webView,
+                                    detail = detail,
+                                    trackerKey = "extractor_${targetUrl.hashCode()}"
+                                ) {
+                                    finish(null, null, null, 0L)
+                                }
                             }
 
                             override fun shouldInterceptRequest(
@@ -589,10 +596,10 @@ class WebViewMediaExtractor(private val context: Context) {
                         }
 
                         cont.invokeOnCancellation {
-                            try {
-                                wv.stopLoading()
-                                wv.destroy()
-                            } catch (_: Exception) {}
+                            completed = true
+                            val target = webView ?: wv
+                            webView = null
+                            com.example.data.browser.WebViewRendererGuard.destroyWebViewSafely(target)
                         }
 
                         val extraHeaders = mutableMapOf<String, String>()
@@ -642,6 +649,8 @@ class WebViewMediaExtractor(private val context: Context) {
         fun isLikelyVideoStreamUrl(lowerUrl: String): Boolean {
             if (lowerUrl.contains(".js") || lowerUrl.contains(".css") || lowerUrl.contains(".jpg") ||
                 lowerUrl.contains(".jpeg") || lowerUrl.contains(".png") || lowerUrl.contains(".webp") ||
+                lowerUrl.contains(".gif") || lowerUrl.contains(".svg") || lowerUrl.contains(".ico") ||
+                lowerUrl.contains(".woff") || lowerUrl.contains(".ttf") ||
                 lowerUrl.contains(".vtt") || lowerUrl.contains(".srt") || lowerUrl.contains(".ts") ||
                 lowerUrl.contains(".m4s") || isPreviewUrl(lowerUrl) || isHtmlEmbedPageUrl(lowerUrl)
             ) {
@@ -655,8 +664,23 @@ class WebViewMediaExtractor(private val context: Context) {
                 lowerUrl.contains(".mov") ||
                 lowerUrl.contains(".webm") ||
                 lowerUrl.contains(".mkv") ||
+                lowerUrl.contains(".avi") ||
+                lowerUrl.contains(".flv") ||
+                lowerUrl.contains(".3gp") ||
+                lowerUrl.contains(".ogv") ||
+                lowerUrl.contains(".wmv") ||
                 lowerUrl.contains(".m3u8") ||
+                lowerUrl.contains(".mpd") ||
+                lowerUrl.contains(".ism/manifest") ||
+                lowerUrl.contains(".isml/manifest") ||
+                lowerUrl.contains(".f4m") ||
+                lowerUrl.contains("format=m3u8") ||
+                lowerUrl.contains("type=m3u8") ||
+                lowerUrl.contains("mime=video") ||
+                lowerUrl.contains("content_type=video") ||
                 lowerUrl.contains("stream.mux.com/") ||
+                lowerUrl.contains("jwpcdn.com/") ||
+                lowerUrl.contains("jwplatform.com/") ||
                 lowerUrl.contains("patreonusercontent.com/") ||
                 lowerUrl.contains("patreon.com/file?") ||
                 lowerUrl.contains("bilivideo.com/") ||
@@ -671,10 +695,10 @@ class WebViewMediaExtractor(private val context: Context) {
                 (lowerUrl.contains("cdninstagram.com") && (lowerUrl.contains(".mp4") || lowerUrl.contains("bytestart"))) ||
                 (lowerUrl.contains("fbcdn.net") && lowerUrl.contains(".mp4")) ||
                 (lowerUrl.contains("tiktokcdn") && lowerUrl.contains("video")) ||
-                (lowerUrl.contains("video.twimg.com") && lowerUrl.contains(".mp4")) ||
-                (lowerUrl.contains("v.redd.it") && lowerUrl.contains("dash_")) ||
+                (lowerUrl.contains("video.twimg.com") && (lowerUrl.contains(".mp4") || lowerUrl.contains(".m3u8"))) ||
+                (lowerUrl.contains("v.redd.it") && (lowerUrl.contains("dash_") || lowerUrl.contains(".m3u8") || lowerUrl.contains(".mpd"))) ||
                 (lowerUrl.contains("sc-cdn.net") && lowerUrl.contains(".mp4")) ||
-                (lowerUrl.contains("v.pinimg.com") && lowerUrl.contains(".mp4"))
+                (lowerUrl.contains("v.pinimg.com") && (lowerUrl.contains(".mp4") || lowerUrl.contains(".m3u8")))
         }
 
         fun isLikelyAudioStreamUrl(lowerUrl: String): Boolean {
@@ -685,23 +709,29 @@ class WebViewMediaExtractor(private val context: Context) {
                 lowerUrl.contains(".flac") ||
                 lowerUrl.contains(".ogg") ||
                 lowerUrl.contains(".opus") ||
+                lowerUrl.contains(".wma") ||
                 (lowerUrl.contains("videoplayback?") && lowerUrl.contains("mime=audio"))
         }
 
         fun isLikelyDownloadableFileUrl(lowerUrl: String): Boolean {
             val path = lowerUrl.substringBefore("?").substringBefore("#")
-            val isImage = path.endsWith(".jpg") || path.endsWith(".jpeg") || path.endsWith(".png") || path.endsWith(".webp") || path.endsWith(".gif")
-            if (!isImage && (lowerUrl.contains("telesco.pe/file/") || lowerUrl.contains("api.telegram.org/file/"))) {
+            val isImage = path.endsWith(".jpg") || path.endsWith(".jpeg") || path.endsWith(".png") ||
+                path.endsWith(".webp") || path.endsWith(".gif") || path.endsWith(".svg") || path.endsWith(".ico")
+            if (!isImage && (
+                lowerUrl.contains("telesco.pe/file/") ||
+                    lowerUrl.contains("api.telegram.org/file/") ||
+                    lowerUrl.contains("response-content-disposition=attachment") ||
+                    lowerUrl.contains("content-disposition=attachment")
+                )
+            ) {
                 return true
             }
             return MediaPlatform.ARCHIVE_EXTENSIONS.any { path.endsWith(it) } ||
                 MediaPlatform.INSTALLER_EXTENSIONS.any { path.endsWith(it) } ||
                 MediaPlatform.DISK_IMAGE_AND_BIN_EXTENSIONS.any { path.endsWith(it) } ||
-                path.endsWith(".pdf") ||
-                path.endsWith(".epub") ||
-                path.endsWith(".docx") ||
-                path.endsWith(".xlsx") ||
-                path.endsWith(".pptx")
+                MediaPlatform.DOCUMENT_EXTENSIONS.any { path.endsWith(it) } ||
+                MediaPlatform.SUBTITLE_EXTENSIONS.any { path.endsWith(it) } ||
+                path.endsWith(".torrent")
         }
     }
 }

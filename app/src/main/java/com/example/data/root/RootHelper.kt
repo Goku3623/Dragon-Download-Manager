@@ -16,31 +16,88 @@ data class CommandResult(
  * ProcessBuilder("su"), or privileged system mutations.
  */
 object RootHelper {
+    @Volatile
     var isRootAvailable: Boolean = false
         private set
 
+    fun runRootShellCommand(command: String, timeoutMs: Long = 15_000L): CommandResult {
+        return try {
+            val process = ProcessBuilder("su", "-c", command)
+                .redirectErrorStream(true)
+                .start()
+            val output = process.inputStream.bufferedReader().use { it.readText().trim() }
+            val finished = process.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                CommandResult(-1, "Timeout", isSimulated = false)
+            } else {
+                val exit = process.exitValue()
+                if (exit == 0) {
+                    isRootAvailable = true
+                }
+                CommandResult(exit, output, isSimulated = false)
+            }
+        } catch (e: Exception) {
+            CommandResult(-1, e.message ?: "Root unavailable", isSimulated = false)
+        }
+    }
+
+    fun runUserShellCommand(command: String, timeoutMs: Long = 10_000L): CommandResult {
+        return try {
+            val process = ProcessBuilder("sh", "-c", command)
+                .redirectErrorStream(true)
+                .start()
+            val output = process.inputStream.bufferedReader().use { it.readText().trim() }
+            val finished = process.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                CommandResult(-1, "Timeout", isSimulated = false)
+            } else {
+                CommandResult(process.exitValue(), output, isSimulated = false)
+            }
+        } catch (e: Exception) {
+            CommandResult(-1, e.message ?: "Shell unavailable", isSimulated = false)
+        }
+    }
+
+    fun checkOrRequestRootBlocking(): Boolean {
+        val res = runRootShellCommand("id", timeoutMs = 8_000L)
+        val granted = res.exitCode == 0 && res.output.contains("uid=0")
+        isRootAvailable = granted
+        return granted
+    }
+
+    fun grantStorageAndDataObbRootPermissionsBlocking(packageName: String): Boolean {
+        return isRootAvailable || checkOrRequestRootBlocking()
+    }
+
     suspend fun ensureSilentRootSession(forceRetry: Boolean = false): Boolean = withContext(Dispatchers.IO) {
-        false
+        if (isRootAvailable && !forceRetry) return@withContext true
+        checkOrRequestRootBlocking()
     }
 
     suspend fun refreshRootStatus(): Boolean = withContext(Dispatchers.IO) {
-        false
+        checkOrRequestRootBlocking()
     }
 
     suspend fun grantAllNecessaryPermissions(packageName: String, nativePeakHz: Int = 120): Boolean = withContext(Dispatchers.IO) {
-        false
+        val hasRoot = checkOrRequestRootBlocking()
+        if (hasRoot) {
+            grantStorageAndDataObbRootPermissionsBlocking(packageName)
+        }
+        hasRoot
     }
 
     suspend fun grantRootFpsPermissions(packageName: String, nativePeakHz: Int = 120): Boolean = withContext(Dispatchers.IO) {
-        false
+        isRootAvailable || checkOrRequestRootBlocking()
     }
 
     suspend fun grantRootChargingPermissions(packageName: String): Boolean = withContext(Dispatchers.IO) {
-        false
+        isRootAvailable || checkOrRequestRootBlocking()
     }
 
     suspend fun grantAllBatteryPermissions(packageName: String): Boolean = withContext(Dispatchers.IO) {
-        false
+        isRootAvailable || checkOrRequestRootBlocking()
     }
 
     suspend fun fetchDumpsysBatteryStats(): String = withContext(Dispatchers.IO) {
@@ -48,7 +105,7 @@ object RootHelper {
     }
 
     suspend fun grantRootRamAndVramPermissions(packageName: String): Boolean = withContext(Dispatchers.IO) {
-        false
+        isRootAvailable || checkOrRequestRootBlocking()
     }
 
     suspend fun enforceRootBypassCharging(

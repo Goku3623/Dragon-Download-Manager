@@ -41,7 +41,8 @@ import javax.net.ssl.SSLSocketFactory
  */
 class LocalBrowserProxyServer(
     @Volatile var dnsProvider: () -> CloudflareWarpDns? = { null },
-    @Volatile var proxyProvider: () -> BrowserProxyProfile? = { null }
+    @Volatile var proxyProvider: () -> BrowserProxyProfile? = { null },
+    @Volatile var malwareValidator: (url: String, host: String) -> Boolean = { _, _ -> false }
 ) {
     private val running = AtomicBoolean(false)
     private val lock = Any()
@@ -139,6 +140,53 @@ class LocalBrowserProxyServer(
         }
     }
 
+    private fun openResilientUpstreamTunnel(
+        primaryProxy: BrowserProxyProfile,
+        targetHost: String,
+        targetPort: Int,
+        activeDns: CloudflareWarpDns?
+    ): Socket {
+        // Merge any freshly-updated credentials from proxyProvider() in case onAuthRequired resolved asynchronously
+        val latestActive = proxyProvider()
+        val effectiveUser = primaryProxy.username.ifBlank { latestActive?.username.orEmpty() }
+        val effectivePass = if (primaryProxy.username.isNotBlank()) primaryProxy.password else (latestActive?.password.orEmpty())
+
+        val candidates = buildList {
+            add(primaryProxy.copy(username = effectiveUser, password = effectivePass))
+            primaryProxy.fallbackProxies.forEach { fb ->
+                val fbUser = fb.username.ifBlank { effectiveUser }
+                val fbPass = if (fb.username.isNotBlank()) fb.password else effectivePass
+                add(fb.copy(username = fbUser, password = fbPass))
+            }
+        }.distinctBy { "${it.type.id}:${it.host.lowercase(Locale.US)}:${it.port}:${it.username}" }
+
+        for (candidate in candidates) {
+            try {
+                return openUpstreamProxyTunnel(candidate, targetHost, targetPort, activeDns)
+            } catch (_: Throwable) {
+                // If an extension specified HTTP on port 443/8443 or HTTPS on port 80/8080, try alternate HTTP/HTTPS framing once
+                val altType = when {
+                    candidate.type == BrowserProxyType.HTTP && (candidate.port == 443 || candidate.port == 8443) ->
+                        BrowserProxyType.HTTPS
+                    candidate.type == BrowserProxyType.HTTPS && (candidate.port == 80 || candidate.port == 8080 || candidate.port == 3128) ->
+                        BrowserProxyType.HTTP
+                    else -> null
+                }
+                if (altType != null) {
+                    try {
+                        return openUpstreamProxyTunnel(candidate.copy(type = altType), targetHost, targetPort, activeDns)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
+        // Resilient DNS-protected fallback: if all upstream VPN proxy servers fail (e.g. HTTP 407 auth expired,
+        // free VPN proxy node unreachable, or tunnel handshake rejected), fall back to direct socket using the
+        // active Custom DNS (Cloudflare WARP / AdGuard AdBlocker / Unfiltered / Custom DNS) so WebView never
+        // crashes with net::ERR_TUNNEL_CONNECTION_FAILED.
+        return openDirectSocketWithDns(targetHost, targetPort, activeDns)
+    }
+
     private fun handleConnectTunnel(
         client: Socket,
         clientIn: InputStream,
@@ -155,20 +203,30 @@ class LocalBrowserProxyServer(
             return
         }
 
-        val activeDns = dnsProvider()
-        if (activeDns != null && activeDns.isAnyCustomDnsActive && activeDns.isHostSinkholedForProxy(targetHost)) {
-            writeSimpleHttpError(clientOut, 403, "Blocked by AdBlocker DNS")
+        // 1. Malware & Protection Shield enforcement at tunnel level (works with VPN extensions + DNS)
+        if (malwareValidator("https://$targetHost/", targetHost)) {
+            writeSimpleHttpError(clientOut, 403, "Blocked by Malware & Protection Shield")
             return
+        }
+
+        // 2. Custom DNS & AdBlocker DNS enforcement at tunnel level
+        val activeDns = dnsProvider()
+        if (activeDns != null && activeDns.isAnyCustomDnsActive) {
+            if (activeDns.isHostSinkholedForProxy(targetHost)) {
+                writeSimpleHttpError(clientOut, 403, "Blocked by AdBlocker DNS")
+                return
+            }
+            activeDns.prewarmHostAsync(targetHost)
         }
 
         val upstreamProxy = proxyProvider()?.takeIf { it.shouldProxyHost(targetHost) }
         val upstreamSocket: Socket = try {
             if (upstreamProxy != null) {
-                openUpstreamProxyTunnel(upstreamProxy, targetHost, targetPort, activeDns)
+                openResilientUpstreamTunnel(upstreamProxy, targetHost, targetPort, activeDns)
             } else {
                 openDirectSocketWithDns(targetHost, targetPort, activeDns)
             }
-        } catch (uhe: UnknownHostException) {
+        } catch (_: UnknownHostException) {
             if (activeDns != null && activeDns.isHostSinkholedForProxy(targetHost)) {
                 writeSimpleHttpError(clientOut, 403, "Blocked by DNS")
             } else {
@@ -235,22 +293,48 @@ class LocalBrowserProxyServer(
             return
         }
 
-        val activeDns = dnsProvider()
-        if (activeDns != null && activeDns.isAnyCustomDnsActive && activeDns.isHostSinkholedForProxy(targetHost)) {
-            writeSimpleHttpError(clientOut, 403, "Blocked by AdBlocker DNS")
+        // 1. Malware & Protection Shield enforcement at plain HTTP request level
+        if (malwareValidator("http://$targetHost$originPath", targetHost)) {
+            writeSimpleHttpError(clientOut, 403, "Blocked by Malware & Protection Shield")
             return
+        }
+
+        // 2. Custom DNS & AdBlocker DNS enforcement
+        val activeDns = dnsProvider()
+        if (activeDns != null && activeDns.isAnyCustomDnsActive) {
+            if (activeDns.isHostSinkholedForProxy(targetHost)) {
+                writeSimpleHttpError(clientOut, 403, "Blocked by AdBlocker DNS")
+                return
+            }
+            activeDns.prewarmHostAsync(targetHost)
         }
 
         val upstreamProxy = proxyProvider()?.takeIf { it.shouldProxyHost(targetHost) }
         val isWebsocketUpgrade = headers.any { it.first.equals("Upgrade", ignoreCase = true) }
-        val isHttpUpstreamProxy = upstreamProxy != null &&
-            (upstreamProxy.type == BrowserProxyType.HTTP || upstreamProxy.type == BrowserProxyType.HTTPS)
+        var usedHttpUpstreamProxy = false
+        var activeHttpProxyForHeaders: BrowserProxyProfile? = null
 
         val upstreamSocket: Socket = try {
-            when {
-                isHttpUpstreamProxy -> openHttpOrHttpsProxyBaseSocket(upstreamProxy!!, activeDns)
-                upstreamProxy != null -> openUpstreamProxyTunnel(upstreamProxy, targetHost, targetPort, activeDns)
-                else -> openDirectSocketWithDns(targetHost, targetPort, activeDns)
+            if (upstreamProxy != null &&
+                (upstreamProxy.type == BrowserProxyType.HTTP || upstreamProxy.type == BrowserProxyType.HTTPS)
+            ) {
+                val latestActive = proxyProvider()
+                val effectiveUser = upstreamProxy.username.ifBlank { latestActive?.username.orEmpty() }
+                val effectivePass = if (upstreamProxy.username.isNotBlank()) upstreamProxy.password else (latestActive?.password.orEmpty())
+                val mergedProxy = upstreamProxy.copy(username = effectiveUser, password = effectivePass)
+                try {
+                    val s = openHttpOrHttpsProxyBaseSocket(mergedProxy, activeDns)
+                    usedHttpUpstreamProxy = true
+                    activeHttpProxyForHeaders = mergedProxy
+                    s
+                } catch (_: Throwable) {
+                    usedHttpUpstreamProxy = false
+                    openDirectSocketWithDns(targetHost, targetPort, activeDns)
+                }
+            } else if (upstreamProxy != null) {
+                openResilientUpstreamTunnel(upstreamProxy, targetHost, targetPort, activeDns)
+            } else {
+                openDirectSocketWithDns(targetHost, targetPort, activeDns)
             }
         } catch (_: UnknownHostException) {
             if (activeDns != null && activeDns.isHostSinkholedForProxy(targetHost)) {
@@ -272,7 +356,7 @@ class LocalBrowserProxyServer(
             val upstreamOut = upstreamSocket.getOutputStream()
             val upstreamIn = upstreamSocket.getInputStream()
 
-            val outboundTarget = if (isHttpUpstreamProxy) {
+            val outboundTarget = if (usedHttpUpstreamProxy) {
                 if (targetRaw.startsWith("http://", ignoreCase = true)) {
                     targetRaw
                 } else {
@@ -315,8 +399,9 @@ class LocalBrowserProxyServer(
                 val portPart = if (targetPort == 80) "" else ":$targetPort"
                 reqBuf.append("Host: ").append(hostFmt).append(portPart).append("\r\n")
             }
-            if (isHttpUpstreamProxy && upstreamProxy!!.hasAuth()) {
-                reqBuf.append("Proxy-Authorization: ").append(buildBasicAuthHeader(upstreamProxy.username, upstreamProxy.password)).append("\r\n")
+            val proxyForAuth = activeHttpProxyForHeaders
+            if (usedHttpUpstreamProxy && proxyForAuth != null && proxyForAuth.hasAuth()) {
+                reqBuf.append("Proxy-Authorization: ").append(buildBasicAuthHeader(proxyForAuth.username, proxyForAuth.password)).append("\r\n")
             }
             if (!isWebsocketUpgrade) {
                 reqBuf.append("Connection: close\r\n")

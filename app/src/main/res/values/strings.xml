@@ -1,4 +1,6 @@
 <resources>
     <string name="app_name">Dragon Download Manager</string>
+    <string name="dragon_archiver_app_name">Dragon Archiver</string>
+    <string name="dragon_browser_app_name">Dragon Browser</string>
     <string name="accessibility_service_description">Dragon Download Manager background download helper.</string>
 </resources>

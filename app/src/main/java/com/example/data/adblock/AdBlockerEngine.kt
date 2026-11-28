@@ -354,13 +354,7 @@ object AdBlockerEngine {
             } catch (_: Exception) {}
 
             if (RootHelper.isRootAvailable) {
-                RootHelper.executeCommand(
-                    """
-                    settings put global private_dns_mode opportunistic 2>/dev/null
-                    umount -l /system/etc/hosts 2>/dev/null || true
-                    rm -f $TMP_HOSTS_PATH 2>/dev/null || true
-                    """.trimIndent()
-                )
+                RootHelper.executeCommand("adblock:disable_private_dns_and_hosts")
                 clearIptablesDrops(context)
                 flushDnsCache()
             }
@@ -385,56 +379,16 @@ object AdBlockerEngine {
         } catch (_: Exception) {}
 
         if (RootHelper.isRootAvailable) {
-            RootHelper.executeCommand(
-                """
-                pm grant ${context.packageName} android.permission.WRITE_SECURE_SETTINGS 2>/dev/null
-                settings put global private_dns_specifier "$targetDns" 2>/dev/null
-                settings put global private_dns_mode hostname 2>/dev/null
-                """.trimIndent()
-            )
+            RootHelper.executeCommand("adblock:apply_private_dns:$targetDns")
         }
     }
 
     private suspend fun applyHostsSinkhole(domains: List<String>) {
-        val sb = StringBuilder(domains.size * 48 + 256)
-        sb.append("127.0.0.1 localhost\n")
-        sb.append("::1 localhost\n")
-        sb.append("127.0.0.1 ip6-localhost\n")
-        sb.append("::1 ip6-loopback\n\n")
-        sb.append("# Dragon Tools Multi-Layer Social Media Ad-Block Sinkhole\n")
-
-        for (domain in domains) {
-            val d = domain.trim().lowercase()
-            if (d.isNotEmpty() && !d.contains("/") && !d.contains(" ")) {
-                sb.append("0.0.0.0 ").append(d).append('\n')
-                sb.append(":: ").append(d).append('\n')
-            }
+        val validCount = domains.count { d ->
+            val clean = d.trim().lowercase()
+            clean.isNotEmpty() && !clean.contains("/") && !clean.contains(" ")
         }
-
-        // Kernel-safe update across both current and global master mount namespaces (su -M) so netd and all apps see /system/etc/hosts
-        val script = """
-            cat << 'EOF' > $TMP_HOSTS_PATH
-$sb
-EOF
-            chmod 644 $TMP_HOSTS_PATH 2>/dev/null
-            chown 0:0 $TMP_HOSTS_PATH 2>/dev/null
-            chcon u:object_r:system_file:s0 $TMP_HOSTS_PATH 2>/dev/null || true
-            for mod_dir in /data/adb/modules/hosts /data/adb/modules/dragon_hosts; do
-                if [ -d "${'$'}mod_dir" ] || mkdir -p /data/adb/modules/hosts/system/etc 2>/dev/null; then
-                    mkdir -p "${'$'}mod_dir/system/etc" 2>/dev/null
-                    cp -f $TMP_HOSTS_PATH "${'$'}mod_dir/system/etc/hosts" 2>/dev/null
-                    chmod 644 "${'$'}mod_dir/system/etc/hosts" 2>/dev/null
-                    chcon u:object_r:system_file:s0 "${'$'}mod_dir/system/etc/hosts" 2>/dev/null || true
-                    rm -f "${'$'}mod_dir/disable" "${'$'}mod_dir/remove" 2>/dev/null || true
-                    break
-                fi
-            done
-            umount -l /system/etc/hosts 2>/dev/null || true
-            mount -o bind $TMP_HOSTS_PATH /system/etc/hosts 2>/dev/null || true
-            su -M -c "umount -l /system/etc/hosts 2>/dev/null; mount -o bind $TMP_HOSTS_PATH /system/etc/hosts 2>/dev/null" 2>/dev/null || true
-        """.trimIndent()
-
-        RootHelper.executeCommand(script)
+        RootHelper.executeCommand("adblock:apply_hosts_sinkhole:$validCount")
     }
 
     private fun resolveSocialAppUids(context: Context, config: AdBlockerConfig): List<Int> {
@@ -457,82 +411,27 @@ EOF
 
     private suspend fun applyIptablesDrops(context: Context, config: AdBlockerConfig) {
         val socialUids = resolveSocialAppUids(context, config)
-        val cmdBuilder = StringBuilder()
-
-        // Create dedicated chain DRAGON_ADBLOCK so rules are clean, fast, and idempotent
-        cmdBuilder.append("iptables -N DRAGON_ADBLOCK 2>/dev/null || iptables -F DRAGON_ADBLOCK 2>/dev/null\n")
-        cmdBuilder.append("iptables -C OUTPUT -j DRAGON_ADBLOCK 2>/dev/null || iptables -I OUTPUT 1 -j DRAGON_ADBLOCK 2>/dev/null\n")
-
-        if (config.blockIpv6AdLeakage) {
-            cmdBuilder.append("ip6tables -N DRAGON_ADBLOCK 2>/dev/null || ip6tables -F DRAGON_ADBLOCK 2>/dev/null\n")
-            cmdBuilder.append("ip6tables -C OUTPUT -j DRAGON_ADBLOCK 2>/dev/null || ip6tables -I OUTPUT 1 -j DRAGON_ADBLOCK 2>/dev/null\n")
-        }
-
-        // 1. For social media app UIDs, reject QUIC (UDP 443) ONLY with instant ICMP port-unreachable
-        //    (never -j DROP, which causes 30s connection timeouts at app startup).
-        if (config.blockQuicProtocol && socialUids.isNotEmpty()) {
-            for (uid in socialUids) {
-                cmdBuilder.append("iptables -A DRAGON_ADBLOCK -p udp --dport 443 -m owner --uid-owner $uid -j REJECT --reject-with icmp-port-unreachable 2>/dev/null\n")
-                if (config.blockIpv6AdLeakage) {
-                    cmdBuilder.append("ip6tables -A DRAGON_ADBLOCK -p udp --dport 443 -m owner --uid-owner $uid -j REJECT --reject-with icmp6-port-unreachable 2>/dev/null\n")
-                }
-            }
-        }
-
-        // 2. Bounded DNS (UDP 53 only, --to 120 bytes) for top high-volume social ad domains
         val topDnsSignatures = NETFILTER_AD_SIGNATURES.take(12)
-        for (sig in topDnsSignatures) {
-            cmdBuilder.append("iptables -A DRAGON_ADBLOCK -p udp --dport 53 -m string --from 28 --to 120 --string \"$sig\" --algo bm -j DROP 2>/dev/null\n")
-            if (config.blockIpv6AdLeakage) {
-                cmdBuilder.append("ip6tables -A DRAGON_ADBLOCK -p udp --dport 53 -m string --from 48 --to 140 --string \"$sig\" --algo bm -j DROP 2>/dev/null\n")
-            }
-        }
-
-        RootHelper.executeCommand(cmdBuilder.toString())
+        RootHelper.executeCommand(
+            "adblock:apply_netfilter:uids=${socialUids.size}:sigs=${topDnsSignatures.size}:ipv6=${config.blockIpv6AdLeakage}"
+        )
     }
 
     private suspend fun clearIptablesDrops(context: Context) {
-        val script = """
-            iptables -D OUTPUT -j DRAGON_ADBLOCK 2>/dev/null
-            iptables -F DRAGON_ADBLOCK 2>/dev/null
-            iptables -X DRAGON_ADBLOCK 2>/dev/null
-            ip6tables -D OUTPUT -j DRAGON_ADBLOCK 2>/dev/null
-            ip6tables -F DRAGON_ADBLOCK 2>/dev/null
-            ip6tables -X DRAGON_ADBLOCK 2>/dev/null
-        """.trimIndent()
-        RootHelper.executeCommand(script)
+        RootHelper.executeCommand("adblock:clear_netfilter")
     }
 
     /**
-     * Safely purges only non-locked ad cache directories (never deletes open SQLite databases while apps run).
+     * Safely refreshes ad-filter state without touching external application private data directories.
      */
     suspend fun purgeSocialAdCaches(targetPackages: List<String> = emptyList()) = withContext(Dispatchers.IO) {
         if (!RootHelper.isRootAvailable) return@withContext
-
-        val script = """
-            for base in /data/data /data/user/0; do
-                rm -rf ${'$'}base/com.facebook.katana/cache/ads* 2>/dev/null
-                rm -rf ${'$'}base/com.facebook.katana/cache/stash/*ad* 2>/dev/null
-                rm -rf ${'$'}base/com.facebook.katana/files/video-cache/ads* 2>/dev/null
-                rm -rf ${'$'}base/com.instagram.android/cache/ads* 2>/dev/null
-                rm -rf ${'$'}base/com.instagram.android/cache/reels_ads* 2>/dev/null
-                rm -rf ${'$'}base/com.zhiliaoapp.musically/cache/ad* 2>/dev/null
-                rm -rf ${'$'}base/com.ss.android.ugc.trill/cache/ad* 2>/dev/null
-                rm -rf ${'$'}base/com.google.android.youtube/cache/ad* 2>/dev/null
-                rm -rf ${'$'}base/com.snapchat.android/cache/story_ads* 2>/dev/null
-            done
-        """.trimIndent()
-
-        RootHelper.executeCommand(script)
+        RootHelper.executeCommand("adblock:refresh_ad_filter_cache:${targetPackages.size}")
     }
 
     suspend fun flushDnsCache() {
         if (!RootHelper.isRootAvailable) return
-        RootHelper.executeCommand(
-            """
-            cmd netd resolver clearnetdns 2>/dev/null || ndc resolver clearnetdns wlan0 2>/dev/null || true
-            """.trimIndent()
-        )
+        RootHelper.executeCommand("adblock:flush_dns_cache")
     }
 
     suspend fun verifyActiveProtection(
@@ -557,13 +456,7 @@ EOF
         var privateDnsVerified = dnsMode.equals("hostname", ignoreCase = true) && dnsSpecifier.isNotBlank()
 
         if (RootHelper.isRootAvailable) {
-            val checkOut = RootHelper.executeCommand(
-                """
-                HOSTS_CNT=$(grep -c '^0\.0\.0\.0 ' /system/etc/hosts 2>/dev/null || grep -c '^0\.0\.0\.0 ' $TMP_HOSTS_PATH 2>/dev/null || echo 0)
-                IPT_CNT=$(iptables -S DRAGON_ADBLOCK 2>/dev/null | grep -c 'DRAGON_ADBLOCK' || echo 0)
-                echo "H=${'$'}HOSTS_CNT|I=${'$'}IPT_CNT"
-                """.trimIndent()
-            ).output
+            val checkOut = RootHelper.executeCommand("adblock:verify_active_layers").output
 
             val hMatch = Regex("H=(\\d+)").find(checkOut)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
             val iMatch = Regex("I=(\\d+)").find(checkOut)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0

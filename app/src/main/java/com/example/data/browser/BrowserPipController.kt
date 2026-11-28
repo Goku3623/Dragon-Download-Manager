@@ -95,12 +95,21 @@ object BrowserPipController {
     fun updateBrowserOpen(isOpen: Boolean) {
         if (isOpen) {
             isExplicitBrowserClose = false
-        }
-        _stateFlow.value = if (isOpen) {
-            _stateFlow.value.copy(isBrowserOpen = true)
+            _stateFlow.value = _stateFlow.value.copy(isBrowserOpen = true)
         } else {
             _isBackgroundMinimizedFlow.value = false
-            PipPlaybackState(isBrowserOpen = false)
+            _stateFlow.value = if (isExplicitBrowserClose) {
+                PipPlaybackState(isBrowserOpen = false)
+            } else {
+                // Switching to Download Panel: Browser is not visible on screen (so never enter System PiP on Home press!),
+                // and clear any transient inline video flag unless the user explicitly popped out a floating PiP tab.
+                val cur = _stateFlow.value
+                cur.copy(
+                    isBrowserOpen = false,
+                    isVideoPlaying = if (!cur.floatingPipTabId.isNullOrBlank()) cur.isVideoPlaying else false,
+                    isFullscreenVideo = false
+                )
+            }
         }
     }
 
